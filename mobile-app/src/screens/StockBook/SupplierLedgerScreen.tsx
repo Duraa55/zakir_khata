@@ -1,4 +1,5 @@
 import React, { useEffect, useCallback } from 'react';
+import { useLanguageStore } from '../../store/useLanguageStore';
 import {
   View, Text, TouchableOpacity, StyleSheet,
   FlatList, ActivityIndicator
@@ -6,38 +7,37 @@ import {
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useSupplierStore } from '../../store/useSupplierStore';
 import { SupplierLedgerEntry } from '../../types/supplier.types';
-import { formatCurrency } from '../../utils/calculations';
+import { formatDisplayDate } from '../../utils/dates';
 import { ScreenContainer } from '../../components/ui/ScreenContainer';
-import { Colors } from '../../theme';
+import { color, space, radius, type as typeScale, hairline, iconSize, touchTarget } from '../../theme/tokens';
+import { Icon, IconName, AmountText } from '../../components/ui/primitives';
 
-const LedgerRow = React.memo(({ item, index }: { item: SupplierLedgerEntry; index: number }) => {
-  const icon = item.type === 'invoice' ? '🧾' : item.type === 'return' ? '↩️' : '💳';
-  return (
-    <View style={styles.row}>
-      <View style={styles.rowLeft}>
-        <Text style={styles.rowIcon}>{icon}</Text>
-        <View>
-          <Text style={styles.rowLabel}>{item.label}</Text>
-          <Text style={styles.rowDate}>{item.date}</Text>
-        </View>
-      </View>
-      <View style={styles.rowRight}>
-        {item.amount > 0 && (
-          <Text style={styles.debitAmt}>+{formatCurrency(item.amount)}</Text>
-        )}
-        {item.credit > 0 && (
-          <Text style={styles.creditAmt}>-{formatCurrency(item.credit)}</Text>
-        )}
-        <Text style={[styles.balance, item.balance >= 0 ? styles.balRed : styles.balGreen]}>
-          {formatCurrency(Math.abs(item.balance))}
-        </Text>
+const TYPE_ICON: Record<string, IconName> = { invoice: 'file-text', return: 'corner-up-left', payment: 'credit-card' };
+
+const LedgerRow = React.memo(({ item }: { item: SupplierLedgerEntry }) => (
+  <View style={styles.row}>
+    <View style={styles.rowLeft}>
+      <Icon name={TYPE_ICON[item.type] ?? 'circle'} size={iconSize.sm} tint={color.textMuted} />
+      <View style={styles.rowText}>
+        <Text style={styles.rowLabel} numberOfLines={1}>{item.label}</Text>
+        <Text style={styles.rowDate}>{formatDisplayDate(item.date)}</Text>
       </View>
     </View>
-  );
-});
+    <View style={styles.rowRight}>
+      {item.amount > 0 && <AmountText paisa={item.amount} size="label" tone="out" />}
+      {item.credit > 0 && <AmountText paisa={item.credit} size="label" tone="in" />}
+      {/* A balance is neutral ink; the word says which way it runs. */}
+      <View style={styles.balanceLine}>
+        <Text style={styles.balance}>{item.balance >= 0 ? 'Payable' : 'Advance'}</Text>
+        <AmountText paisa={Math.abs(item.balance)} size="label" tone="muted" />
+      </View>
+    </View>
+  </View>
+));
 
 export const SupplierLedgerScreen = ({ navigation, route }: any) => {
   const { supplierId, supplierName } = route.params;
+  const { t } = useLanguageStore();
   const { ledger, loading, loadSupplierLedger } = useSupplierStore();
 
   const load = useCallback(() => loadSupplierLedger(supplierId), [supplierId]);
@@ -47,6 +47,7 @@ export const SupplierLedgerScreen = ({ navigation, route }: any) => {
     return unsub;
   }, [navigation, load]);
 
+  // The ledger is loaded whole (not paged), so these cover every entry.
   const totalDebit = ledger.reduce((s, e) => s + e.amount, 0);
   const totalCredit = ledger.reduce((s, e) => s + e.credit, 0);
   const netBalance = totalDebit - totalCredit;
@@ -54,58 +55,47 @@ export const SupplierLedgerScreen = ({ navigation, route }: any) => {
   return (
     <SafeAreaView style={styles.safe}>
       <View style={styles.header}>
-        <TouchableOpacity onPress={() => navigation.goBack()} style={styles.backBtn}>
-          <Text style={styles.backArrow}>←</Text>
+        <TouchableOpacity onPress={() => navigation.goBack()} style={styles.iconBtn} accessibilityRole="button" accessibilityLabel={t('commonBack')}>
+          <Icon name="chevron-left" size={iconSize.lg} tint={color.textPrimary} />
         </TouchableOpacity>
-        <View>
-          <Text style={styles.headerTitle}>Ledger</Text>
-          <Text style={styles.headerSub}>{supplierName}</Text>
+        <View style={styles.headerText}>
+          <Text style={styles.headerTitle}>{t('supLedger')}</Text>
+          <Text style={styles.headerSub} numberOfLines={1}>{supplierName}</Text>
         </View>
-        <View style={{ width: 40 }} />
+        <View style={styles.iconBtn} />
       </View>
 
       <ScreenContainer scrollable={false} hasTabBar={false} style={styles.container}>
-        {/* Summary Totals */}
         <View style={styles.summaryRow}>
-          <View style={[styles.summaryBox, { backgroundColor: Colors.bgCard }]}>
-            <Text style={styles.summaryLabel}>Total Payable</Text>
-            <Text style={[styles.summaryAmt, { color: Colors.error }]}>{formatCurrency(totalDebit)}</Text>
+          <View style={styles.summaryBox}>
+            <Text style={styles.summaryLabel}>{t('slTotalPayable')}</Text>
+            <AmountText paisa={totalDebit} tone="out" size="label" fit />
           </View>
-          <View style={[styles.summaryBox, { backgroundColor: Colors.bgCard }]}>
-            <Text style={styles.summaryLabel}>Total Paid</Text>
-            <Text style={[styles.summaryAmt, { color: Colors.success }]}>{formatCurrency(totalCredit)}</Text>
+          <View style={styles.summaryBox}>
+            <Text style={styles.summaryLabel}>{t('slTotalPaid')}</Text>
+            <AmountText paisa={totalCredit} tone="in" size="label" fit />
           </View>
-          <View style={[styles.summaryBox, { backgroundColor: Colors.bgCard, flex: 1.2 }]}>
-            <Text style={styles.summaryLabel}>Net Balance</Text>
-            <Text style={[styles.summaryAmt, { color: netBalance > 0 ? Colors.warning : Colors.success, fontSize: 15 }]}>
-              {netBalance > 0 ? 'Payable' : 'Credit'}: {formatCurrency(Math.abs(netBalance))}
-            </Text>
+          <View style={styles.summaryBox}>
+            <Text style={styles.summaryLabel}>{netBalance > 0 ? 'Still payable' : 'Advance'}</Text>
+            <AmountText paisa={Math.abs(netBalance)} size="label" fit />
           </View>
-        </View>
-
-        {/* Column Headers */}
-        <View style={styles.colHeader}>
-          <Text style={[styles.colText, { flex: 2 }]}>Description</Text>
-          <Text style={[styles.colText, { textAlign: 'right' }]}>Debit</Text>
-          <Text style={[styles.colText, { textAlign: 'right' }]}>Credit</Text>
-          <Text style={[styles.colText, { textAlign: 'right' }]}>Balance</Text>
         </View>
 
         {loading ? (
-          <ActivityIndicator size="large" color={Colors.primary} style={{ flex: 1 }} />
+          <ActivityIndicator size="large" color={color.accent} style={styles.spinner} />
         ) : ledger.length === 0 ? (
           <View style={styles.empty}>
-            <Text style={{ fontSize: 48 }}>📒</Text>
-            <Text style={styles.emptyText}>No ledger entries yet</Text>
-            <Text style={styles.emptySub}>Invoices and payments will appear here</Text>
+            <Icon name="book-open" size={40} tint={color.textMuted} />
+            <Text style={styles.emptyText}>{t('slNoEntries')}</Text>
+            <Text style={styles.emptySub}>{t('slWillAppear')}</Text>
           </View>
         ) : (
           <FlatList
             data={ledger}
             keyExtractor={item => item.id}
-            renderItem={({ item, index }) => <LedgerRow item={item} index={index} />}
-            style={{ flex: 1 }}
-            contentContainerStyle={{ paddingBottom: 24 }}
+            renderItem={({ item }) => <LedgerRow item={item} />}
+            style={styles.list}
+            contentContainerStyle={styles.listContent}
           />
         )}
       </ScreenContainer>
@@ -114,43 +104,37 @@ export const SupplierLedgerScreen = ({ navigation, route }: any) => {
 };
 
 const styles = StyleSheet.create({
-  safe: { flex: 1, backgroundColor: Colors.bgPrimary },
-  container: { flex: 1, backgroundColor: Colors.bgPrimary },
+  safe: { flex: 1, backgroundColor: color.surface },
+  container: { flex: 1, backgroundColor: color.surface },
   header: {
-    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
-    backgroundColor: Colors.bgCard, paddingHorizontal: 16, height: 56,
-    borderBottomWidth: 1, borderBottomColor: Colors.border,
+    flexDirection: 'row', alignItems: 'center', gap: space.xs,
+    paddingHorizontal: space.sm, minHeight: 56, borderBottomWidth: hairline, borderBottomColor: color.border,
   },
-  backBtn: { width: 36 },
-  backArrow: { fontSize: 22, color: Colors.textWhite, fontWeight: '700' },
-  headerTitle: { fontSize: 18, fontWeight: '700', color: Colors.textWhite },
-  headerSub: { fontSize: 12, color: Colors.primaryLight },
-  summaryRow: { flexDirection: 'row', padding: 12, gap: 8 },
+  iconBtn: { width: touchTarget, height: touchTarget, alignItems: 'center', justifyContent: 'center' },
+  headerText: { flex: 1, alignItems: 'center' },
+  headerTitle: { ...typeScale.heading, fontSize: 18, color: color.textPrimary },
+  headerSub: { ...typeScale.caption, color: color.textSecondary },
+  summaryRow: { flexDirection: 'row', padding: space.md, gap: space.sm },
   summaryBox: {
-    flex: 1, padding: 12, borderRadius: 12, borderWidth: 1, borderColor: Colors.border,
+    flex: 1, padding: space.md, borderRadius: radius.md, gap: space.xs,
+    borderWidth: hairline, borderColor: color.border,
   },
-  summaryLabel: { fontSize: 11, color: Colors.textGray, fontWeight: '600' },
-  summaryAmt: { fontSize: 14, fontWeight: '800', marginTop: 4 },
-  colHeader: {
-    flexDirection: 'row', backgroundColor: Colors.bgSecondary, paddingHorizontal: 16, paddingVertical: 10,
-    borderTopWidth: 1, borderBottomWidth: 1, borderColor: Colors.border,
-  },
-  colText: { flex: 1, fontSize: 12, color: Colors.textGray, fontWeight: '700' },
+  summaryLabel: { ...typeScale.caption, color: color.textSecondary },
+  spinner: { flex: 1 },
+  list: { flex: 1 },
+  listContent: { paddingBottom: space.xxl },
   row: {
-    flexDirection: 'row', backgroundColor: Colors.bgCard, paddingHorizontal: 16, paddingVertical: 12,
-    borderBottomWidth: 1, borderBottomColor: Colors.border, alignItems: 'center',
+    flexDirection: 'row', paddingHorizontal: space.lg, paddingVertical: space.md, gap: space.md,
+    borderBottomWidth: hairline, borderBottomColor: color.border, alignItems: 'center',
   },
-  rowLeft: { flex: 2, flexDirection: 'row', alignItems: 'center', gap: 10 },
-  rowIcon: { fontSize: 18 },
-  rowLabel: { fontSize: 13, fontWeight: '700', color: Colors.textWhite },
-  rowDate: { fontSize: 11, color: Colors.textGray, marginTop: 2 },
-  rowRight: { flex: 2, alignItems: 'flex-end' },
-  debitAmt: { fontSize: 13, fontWeight: '700', color: Colors.error },
-  creditAmt: { fontSize: 13, fontWeight: '700', color: Colors.success },
-  balance: { fontSize: 11, color: Colors.textGray, marginTop: 2 },
-  balRed: { color: Colors.warning },
-  balGreen: { color: Colors.success },
-  empty: { flex: 1, justifyContent: 'center', alignItems: 'center', padding: 20 },
-  emptyText: { fontSize: 16, fontWeight: '700', color: Colors.textWhite, marginTop: 12 },
-  emptySub: { fontSize: 13, color: Colors.textGray, marginTop: 4 },
+  rowLeft: { flex: 1, flexDirection: 'row', alignItems: 'center', gap: space.md },
+  rowText: { flex: 1 },
+  rowLabel: { ...typeScale.bodyMedium, fontSize: 14, color: color.textPrimary },
+  rowDate: { ...typeScale.caption, color: color.textSecondary, marginTop: 2 },
+  rowRight: { flexShrink: 0, alignItems: 'flex-end', gap: 2 },
+  balanceLine: { flexDirection: 'row', alignItems: 'center', gap: space.xs },
+  balance: { ...typeScale.caption, color: color.textMuted },
+  empty: { flex: 1, justifyContent: 'center', alignItems: 'center', padding: space.xl, gap: space.xs },
+  emptyText: { ...typeScale.bodyMedium, fontSize: 16, color: color.textPrimary, marginTop: space.sm },
+  emptySub: { ...typeScale.body, color: color.textSecondary },
 });

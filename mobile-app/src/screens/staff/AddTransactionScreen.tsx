@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
-import { View, Text, TextInput, TouchableOpacity, Alert, ScrollView, KeyboardAvoidingView, Platform , StyleSheet } from 'react-native';
+import { useLanguageStore } from '../../store/useLanguageStore';
+import { View, Text, TextInput, TouchableOpacity, Alert, ScrollView } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useAuthStore } from '../../store/authStore';
 import { createTransaction } from '../../services/database/transactionDb';
@@ -9,6 +10,9 @@ import { rupeesToPaisa } from '../../utils/calculations';
 import { ScreenContainer } from '../../components/ui/ScreenContainer';
 import { DateField } from '../../components/ui/DateField';
 import { todayDate } from '../../utils/dates';
+import { Icon, Button } from '../../components/ui/primitives';
+import { color, iconSize } from '../../theme/tokens';
+import { KhataTypeToggle, FormHeader, formStyles as styles } from './KhataEntryForm';
 
 interface Props {
   navigation: any;
@@ -16,6 +20,7 @@ interface Props {
 
 export const AddTransactionScreen: React.FC<Props> = ({ navigation }) => {
   const { user } = useAuthStore();
+  const { t } = useLanguageStore();
   const { loadTransactions } = useTransactionStore();
 
   const [customers, setCustomers] = useState<Customer[]>([]);
@@ -43,16 +48,16 @@ export const AddTransactionScreen: React.FC<Props> = ({ navigation }) => {
 
   const validate = (): number | null => {
     if (!partyName.trim()) {
-      Alert.alert('Error', 'Please select or enter a party name');
+      Alert.alert(t('commonError'), t('khataPartyRequired'));
       return null;
     }
     const paisa = rupeesToPaisa(amount);
     if (paisa === null) {
-      Alert.alert('Error', 'Please enter a valid positive amount');
+      Alert.alert(t('commonError'), t('commonAmountInvalid'));
       return null;
     }
     if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
-      Alert.alert('Error', 'Date must be YYYY-MM-DD');
+      Alert.alert(t('commonError'), t('khataDateInvalid'));
       return null;
     }
     return paisa;
@@ -66,47 +71,48 @@ export const AddTransactionScreen: React.FC<Props> = ({ navigation }) => {
     try {
       await createTransaction(user.id, partyName.trim(), paisa, type, notes.trim() || undefined, date, undefined);
       await loadTransactions(user.id);
-      Alert.alert('Success', 'Transaction added', [{ text: 'OK', onPress: () => navigation.goBack() }]);
+      Alert.alert(t('commonSaved'), t('khataEntryAdded'), [{ text: 'OK', onPress: () => navigation.goBack() }]);
     } catch {
-      Alert.alert('Error', 'Failed to save transaction. Please try again.');
+      Alert.alert(t('commonError'), t('khataSaveFailed'));
     } finally {
       setLoading(false);
     }
   };
 
   return (
-    <SafeAreaView className="flex-1 bg-gray-50">
-      <ScreenContainer scrollable={true} hasTabBar={false} contentContainerStyle={{ paddingHorizontal: 16, paddingVertical: 24 }}>
-        <Text className="text-2xl font-bold text-gray-800 mb-6">Add Transaction</Text>
-
-          <View className="mb-4 z-50">
-            <Text className="text-gray-700 font-medium mb-2">Customer Name *</Text>
+    <SafeAreaView style={styles.safe}>
+      <FormHeader title={t('khataAddEntry')} onBack={() => navigation.goBack()} />
+      <ScreenContainer scrollable={true} hasTabBar={false} contentContainerStyle={styles.content}>
+          <View style={[styles.field, { zIndex: 50 }]}>
+            <Text style={styles.label}>{t('khataCustomerName')} *</Text>
             <TextInput
-              className="bg-white border border-gray-300 rounded-lg px-4 py-3 text-gray-800"
-              placeholder="Select or enter customer"
+              style={styles.input}
+              placeholder={t('khataSelectOrEnter')}
+              placeholderTextColor={color.textMuted}
               value={partyName}
               onChangeText={(txt) => { setPartyName(txt); setShowDropdown(true); }}
               onFocus={() => setShowDropdown(true)}
             />
             {showDropdown && (
-              <View className="bg-white border border-gray-200 rounded-lg mt-1 max-h-48 overflow-hidden absolute w-full top-[75px] z-50 shadow-md">
-                <ScrollView keyboardShouldPersistTaps="handled">
+              <View style={styles.dropdown}>
+                <ScrollView keyboardShouldPersistTaps="handled" nestedScrollEnabled>
                   {filteredCustomers.map(c => (
-                    <TouchableOpacity 
-                      key={c.id} 
-                      className="p-3 border-b border-gray-100"
+                    <TouchableOpacity
+                      key={c.id}
+                      style={styles.dropItem}
                       onPress={() => { setPartyName(c.name); setShowDropdown(false); }}
                     >
-                      <Text className="text-gray-800 font-medium">{c.name}</Text>
-                      {c.phone && <Text className="text-gray-500 text-xs">{c.phone}</Text>}
+                      <Text style={styles.dropName}>{c.name}</Text>
+                      {c.phone && <Text style={styles.dropSub}>{c.phone}</Text>}
                     </TouchableOpacity>
                   ))}
                   {partyName.trim() !== '' && !filteredCustomers.find(c => c.name.toLowerCase() === partyName.trim().toLowerCase()) && (
-                    <TouchableOpacity 
-                      className="p-3 bg-green-50"
+                    <TouchableOpacity
+                      style={styles.dropCreate}
                       onPress={() => { setShowDropdown(false); navigation.navigate('AddCustomerModal', { onSave: (nc: Customer) => { setPartyName(nc.name); setCustomers([nc, ...customers]); } }); }}
                     >
-                      <Text className="text-green-700 font-medium">+ Create new customer: "{partyName}"</Text>
+                      <Icon name="user-plus" size={iconSize.sm} tint={color.accent} />
+                      <Text style={styles.dropCreateText} numberOfLines={1}>Create new customer "{partyName}"</Text>
                     </TouchableOpacity>
                   )}
                 </ScrollView>
@@ -114,11 +120,12 @@ export const AddTransactionScreen: React.FC<Props> = ({ navigation }) => {
             )}
           </View>
 
-          <View className="mb-4 mt-2">
-            <Text className="text-gray-700 font-medium mb-2">Amount (Rs.) *</Text>
+          <View style={styles.field}>
+            <Text style={styles.label}>{t('commonAmount')} (Rs.) *</Text>
             <TextInput
-              className="bg-white border border-gray-300 rounded-lg px-4 py-3 text-gray-800"
+              style={styles.input}
               placeholder="e.g. 1500.50"
+              placeholderTextColor={color.textMuted}
               value={amount}
               onChangeText={setAmount}
               keyboardType="decimal-pad"
@@ -126,39 +133,27 @@ export const AddTransactionScreen: React.FC<Props> = ({ navigation }) => {
             />
           </View>
 
-          <View className="mb-4">
-            <Text className="text-gray-700 font-medium mb-2">Type *</Text>
-            <View className="flex-row gap-2">
-              <TouchableOpacity
-                className={`flex-1 py-3 rounded-lg border-2 ${type === 'lena' ? 'bg-green-500 border-green-500' : 'bg-white border-gray-300'}`}
-                onPress={() => { setType('lena'); setShowDropdown(false); }}
-              >
-                <Text className={`text-center font-medium ${type === 'lena' ? 'text-white' : 'text-gray-800'}`}>Lena (Give)</Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                className={`flex-1 py-3 rounded-lg border-2 ${type === 'dena' ? 'bg-red-500 border-red-500' : 'bg-white border-gray-300'}`}
-                onPress={() => { setType('dena'); setShowDropdown(false); }}
-              >
-                <Text className={`text-center font-medium ${type === 'dena' ? 'text-white' : 'text-gray-800'}`}>Dena (Take)</Text>
-              </TouchableOpacity>
-            </View>
+          <View style={styles.field}>
+            <Text style={styles.label}>{t('khataTypeLabel')} *</Text>
+            <KhataTypeToggle value={type} onChange={t => { setType(t); setShowDropdown(false); }} />
           </View>
 
-          <View className="mb-4">
-            <Text className="text-gray-700 font-medium mb-2">Date *</Text>
+          <View style={styles.field}>
+            <Text style={styles.label}>{t('commonDate')} *</Text>
             <DateField
-              style={styles.dateField}
-              textStyle={styles.dateFieldText}
+              style={styles.input}
+              textStyle={styles.dateText}
               value={date}
               onChange={d => { setShowDropdown(false); setDate(d); }}
             />
           </View>
 
-          <View className="mb-6">
-            <Text className="text-gray-700 font-medium mb-2">Notes (Optional)</Text>
+          <View style={styles.field}>
+            <Text style={styles.label}>{t('poNotesLabel')}</Text>
             <TextInput
-              className="bg-white border border-gray-300 rounded-lg px-4 py-3 text-gray-800"
-              placeholder="Enter notes"
+              style={[styles.input, styles.notes]}
+              placeholder={t('khataEnterNotes')}
+              placeholderTextColor={color.textMuted}
               value={notes}
               onChangeText={setNotes}
               multiline
@@ -167,30 +162,8 @@ export const AddTransactionScreen: React.FC<Props> = ({ navigation }) => {
             />
           </View>
 
-          <TouchableOpacity
-            className={`bg-green-600 py-4 rounded-lg ${loading ? 'opacity-70' : ''}`}
-            onPress={handleSave}
-            disabled={loading}
-          >
-            <Text className="text-white text-center font-semibold text-lg">
-              {loading ? 'Saving...' : 'Save Transaction'}
-            </Text>
-          </TouchableOpacity>
+          <Button label={loading ? 'Saving…' : 'Save entry'} onPress={handleSave} loading={loading} disabled={loading} fullWidth style={styles.save} />
       </ScreenContainer>
     </SafeAreaView>
   );
 };
-
-// Matches the sibling className fields exactly: bg-white / border-gray-300 /
-// rounded-lg / px-4 py-3 / text-gray-800, so the date field looks unchanged in place.
-const styles = StyleSheet.create({
-  dateField: {
-    backgroundColor: '#FFFFFF',
-    borderWidth: 1,
-    borderColor: '#D1D5DB',
-    borderRadius: 8,
-    paddingHorizontal: 16,
-    paddingVertical: 12,
-  },
-  dateFieldText: { color: '#1F2937', fontSize: 15 },
-});

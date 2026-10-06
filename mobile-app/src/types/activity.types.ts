@@ -3,7 +3,7 @@ export interface ActivityLog {
   user_id: string;
   user_name: string;
   action: 'create' | 'update' | 'delete' | 'login' | 'mark_attendance';
-  entity_type: 'cash' | 'stock' | 'bill' | 'staff' | 'expense' | 'auth';
+  entity_type: 'cash' | 'stock' | 'bill' | 'staff' | 'expense' | 'auth' | 'supplier';
   entity_id?: string;
   description: string;
   amount?: number;

@@ -1,16 +1,18 @@
 import React from 'react';
+import { useLanguageStore } from '../../store/useLanguageStore';
 import { View, Text, TouchableOpacity, StyleSheet, ScrollView } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 const ORANGE = '#FF6B35';
 
 export const StaffBooksView = ({ route, navigation }: any) => {
+  const { t } = useLanguageStore();
   const staff = route.params?.staff;
 
   if (!staff) {
     return (
       <SafeAreaView style={styles.safe}>
-        <Text>Staff member not found.</Text>
+        <Text>{t('staffNotFound')}</Text>
       </SafeAreaView>
     );
   }

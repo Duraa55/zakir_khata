@@ -1,15 +1,33 @@
 import { getDatabase } from './db';
-import { writeWithSync } from './syncHelpers';
+import { writeWithSync, writeRowWithSyncIn, afterSyncedWrite } from './syncHelpers';
+import { withWriteTransaction } from './writeTransaction';
 import { generateId, nowISO } from './queryHelpers';
-import { addStockMovement, getStockItemsByUserId } from './stockDb';
+import { addStockMovement, addStockMovementIn, getStockItemsByUserId } from './stockDb';
 import { keysetClause, keysetParams, nextCursorOf, PageCursor } from './pagination';
-import { parseDateValue } from '../../utils/dates';
+import { parseDateValue, todayDate } from '../../utils/dates';
 import {
   PurchaseOrder, PurchaseOrderItem,
   PurchaseInvoice, PurchaseInvoiceItem,
   PurchaseReturn, PurchaseReturnItem,
   PurchaseSummary, POStatus, InvoiceStatus
 } from '../../types/purchase.types';
+import { resolveCurrency, type CurrencyCode } from '../../utils/currency';
+import { totalsFrom, type CurrencyTotal } from '../../utils/currencyTotals';
+
+/**
+ * The currency to store when the caller named none: this ACCOUNT's default, not a
+ * hardcoded PKR. The form always sends the chip's value, so this is the safety net for
+ * any other caller — and getting it wrong would silently label an AED shop's document
+ * as rupees. resolveCurrency is total, so a pre-v41 row still reads as PKR.
+ */
+const accountDefaultCurrency = async (
+  db: Awaited<ReturnType<typeof getDatabase>>, userId: string
+): Promise<CurrencyCode> => {
+  const row = await db.getFirstAsync<{ default_currency: string | null }>(
+    'SELECT default_currency FROM users WHERE id = ?', [userId]
+  );
+  return resolveCurrency(row?.default_currency).code;
+};
 
 export type {
   PurchaseOrder, PurchaseOrderItem,
@@ -26,7 +44,9 @@ export const createPurchaseOrder = async (
   items: Omit<PurchaseOrderItem, 'id' | 'po_id' | 'received_qty' | 'is_deleted'>[],
   orderDate: string,
   expectedDate?: string,
-  notes?: string
+  notes?: string,
+  /** What the form's chip was set to. Unknown or absent resolves to PKR. */
+  currency?: CurrencyCode
 ): Promise<PurchaseOrder> => {
   const db = await getDatabase();
   const id = generateId('po');
@@ -47,6 +67,7 @@ export const createPurchaseOrder = async (
     expected_date: expectedDate || null,
     notes: notes || null,
     total, received_total: 0,
+    currency: currency ? resolveCurrency(currency).code : await accountDefaultCurrency(db, userId),
     is_deleted: 0, deleted_at: null,
   };
 
@@ -89,7 +110,27 @@ export const getPurchaseOrders = async (userId: string, status?: POStatus): Prom
 };
 
 export type PurchaseFilter = { startDate?: string; endDate?: string; status?: string };
-export type PurchaseDayTotal = { day: string; count: number; total: number; settled: number };
+/**
+ * A day's purchases. `total` and `settled` are ONE FIGURE PER CURRENCY — adding AED to
+ * PKR means nothing, so the aggregate groups by currency in SQL. A single-currency day
+ * has exactly one entry each and renders as it always did.
+ */
+export type PurchaseDayTotal = { day: string; count: number; total: CurrencyTotal[]; settled: CurrencyTotal[] };
+
+/** Fold `day, currency` rows into one stacked total per day. Grouping is SQL's. */
+const foldDays = (
+  rows: { day: string; currency?: string | null; count?: number; total?: number; settled?: number }[],
+  base: CurrencyCode,
+): PurchaseDayTotal[] => {
+  const byDay = new Map<string, typeof rows>();
+  for (const r of rows) byDay.set(r.day, [...(byDay.get(r.day) ?? []), r]);
+  return [...byDay.entries()].map(([day, group]) => ({
+    day,
+    count: group.reduce((n, r) => n + Number(r.count ?? 0), 0),
+    total: totalsFrom(group, 'total', base),
+    settled: totalsFrom(group, 'settled', base),
+  }));
+};
 
 const assertRange = (f: PurchaseFilter) => {
   for (const date of [f.startDate, f.endDate]) {
@@ -122,20 +163,23 @@ export const getFilteredPurchaseOrders = async (userId: string, filter: Purchase
     `SELECT po.*, s.name as supplier_name FROM purchase_orders po LEFT JOIN suppliers s ON s.id = po.supplier_id
       WHERE ${rowsWhere} ORDER BY po.order_date DESC, po.created_at DESC, po.id DESC LIMIT ?`, [...rowsParams, limit]
   );
-  const summary = await db.getFirstAsync<{ count: number; total: number; settled: number }>(
-    `SELECT COUNT(*) AS count, COALESCE(SUM(po.total), 0) AS total, COALESCE(SUM(po.received_total), 0) AS settled
-       FROM purchase_orders po WHERE ${where}`, params
+  // COUNT only. The money columns here were summed ACROSS currencies and no screen ever
+  // rendered them — the tab label shows the count. A flat SUM nothing displays is just a
+  // wrong number waiting to be used; the day headers and the tiles are the real totals.
+  const summary = await db.getFirstAsync<{ count: number }>(
+    `SELECT COUNT(*) AS count FROM purchase_orders po WHERE ${where}`, params
   );
-  return { rows, summary: summary ?? { count: 0, total: 0, settled: 0 }, nextCursor: nextCursorOf(rows, limit, { date: 'order_date', createdAt: 'created_at', id: 'id' }) };
+  return { rows, summary: summary ?? { count: 0 }, nextCursor: nextCursorOf(rows, limit, { date: 'order_date', createdAt: 'created_at', id: 'id' }) };
 };
 
 export const getPurchaseOrderDayTotals = async (userId: string, filter: PurchaseFilter = {}): Promise<PurchaseDayTotal[]> => {
   const { where, params } = orderWhere(userId, filter);
   const db = await getDatabase();
-  return db.getAllAsync<PurchaseDayTotal>(
-    `SELECT date(po.order_date) AS day, COUNT(*) AS count, COALESCE(SUM(po.total), 0) AS total, COALESCE(SUM(po.received_total), 0) AS settled
-       FROM purchase_orders po WHERE ${where} GROUP BY date(po.order_date) ORDER BY day DESC`, params
+  const rows = await db.getAllAsync<{ day: string; currency: string | null; count: number; total: number; settled: number }>(
+    `SELECT date(po.order_date) AS day, po.currency AS currency, COUNT(*) AS count, COALESCE(SUM(po.total), 0) AS total, COALESCE(SUM(po.received_total), 0) AS settled
+       FROM purchase_orders po WHERE ${where} GROUP BY date(po.order_date), po.currency ORDER BY day DESC`, params
   );
+  return foldDays(rows, await accountDefaultCurrency(db, userId));
 };
 
 /** THE one predicate for the Invoices tab. */
@@ -158,20 +202,21 @@ export const getFilteredPurchaseInvoices = async (userId: string, filter: Purcha
     `SELECT pi.*, s.name as supplier_name FROM purchase_invoices pi LEFT JOIN suppliers s ON s.id = pi.supplier_id
       WHERE ${rowsWhere} ORDER BY pi.invoice_date DESC, pi.created_at DESC, pi.id DESC LIMIT ?`, [...rowsParams, limit]
   );
-  const summary = await db.getFirstAsync<{ count: number; total: number; settled: number }>(
-    `SELECT COUNT(*) AS count, COALESCE(SUM(pi.total), 0) AS total, COALESCE(SUM(pi.amount_paid), 0) AS settled
-       FROM purchase_invoices pi WHERE ${where}`, params
+  // COUNT only — see the note on the orders query above.
+  const summary = await db.getFirstAsync<{ count: number }>(
+    `SELECT COUNT(*) AS count FROM purchase_invoices pi WHERE ${where}`, params
   );
-  return { rows, summary: summary ?? { count: 0, total: 0, settled: 0 }, nextCursor: nextCursorOf(rows, limit, { date: 'invoice_date', createdAt: 'created_at', id: 'id' }) };
+  return { rows, summary: summary ?? { count: 0 }, nextCursor: nextCursorOf(rows, limit, { date: 'invoice_date', createdAt: 'created_at', id: 'id' }) };
 };
 
 export const getPurchaseInvoiceDayTotals = async (userId: string, filter: PurchaseFilter = {}): Promise<PurchaseDayTotal[]> => {
   const { where, params } = invoiceWhere(userId, filter);
   const db = await getDatabase();
-  return db.getAllAsync<PurchaseDayTotal>(
-    `SELECT date(pi.invoice_date) AS day, COUNT(*) AS count, COALESCE(SUM(pi.total), 0) AS total, COALESCE(SUM(pi.amount_paid), 0) AS settled
-       FROM purchase_invoices pi WHERE ${where} GROUP BY date(pi.invoice_date) ORDER BY day DESC`, params
+  const rows = await db.getAllAsync<{ day: string; currency: string | null; count: number; total: number; settled: number }>(
+    `SELECT date(pi.invoice_date) AS day, pi.currency AS currency, COUNT(*) AS count, COALESCE(SUM(pi.total), 0) AS total, COALESCE(SUM(pi.amount_paid), 0) AS settled
+       FROM purchase_invoices pi WHERE ${where} GROUP BY date(pi.invoice_date), pi.currency ORDER BY day DESC`, params
   );
+  return foldDays(rows, await accountDefaultCurrency(db, userId));
 };
 
 export const getPurchaseOrderById = async (id: string): Promise<PurchaseOrder | null> => {
@@ -204,62 +249,57 @@ export const updatePurchaseOrderStatus = async (
 };
 
 /**
- * Mark items as received.
- * Automatically increases stock for each item via addStockMovement.
+ * Mark items as received — ALL-OR-NOTHING. Each quantity must be above zero and no
+ * more than what is still outstanding on that order line (you cannot receive more
+ * than you ordered); the line, the stock increase and the order's status/total are
+ * written in one transaction, so a failure part way leaves the order untouched.
  */
 export const receiveGoods = async (
   poId: string,
   userId: string,
   receipts: { itemId: string; stockItemId?: string | null; itemName: string; receivedQty: number; unitCost: number }[]
 ): Promise<void> => {
-  const db = await getDatabase();
-  const now = nowISO();
-  let allReceived = true;
-  let anyReceived = false;
-
-  for (const r of receipts) {
-    if (r.receivedQty <= 0) continue;
-    anyReceived = true;
-
-    // Update received_qty on the PO item
-    await db.runAsync(
-      `UPDATE purchase_order_items SET received_qty = received_qty + ? WHERE id = ?`,
-      [r.receivedQty, r.itemId]
-    );
-
-    // Check if fully received
-    const poItem = await db.getFirstAsync<{ quantity: number; received_qty: number }>(
-      'SELECT quantity, received_qty FROM purchase_order_items WHERE id = ?',
-      [r.itemId]
-    );
-    if (poItem && poItem.received_qty < poItem.quantity) allReceived = false;
-
-    // Increase stock if linked to a stock item
-    if (r.stockItemId) {
-      await addStockMovement({
-        item_id: r.stockItemId,
-        change: r.receivedQty,
-        reason: 'purchase',
-        date: now.split('T')[0],
-        cost_per_unit: r.unitCost,
-        user_id: userId,
-        note: `Received from PO`,
-      });
-    }
+  const wanted = receipts.filter(r => r.receivedQty !== 0);
+  if (wanted.length === 0) throw new Error('Enter a received quantity for at least one item.');
+  for (const r of wanted) {
+    if (!(r.receivedQty > 0) || !Number.isFinite(r.receivedQty)) throw new Error(`Invalid quantity for ${r.itemName}.`);
   }
-
-  if (!anyReceived) return;
-
-  // Update PO totals and status
-  const totRow = await db.getFirstAsync<{ received_total: number }>(
-    'SELECT SUM(received_qty * unit_cost) as received_total FROM purchase_order_items WHERE po_id = ? AND is_deleted = 0',
-    [poId]
-  );
-  const newStatus: POStatus = allReceived ? 'received' : 'partial';
-  await db.runAsync(
-    `UPDATE purchase_orders SET status = ?, received_total = ?, updated_at = ?, synced = 0 WHERE id = ?`,
-    [newStatus, totRow?.received_total ?? 0, now, poId]
-  );
+  const now = nowISO();
+  await withWriteTransaction(async db => {
+    for (const r of wanted) {
+      const line = await db.getFirstAsync<{ quantity: number; received_qty: number; stock_item_id: string | null; unit_cost: number }>(
+        'SELECT quantity, received_qty, stock_item_id, unit_cost FROM purchase_order_items WHERE id = ? AND po_id = ? AND is_deleted = 0',
+        [r.itemId, poId]
+      );
+      if (!line) throw new Error('Order line not found.');
+      const remaining = line.quantity - (line.received_qty || 0);
+      if (r.receivedQty > remaining) throw new Error(`Only ${remaining} of ${r.itemName} is still to be received.`);
+      await db.runAsync('UPDATE purchase_order_items SET received_qty = received_qty + ? WHERE id = ?', [r.receivedQty, r.itemId]);
+      // Stock goes up only for a line linked to a stock item (the line's own link, not the caller's).
+      if (line.stock_item_id) {
+        await addStockMovementIn(db, {
+          item_id: line.stock_item_id,
+          change: r.receivedQty,
+          reason: 'purchase',
+          date: todayDate(), // local day, not UTC
+          cost_per_unit: line.unit_cost,
+          user_id: userId,
+          note: 'Received from PO',
+        });
+      }
+    }
+    const tot = await db.getFirstAsync<{ received_total: number; open: number }>(
+      `SELECT COALESCE(SUM(received_qty * unit_cost), 0) as received_total,
+              SUM(CASE WHEN received_qty < quantity THEN 1 ELSE 0 END) as open
+         FROM purchase_order_items WHERE po_id = ? AND is_deleted = 0`,
+      [poId]
+    );
+    const newStatus: POStatus = (tot?.open ?? 0) === 0 ? 'received' : 'partial';
+    await db.runAsync(
+      'UPDATE purchase_orders SET status = ?, received_total = ?, updated_at = ?, synced = 0 WHERE id = ?',
+      [newStatus, Math.round(tot?.received_total ?? 0), now, poId]
+    );
+  });
 };
 
 // ─── Purchase Invoices ────────────────────────────────────────────────────────
@@ -276,6 +316,8 @@ export const createPurchaseInvoice = async (
     discountAmount?: number;
     taxAmount?: number;
     notes?: string;
+    /** What the form's chip was set to. Unknown or absent resolves to PKR. */
+    currency?: CurrencyCode;
   }
 ): Promise<PurchaseInvoice> => {
   const db = await getDatabase();
@@ -305,6 +347,7 @@ export const createPurchaseInvoice = async (
     total, amount_paid: 0, balance_due,
     status: 'unpaid' as InvoiceStatus,
     notes: opts?.notes || null,
+    currency: opts?.currency ? resolveCurrency(opts.currency).code : await accountDefaultCurrency(db, userId),
     is_deleted: 0, deleted_at: null,
   };
 
@@ -385,6 +428,13 @@ export const getPurchaseInvoicesBySupplier = async (supplierId: string): Promise
 
 // ─── Purchase Returns ─────────────────────────────────────────────────────────
 
+/**
+ * Return goods to a supplier against ONE invoice — ALL-OR-NOTHING. Each item's
+ * quantity must be above zero and, together with earlier returns on the same invoice,
+ * no more than was invoiced (the same goods cannot be returned twice). Line totals are
+ * computed here in whole paisa; the return, its lines and the stock decrease are one
+ * transaction.
+ */
 export const createPurchaseReturn = async (
   userId: string,
   invoiceId: string,
@@ -393,11 +443,15 @@ export const createPurchaseReturn = async (
   returnDate: string,
   reason?: string
 ): Promise<PurchaseReturn> => {
-  const db = await getDatabase();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(returnDate) || !parseDateValue(returnDate)) throw new Error('Invalid return date.');
+  if (items.length === 0) throw new Error('Select at least one item to return.');
+  for (const i of items) {
+    if (!(i.quantity > 0) || !Number.isFinite(i.quantity)) throw new Error(`Invalid quantity for ${i.item_name}.`);
+  }
   const id = generateId('pret');
   const now = nowISO();
-  const totalRefund = items.reduce((s, i) => s + i.line_total, 0);
-
+  const lines = items.map(i => ({ ...i, line_total: Math.round(i.quantity * i.unit_cost) }));
+  const totalRefund = lines.reduce((sum, i) => sum + i.line_total, 0);
   const data = {
     id, user_id: userId, invoice_id: invoiceId, supplier_id: supplierId,
     return_date: returnDate, reason: reason || null,
@@ -405,37 +459,51 @@ export const createPurchaseReturn = async (
     is_deleted: 0, deleted_at: null,
   };
 
-  await writeWithSync({
-    tableName: 'purchase_returns',
-    recordId: id,
-    operation: 'create',
-    data,
-    firestorePath: `users/${userId}/purchase_returns/${id}`,
-    userId
-  });
-
-  // Insert return items + reduce stock
-  for (const item of items) {
-    const itemId = generateId('pritem');
-    await db.runAsync(
-      `INSERT INTO purchase_return_items (id, return_id, stock_item_id, item_name, quantity, unit_cost, line_total)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      [itemId, id, item.stock_item_id || null, item.item_name, item.quantity, item.unit_cost, item.line_total]
-    );
-
-    // Reduce stock
-    if (item.stock_item_id) {
-      await addStockMovement({
-        item_id: item.stock_item_id,
-        change: -item.quantity,
-        reason: 'adjustment',
-        date: returnDate,
-        cost_per_unit: item.unit_cost,
-        user_id: userId,
-        note: `Purchase Return`,
-      });
+  await withWriteTransaction(async db => {
+    const invoice = await db.getFirstAsync<{ id: string }>('SELECT id FROM purchase_invoices WHERE id = ? AND is_deleted = 0', [invoiceId]);
+    if (!invoice) throw new Error('Invoice not found.');
+    // Invoiced vs already returned, per item (matched by stock item when linked, else by name).
+    for (const i of lines) {
+      const key = i.stock_item_id ? 'stock_item_id = ?' : '(stock_item_id IS NULL AND item_name = ?)';
+      const keyVal = i.stock_item_id || i.item_name;
+      const invoiced = await db.getFirstAsync<{ q: number }>(
+        `SELECT COALESCE(SUM(quantity), 0) as q FROM purchase_invoice_items WHERE invoice_id = ? AND is_deleted = 0 AND ${key}`,
+        [invoiceId, keyVal]
+      );
+      const returned = await db.getFirstAsync<{ q: number }>(
+        `SELECT COALESCE(SUM(ri.quantity), 0) as q FROM purchase_return_items ri
+           JOIN purchase_returns r ON r.id = ri.return_id
+          WHERE r.invoice_id = ? AND r.is_deleted = 0 AND ${key.replace(/stock_item_id/g, 'ri.stock_item_id').replace('item_name', 'ri.item_name')}`,
+        [invoiceId, keyVal]
+      );
+      const left = (invoiced?.q ?? 0) - (returned?.q ?? 0);
+      if (i.quantity > left) throw new Error(`Only ${left} of ${i.item_name} can still be returned on this invoice.`);
     }
-  }
+
+    await writeRowWithSyncIn(db, {
+      tableName: 'purchase_returns', recordId: id, operation: 'create', data,
+      firestorePath: `users/${userId}/purchase_returns/${id}`, userId
+    });
+    for (const item of lines) {
+      await db.runAsync(
+        `INSERT INTO purchase_return_items (id, return_id, stock_item_id, item_name, quantity, unit_cost, line_total)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [generateId('pritem'), id, item.stock_item_id || null, item.item_name, item.quantity, item.unit_cost, item.line_total]
+      );
+      if (item.stock_item_id) {
+        await addStockMovementIn(db, {
+          item_id: item.stock_item_id,
+          change: -item.quantity,
+          reason: 'adjustment',
+          date: returnDate,
+          cost_per_unit: item.unit_cost,
+          user_id: userId,
+          note: 'Purchase return',
+        });
+      }
+    }
+  });
+  afterSyncedWrite();
 
   return { ...data, created_at: now, updated_at: now, synced: 0 } as PurchaseReturn;
 };
@@ -462,25 +530,30 @@ export const getPurchaseSummary = async (userId: string): Promise<PurchaseSummar
        FROM purchase_orders WHERE user_id = ? AND is_deleted = 0`,
       [userId]
     ),
-    db.getFirstAsync<{ total_invoiced: number; total_outstanding: number }>(
-      `SELECT COALESCE(SUM(total), 0) as total_invoiced,
+    db.getAllAsync<{ currency: string | null; total_invoiced: number; total_outstanding: number }>(
+      `SELECT currency, COALESCE(SUM(total), 0) as total_invoiced,
          COALESCE(SUM(balance_due), 0) as total_outstanding
-       FROM purchase_invoices WHERE user_id = ? AND is_deleted = 0`,
+       FROM purchase_invoices WHERE user_id = ? AND is_deleted = 0 GROUP BY currency`,
       [userId]
     ),
-    db.getFirstAsync<{ paid_this_month: number }>(
-      `SELECT COALESCE(SUM(amount), 0) as paid_this_month
-       FROM supplier_payments
-       WHERE user_id = ? AND is_deleted = 0 AND payment_date >= ?`,
+    // A supplier payment settles an invoice, so it is in THAT invoice's currency —
+    // supplier_payments has no column of its own and must not grow one that could drift.
+    db.getAllAsync<{ currency: string | null; paid_this_month: number }>(
+      `SELECT pi.currency AS currency, COALESCE(SUM(sp.amount), 0) as paid_this_month
+       FROM supplier_payments sp
+       LEFT JOIN purchase_invoices pi ON pi.id = sp.invoice_id
+       WHERE sp.user_id = ? AND sp.is_deleted = 0 AND sp.payment_date >= ?
+       GROUP BY pi.currency`,
       [userId, monthStart]
     ),
   ]);
 
+  const base = await accountDefaultCurrency(db, userId);
   return {
     totalOrders: ordersRow?.total ?? 0,
     pendingOrders: ordersRow?.pending ?? 0,
-    totalInvoiced: invoicesRow?.total_invoiced ?? 0,
-    totalOutstanding: invoicesRow?.total_outstanding ?? 0,
-    totalPaidThisMonth: paidRow?.paid_this_month ?? 0,
+    totalInvoiced: totalsFrom(invoicesRow, 'total_invoiced', base),
+    totalOutstanding: totalsFrom(invoicesRow, 'total_outstanding', base),
+    totalPaidThisMonth: totalsFrom(paidRow, 'paid_this_month', base),
   };
 };

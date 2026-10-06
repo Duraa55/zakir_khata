@@ -2,6 +2,7 @@ import * as SQLite from 'expo-sqlite';
 import { classifyAccountLevel, expectedAccountLevel, AccountLevel, LevelNode, LevelReason } from './accountLevel';
 import { ENTRY_AUDIT_V31_SQL } from './entryAuditMigration';
 import { DAY_CLOSING_V33_SQL } from './dayClosingMigration';
+import { repairAttachmentsIn } from './attachmentRepair';
 // NOTE: seedTestUsers is called from AppNavigator after getDatabase() to avoid
 // a circular dependency (db.ts → userDb.ts → db.ts).
 
@@ -11,10 +12,10 @@ let db: SQLite.SQLiteDatabase | null = null;
 
 export const getDatabase = async (): Promise<SQLite.SQLiteDatabase> => {
   if (db) return db;
-  console.log('[DB] Opening SQLite database...');
+  if (__DEV__) console.log('[DB] Opening SQLite database...');
   db = await SQLite.openDatabaseAsync(DB_NAME);
   await initializeDatabase(db);
-  console.log('[DB] Database tables and migrations complete.');
+  if (__DEV__) console.log('[DB] Database tables and migrations complete.');
   return db;
 };
 
@@ -126,7 +127,7 @@ async function initializeDatabase(database: SQLite.SQLiteDatabase): Promise<void
       id TEXT PRIMARY KEY,
       item_id TEXT NOT NULL,
       change INTEGER NOT NULL,
-      reason TEXT CHECK(reason IN ('purchase','sale','adjustment')) NOT NULL,
+      reason TEXT CHECK(reason IN ('purchase','sale','adjustment','customer_return')) NOT NULL,
       date TEXT NOT NULL,
       cost_per_unit REAL, -- integer paisa (see migration v29)
       sale_price_unit REAL, -- integer paisa (see migration v29)
@@ -189,7 +190,7 @@ async function initializeDatabase(database: SQLite.SQLiteDatabase): Promise<void
       user_id TEXT NOT NULL,
       name_en TEXT NOT NULL,
       name_ur TEXT,
-      phone TEXT NOT NULL,
+      phone TEXT NOT NULL, -- relaxed to nullable by migration v43, not here (see v43)
       email TEXT,
       role TEXT NOT NULL,
       joining_date TEXT NOT NULL,
@@ -275,6 +276,51 @@ async function initializeDatabase(database: SQLite.SQLiteDatabase): Promise<void
       last_pulled_at TEXT,
       pending_count INTEGER DEFAULT 0
     );
+
+    -- Also created by migration v38. Listed here as well, like every other table, so a
+    -- database whose migration chain stalled still opens with a usable table instead of
+    -- failing at "no such table" deep inside the salary screen.
+    CREATE TABLE IF NOT EXISTS salary_month_closings (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      staff_id TEXT NOT NULL,
+      month TEXT NOT NULL,
+      closed_at TEXT NOT NULL,
+      closed_by TEXT NOT NULL,
+      closed_by_name TEXT NOT NULL,
+      salary_paisa INTEGER NOT NULL,
+      opening_advance_paisa INTEGER NOT NULL,
+      paid_paisa INTEGER NOT NULL,
+      due_paisa INTEGER NOT NULL,
+      remaining_paisa INTEGER NOT NULL,
+      carry_advance_paisa INTEGER NOT NULL,
+      note TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT,
+      synced INTEGER DEFAULT 0,
+      is_deleted INTEGER DEFAULT 0,
+      deleted_at TEXT,
+      firestore_path TEXT,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+      FOREIGN KEY (staff_id) REFERENCES staff_records(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_salary_closing_staff ON salary_month_closings(staff_id, month);
+    CREATE INDEX IF NOT EXISTS idx_salary_closing_user ON salary_month_closings(user_id);
+
+    -- Also created by migration v39: an attachment whose file had already vanished from
+    -- the picker cache before durable storage existed. The row keeps its path; this
+    -- only records the loss.
+    CREATE TABLE IF NOT EXISTS lost_attachments (
+      id TEXT PRIMARY KEY,
+      table_name TEXT NOT NULL,
+      record_id TEXT NOT NULL,
+      original_path TEXT NOT NULL,
+      detected_at TEXT NOT NULL
+    );
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_lost_attachment_unique
+      ON lost_attachments(table_name, record_id, original_path);
   `);
 
   await runMigrations(database);
@@ -290,9 +336,23 @@ async function addColumnIfNotExists(db: SQLite.SQLiteDatabase, table: string, co
 }
 
 async function runMigrations(database: SQLite.SQLiteDatabase): Promise<void> {
+  try {
+    await migrateFrom(database);
+  } catch (err: any) {
+    // A half-migrated database is the worst outcome: the app keeps running and fails
+    // later somewhere unrelated ("no such table: …"). Say which version stalled, and
+    // let it surface — never swallow it here.
+    const stalled = (await database.getFirstAsync<{ user_version: number }>('PRAGMA user_version'))?.user_version ?? 0;
+    const message = `Schema migration stalled at v${stalled}: ${err?.message || err}`;
+    if (__DEV__) console.error('[DB]', message);
+    throw new Error(message);
+  }
+}
+
+async function migrateFrom(database: SQLite.SQLiteDatabase): Promise<void> {
   const row = await database.getFirstAsync<{ user_version: number }>('PRAGMA user_version');
   let version = row?.user_version ?? 0;
-  console.log('[DB] Current schema version:', version);
+  if (__DEV__) console.log('[DB] Current schema version:', version);
 
   if (version < 1) {
     // Check if old schema (has float `amount` column instead of integer `amount_paisa`)
@@ -584,7 +644,7 @@ async function runMigrations(database: SQLite.SQLiteDatabase): Promise<void> {
       try {
         await database.runAsync('CREATE INDEX IF NOT EXISTS idx_expenses_date ON expenses(expense_date)');
       } catch (e) {
-        console.warn('Skipping idx_expenses_date creation in v8; column may not exist yet.');
+        if (__DEV__) console.warn('Skipping idx_expenses_date creation in v8; column may not exist yet.');
       }
     });
     await database.execAsync('PRAGMA user_version = 8');
@@ -1277,6 +1337,363 @@ async function runMigrations(database: SQLite.SQLiteDatabase): Promise<void> {
       await database.execAsync('PRAGMA user_version = 34');
     });
     version = 34;
+  }
+
+  if (version < 35) {
+    // Staff photos, the same two-column shape as customers (v34): the durable local
+    // copy (documentDirectory/staff_photos) and a remote URL that stays NULL until
+    // Firebase Storage upload is wired. Both nullable, so every existing row is
+    // preserved untouched. The old single picture_url column is left in place —
+    // nothing ever wrote it, and dropping a column would need a table rebuild.
+    await database.withTransactionAsync(async () => {
+      await addColumnIfNotExists(database, 'staff_records', 'photo_local_path', 'TEXT');
+      await addColumnIfNotExists(database, 'staff_records', 'photo_remote_url', 'TEXT');
+      await database.execAsync('PRAGMA user_version = 35');
+    });
+    version = 35;
+  }
+
+  if (version < 36) {
+    // Links an HR profile (staff_records) to the login it belongs to (users.id), so
+    // the app stops treating one person as two. Nullable: rows created before the
+    // unified Add Staff flow have no login and are preserved untouched. From v36 on,
+    // Add Staff creates the login and the profile together and sets this at birth.
+    await database.withTransactionAsync(async () => {
+      await addColumnIfNotExists(database, 'staff_records', 'linked_user_id', 'TEXT');
+      await database.execAsync('CREATE INDEX IF NOT EXISTS idx_staff_linked_user ON staff_records(linked_user_id)');
+      await database.execAsync('PRAGMA user_version = 36');
+    });
+    version = 36;
+  }
+
+  if (version < 37) {
+    // business_type becomes OPTIONAL. SQLite cannot drop a NOT NULL, so this is the
+    // standard table rebuild: create the new shape, copy every row across, swap, then
+    // put the indexes back. Column list is explicit so a row can never shift columns.
+    // Re-running is safe: once the column is nullable the rebuild is skipped.
+    const staffCols = await database.getAllAsync<{ name: string; notnull: number; type: string }>('PRAGMA table_info(staff_records)');
+    const businessType = staffCols.find(c => c.name === 'business_type');
+    if (businessType?.notnull) {
+      // Any column this rebuild does not know about — one added by a build that ran on
+      // this phone and nowhere else — is carried across as-is. The first version threw
+      // instead, which ABORTED THE WHOLE CHAIN: every later migration (v38's
+      // salary_month_closings among them) silently never ran on that device.
+      const knownShape = ['id','user_id','name_en','name_ur','phone','email','role','joining_date','area','business_type','address','picture_url','document_urls','status','monthly_salary','photo_local_path','photo_remote_url','linked_user_id','created_at','updated_at','synced','is_deleted','deleted_at','firestore_path'];
+      const carried = staffCols.filter(c => !knownShape.includes(c.name));
+      const carriedDefs = carried.map(c => `,\n            ${c.name} ${c.type || 'TEXT'}`).join('');
+      await database.withTransactionAsync(async () => {
+        await database.execAsync(`
+          CREATE TABLE staff_records_v37 (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            name_en TEXT NOT NULL,
+            name_ur TEXT,
+            phone TEXT NOT NULL,
+            email TEXT,
+            role TEXT NOT NULL,
+            joining_date TEXT NOT NULL,
+            area TEXT NOT NULL,
+            business_type TEXT,
+            address TEXT,
+            picture_url TEXT,
+            document_urls TEXT,
+            status TEXT CHECK(status IN ('active','inactive')) DEFAULT 'active',
+            monthly_salary REAL DEFAULT 0,
+            photo_local_path TEXT,
+            photo_remote_url TEXT,
+            linked_user_id TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT,
+            synced INTEGER DEFAULT 0,
+            is_deleted INTEGER DEFAULT 0,
+            deleted_at TEXT,
+            firestore_path TEXT${carriedDefs},
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+          )
+        `);
+        // Every column the live table has, in its own order: nothing is dropped and
+        // nothing can shift into the wrong column.
+        const copied = staffCols.map(c => c.name).join(', ');
+        await database.execAsync(`INSERT INTO staff_records_v37 (${copied}) SELECT ${copied} FROM staff_records`);
+        // staff_salary_transactions and staff_attendance carry FK clauses naming
+        // staff_records. Modern SQLite re-parses those on a rename and can refuse the
+        // swap; legacy mode leaves other tables' text alone, which is what a rebuild
+        // wants. Foreign keys are not enforced here anyway.
+        await database.execAsync('PRAGMA legacy_alter_table = ON');
+        await database.execAsync('DROP TABLE staff_records');
+        await database.execAsync('ALTER TABLE staff_records_v37 RENAME TO staff_records');
+        await database.execAsync('PRAGMA legacy_alter_table = OFF');
+        await database.execAsync('CREATE INDEX IF NOT EXISTS idx_staff_user_id ON staff_records(user_id)');
+        await database.execAsync('CREATE INDEX IF NOT EXISTS idx_staff_name ON staff_records(name_en)');
+        await database.execAsync('CREATE INDEX IF NOT EXISTS idx_staff_phone ON staff_records(phone)');
+        await database.execAsync('CREATE INDEX IF NOT EXISTS idx_staff_linked_user ON staff_records(linked_user_id)');
+        await database.execAsync('PRAGMA user_version = 37');
+      });
+    } else {
+      await database.execAsync('PRAGMA user_version = 37');
+    }
+    version = 37;
+  }
+
+  if (version < 38) {
+    // Salary month closings — the same shape as day_closings (v33): a SNAPSHOT of a
+    // month, never a lock. Each row records the salary that applied that month (so
+    // raising a salary later cannot rewrite a settled month) and the advance carried
+    // OUT of it, which is what reduces the next month's due. Purely additive.
+    await database.withTransactionAsync(async () => {
+      await database.execAsync(`
+        CREATE TABLE IF NOT EXISTS salary_month_closings (
+          id TEXT PRIMARY KEY,
+          user_id TEXT NOT NULL,
+          staff_id TEXT NOT NULL,
+          month TEXT NOT NULL,
+          closed_at TEXT NOT NULL,
+          closed_by TEXT NOT NULL,
+          closed_by_name TEXT NOT NULL,
+          salary_paisa INTEGER NOT NULL,
+          opening_advance_paisa INTEGER NOT NULL,
+          paid_paisa INTEGER NOT NULL,
+          due_paisa INTEGER NOT NULL,
+          remaining_paisa INTEGER NOT NULL,
+          carry_advance_paisa INTEGER NOT NULL,
+          note TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT,
+          synced INTEGER DEFAULT 0,
+          is_deleted INTEGER DEFAULT 0,
+          deleted_at TEXT,
+          firestore_path TEXT,
+          FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+          FOREIGN KEY (staff_id) REFERENCES staff_records(id) ON DELETE CASCADE
+        )
+      `);
+      await database.execAsync('CREATE INDEX IF NOT EXISTS idx_salary_closing_staff ON salary_month_closings(staff_id, month)');
+      await database.execAsync('CREATE INDEX IF NOT EXISTS idx_salary_closing_user ON salary_month_closings(user_id)');
+      await database.execAsync('PRAGMA user_version = 38');
+    });
+    version = 38;
+  }
+
+  if (version < 39) {
+    // Attachments saved before durableFile.ts stored the picker's CACHE path, which
+    // Android may clear at any time. Copy every surviving file into permanent storage
+    // and repoint its row; record any already gone in lost_attachments. No row is ever
+    // deleted. Also drops the placeholder staff document names ("doc_<time>.pdf") that
+    // never had a file. Idempotent: durable paths are skipped, losses recorded once.
+    await database.withTransactionAsync(async () => {
+      await database.execAsync(`
+    CREATE TABLE IF NOT EXISTS lost_attachments (
+      id TEXT PRIMARY KEY,
+      table_name TEXT NOT NULL,
+      record_id TEXT NOT NULL,
+      original_path TEXT NOT NULL,
+      detected_at TEXT NOT NULL
+    );
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_lost_attachment_unique
+      ON lost_attachments(table_name, record_id, original_path);
+      `);
+      await repairAttachmentsIn(database);
+      await database.execAsync('PRAGMA user_version = 39');
+    });
+    version = 39;
+  }
+
+  if (version < 40) {
+    // Stock coming BACK from a customer is not a purchase and not an adjustment: it
+    // reverses a sale (units return to stock, their selling value leaves the total sold).
+    // A CHECK constraint can only change by rebuilding the table, so every column the
+    // table actually has — including the ones earlier migrations added — is copied across.
+    await database.withTransactionAsync(async () => {
+      const cols = (await database.getAllAsync<{ name: string }>(`PRAGMA table_info(stock_movements)`)).map(c => c.name);
+      const extra = ["deleted_at TEXT", "created_at TEXT", "updated_at TEXT", "firestore_path TEXT"]
+        .filter(def => cols.includes(def.split(" ")[0]));
+      await database.execAsync(`
+        CREATE TABLE IF NOT EXISTS stock_movements_v40 (
+          id TEXT PRIMARY KEY,
+          item_id TEXT NOT NULL,
+          change INTEGER NOT NULL,
+          reason TEXT CHECK(reason IN ('purchase','sale','adjustment','customer_return')) NOT NULL,
+          date TEXT NOT NULL,
+          cost_per_unit REAL,
+          sale_price_unit REAL,
+          user_id TEXT NOT NULL,
+          note TEXT,
+          synced INTEGER DEFAULT 0,
+          is_deleted INTEGER DEFAULT 0${extra.map(def => ', ' + def).join('')},
+          FOREIGN KEY (item_id) REFERENCES stock_items(id) ON DELETE CASCADE,
+          FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+      `);
+      const carried = (await database.getAllAsync<{ name: string }>(`PRAGMA table_info(stock_movements_v40)`))
+        .map(c => c.name).filter(name => cols.includes(name)).join(", ");
+      await database.execAsync(`
+        INSERT OR IGNORE INTO stock_movements_v40 (${carried}) SELECT ${carried} FROM stock_movements;
+        DROP TABLE stock_movements;
+        ALTER TABLE stock_movements_v40 RENAME TO stock_movements;
+      `);
+      await database.execAsync('PRAGMA user_version = 40');
+    });
+    version = 40;
+  }
+
+  if (version < 41) {
+    // Multi-currency, step 1 of 4 (plan approved 28-Sep-2026): the COLUMNS ONLY. No
+    // screen writes anything but 'PKR' until the pickers arrive in steps 2 and 3, so
+    // defaulting every existing row is not an assumption — these books have only ever
+    // held rupees.
+    //
+    // Currency is stored on the ENTRY ROOTS the shopkeeper picks it on, and nowhere
+    // else. A bill item, a goods receipt, a supplier payment and a purchase return all
+    // belong to one of these documents and inherit its currency; giving them their own
+    // column would let a line disagree with the invoice it is on.
+    //
+    // Khata and cashbook get no column: khata has no currency picker (see
+    // useDashboardStore). What currency a khata entry is in for a non-PKR account is an
+    // open question for step 3, not something this migration decides.
+    //
+    // NOT NULL DEFAULT 'PKR' rather than a nullable column, so no reader ever has to
+    // handle a null currency. `resolveCurrency` still tolerates one for safety.
+    // Every one of these tables exists on a real device by v22, but ALTER TABLE on a
+    // missing one aborts the whole migration chain — so each is checked rather than
+    // assumed. A partial schema is not this migration's problem to fix.
+    await database.withTransactionAsync(async () => {
+      const tableExists = async (table: string) =>
+        (await database.getAllAsync<{ name: string }>(
+          "SELECT name FROM sqlite_master WHERE type='table' AND name=?", [table])).length > 0;
+      for (const [table, column] of [
+        ['users', 'default_currency'],
+        ['bills', 'currency'],
+        ['expenses', 'currency'],
+        ['purchase_orders', 'currency'],
+        ['purchase_invoices', 'currency'],
+      ] as const) {
+        if (await tableExists(table)) {
+          await addColumnIfNotExists(database, table, column, "TEXT NOT NULL DEFAULT 'PKR'");
+        }
+      }
+      await database.execAsync('PRAGMA user_version = 41');
+    });
+    version = 41;
+  }
+
+  if (version < 42) {
+    // Khata entries were joined to customers by MATCHING THE NAME STRING, so renaming a
+    // customer orphaned their whole history and two customers sharing a name shared one
+    // ledger. This adds the real link.
+    //
+    // THE BACKFILL IS DELIBERATELY CONSERVATIVE. A row is linked only when EXACTLY ONE
+    // live customer of the same owner carries that name:
+    //   * no match (a typo, or a customer since deleted) -> customer_id stays NULL
+    //   * TWO OR MORE matches (duplicate names) -> customer_id stays NULL, because the
+    //     migration cannot know which of them the entry belonged to and guessing would
+    //     silently move money onto the wrong person's ledger
+    // Nothing is deleted and no row is rewritten. `partyName` is kept on every row and
+    // remains the display fallback, so an unlinked entry still shows exactly as it does
+    // today — it simply is not attached to a customer record.
+    await database.withTransactionAsync(async () => {
+      await addColumnIfNotExists(database, 'transactions', 'customer_id', 'TEXT');
+      await database.execAsync(
+        'CREATE INDEX IF NOT EXISTS idx_transactions_customer ON transactions(customer_id)'
+      );
+      // TRIM on both sides so trailing whitespace does not block an obvious match.
+      // Case and spelling differences are NOT folded: they leave the row on partyName,
+      // which still works, rather than risking a wrong attachment.
+      await database.runAsync(`
+        UPDATE transactions
+           SET customer_id = (
+                 SELECT c.id FROM customers c
+                  WHERE c.user_id = transactions.userId
+                    AND c.is_deleted = 0
+                    AND TRIM(c.name) = TRIM(transactions.partyName)
+               )
+         WHERE customer_id IS NULL
+           AND (
+                 SELECT COUNT(*) FROM customers c
+                  WHERE c.user_id = transactions.userId
+                    AND c.is_deleted = 0
+                    AND TRIM(c.name) = TRIM(transactions.partyName)
+               ) = 1
+      `);
+      await database.execAsync('PRAGMA user_version = 42');
+    });
+    version = 42;
+  }
+
+  if (version < 43) {
+    // `staff_records.phone` becomes OPTIONAL (step (c) of removing sub-staff logins).
+    //
+    // A sub-staff is a RECORD, not an account: a staff member adds one purely to record
+    // what they pay someone, and that person never installs the app. There is no login,
+    // so there is no username, so a phone number cannot be required. The column stays
+    // for contact details when they are known — it is `users.phone` that is the login,
+    // and nothing uniqueness-related reads this one.
+    //
+    // SQLite cannot drop a NOT NULL, so this is the same table rebuild v37 used on this
+    // table for business_type: create the new shape, copy every row across by explicit
+    // column list, swap, put the indexes back. Re-running is safe — once the column is
+    // nullable the rebuild is skipped.
+    const staffCols = await database.getAllAsync<{ name: string; notnull: number; type: string }>('PRAGMA table_info(staff_records)');
+    const phoneCol = staffCols.find(c => c.name === 'phone');
+    // No staff_records table at all (entryAudit's minimal fixture schema) is not this
+    // migration's problem to fix; it must not abort the chain either.
+    if (staffCols.length > 0 && phoneCol?.notnull) {
+      // Same hard-won rule as v37: a column this rebuild does not know about — one added
+      // by a build that ran on this phone and nowhere else — is CARRIED ACROSS, never a
+      // throw. Throwing here aborts every later migration on that device.
+      const knownShape = ['id','user_id','name_en','name_ur','phone','email','role','joining_date','area','business_type','address','picture_url','document_urls','status','monthly_salary','photo_local_path','photo_remote_url','linked_user_id','created_at','updated_at','synced','is_deleted','deleted_at','firestore_path'];
+      const carried = staffCols.filter(c => !knownShape.includes(c.name));
+      const carriedDefs = carried.map(c => `,
+            ${c.name} ${c.type || 'TEXT'}`).join('');
+      await database.withTransactionAsync(async () => {
+        await database.execAsync(`
+          CREATE TABLE staff_records_v43 (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            name_en TEXT NOT NULL,
+            name_ur TEXT,
+            phone TEXT,
+            email TEXT,
+            role TEXT NOT NULL,
+            joining_date TEXT NOT NULL,
+            area TEXT NOT NULL,
+            business_type TEXT,
+            address TEXT,
+            picture_url TEXT,
+            document_urls TEXT,
+            status TEXT CHECK(status IN ('active','inactive')) DEFAULT 'active',
+            monthly_salary REAL DEFAULT 0,
+            photo_local_path TEXT,
+            photo_remote_url TEXT,
+            linked_user_id TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT,
+            synced INTEGER DEFAULT 0,
+            is_deleted INTEGER DEFAULT 0,
+            deleted_at TEXT,
+            firestore_path TEXT${carriedDefs},
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+          )
+        `);
+        const copied = staffCols.map(c => c.name).join(', ');
+        await database.execAsync(`INSERT INTO staff_records_v43 (${copied}) SELECT ${copied} FROM staff_records`);
+        // staff_salary_transactions and staff_attendance carry FK clauses naming
+        // staff_records; modern SQLite re-parses those on a rename and can refuse the
+        // swap. Legacy mode leaves other tables' text alone — exactly as v37 does.
+        await database.execAsync('PRAGMA legacy_alter_table = ON');
+        await database.execAsync('DROP TABLE staff_records');
+        await database.execAsync('ALTER TABLE staff_records_v43 RENAME TO staff_records');
+        await database.execAsync('PRAGMA legacy_alter_table = OFF');
+        await database.execAsync('CREATE INDEX IF NOT EXISTS idx_staff_user_id ON staff_records(user_id)');
+        await database.execAsync('CREATE INDEX IF NOT EXISTS idx_staff_name ON staff_records(name_en)');
+        await database.execAsync('CREATE INDEX IF NOT EXISTS idx_staff_phone ON staff_records(phone)');
+        await database.execAsync('CREATE INDEX IF NOT EXISTS idx_staff_linked_user ON staff_records(linked_user_id)');
+      });
+    }
+    // Stamped OUTSIDE the rebuild, so a device whose table is already nullable (or which
+    // has no staff_records at all) still advances and does not retry this forever.
+    await database.execAsync('PRAGMA user_version = 43');
+    version = 43;
   }
 }
 

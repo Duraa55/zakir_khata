@@ -1,19 +1,29 @@
 /**
- * accountLevel — the explicit staff / sub-staff level.
+ * accountLevel — the explicit account level.
+ *
+ * THE TREE IS TWO LEVELS: admin → staff. Nothing sits below a staff member. Sub-staff
+ * are `staff_records` rows with no login (see CLAUDE.md); they have no users row, so
+ * they have no level.
  *
  * Until v32 the level was DERIVED by walking parentId depth, so `role === 'staff'`
- * matched both levels and a wrong parentId silently promoted someone. `users.role`
+ * matched every level and a wrong parentId silently promoted someone. `users.role`
  * carries a CHECK constraint that SQLite cannot alter, and changing its values would
  * have flipped every tested permission check at once — so the level lives in its own
  * column instead.
  *
  * ⚠ SCOPE RULE: account_level is for ROLE CHECKS ONLY. Data visibility continues to
- * flow through parentId via queryHelpers.userScope(), which must stay byte-identical.
- * Never use this value to scope a query.
+ * flow through parentId via queryHelpers.userScope(). Never use this value to scope
+ * a query.
  *
  * Pure module — no database import, so it is safe for db.ts to use during migration.
  */
 
+/**
+ * 'substaff' is LEGACY. No live path can produce it any more — only the v32 backfill
+ * below, which reads databases written before the level was retired. It stays in the
+ * type (and in the column's CHECK constraint) so that migration keeps classifying old
+ * rows exactly as it always did; see classifyAccountLevel.
+ */
 export type AccountLevel = 'admin' | 'staff' | 'substaff';
 
 export interface LevelNode {
@@ -35,13 +45,20 @@ export type LevelReason =
 const MAX_WALK = 8;
 
 /**
+ * ⚠ HISTORY, NOT LIVE LOGIC. Called ONLY by the v32 backfill in db.ts, which runs on a
+ * database written before sub-staff were retired. It still knows three levels ON PURPOSE:
+ * a database that genuinely contains a three-deep tree must be classified the way it was
+ * when those rows were written. Collapsing this to two levels would PROMOTE every former
+ * sub-staff to staff during an upgrade — handing them permissions they never had, and
+ * hiding them from the sub-staff wipe, which matches on account_level = 'substaff'.
+ * Leave it alone. New accounts never reach this function.
+ *
  * The level is decided by the PARENT alone:
  *   admin role            -> admin
  *   no parent             -> staff   (root of its own tree)
  *   parent is an admin    -> staff
  *   parent is staff-level -> substaff
- *   parent missing        -> substaff (most restrictive; matches today's effective
- *                                      permissions, never promotes anyone)
+ *   parent missing        -> substaff (most restrictive; never promotes anyone)
  */
 export function classifyAccountLevel(
   node: LevelNode,
@@ -85,6 +102,9 @@ export function expectedAccountLevel(
 /**
  * Throws when role / parent / level disagree. Never silently corrects — an
  * inconsistent combination is a bug in the caller, not something to paper over.
+ *
+ * Two levels only. An account below staff is refused outright: sub-staff are records,
+ * not logins, so nothing may create one.
  */
 export function assertConsistentLevel(params: {
   role: string;
@@ -93,6 +113,10 @@ export function assertConsistentLevel(params: {
   level: AccountLevel;
 }): void {
   const { role, parentId, parentLevel, level } = params;
+
+  if (level === 'substaff') {
+    throw new Error('Sub-staff no longer have logins. Add them as a staff record instead.');
+  }
 
   if (level === 'admin') {
     if (role !== 'admin') throw new Error('Account level "admin" requires role "admin".');
@@ -104,16 +128,8 @@ export function assertConsistentLevel(params: {
     throw new Error(`Account level "${level}" requires role "staff", got "${role}".`);
   }
 
-  if (level === 'staff') {
-    if (parentId && parentLevel !== 'admin') {
-      throw new Error('A staff account must sit directly under an admin.');
-    }
-    return;
-  }
-
-  // substaff
-  if (!parentId) throw new Error('A sub-staff account must have a parent staff member.');
-  if (parentLevel !== 'staff') {
-    throw new Error('A sub-staff account must sit directly under a staff member.');
+  // staff: directly under an admin, or the root of its own tree.
+  if (parentId && parentLevel !== 'admin') {
+    throw new Error('A staff account must sit directly under an admin.');
   }
 }

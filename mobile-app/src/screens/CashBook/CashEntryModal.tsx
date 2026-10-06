@@ -1,4 +1,6 @@
 import React, { useState, useEffect } from 'react';
+import { useLanguageStore } from '../../store/useLanguageStore';
+import { categoryLabel } from '../../i18n/categoryLabel';
 import {
   View, Text, TextInput, TouchableOpacity, StyleSheet,
   ScrollView, ActivityIndicator, Alert, Modal, Image,
@@ -6,20 +8,23 @@ import {
 import * as ImagePicker from 'expo-image-picker';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useAuthStore } from '../../store/authStore';
+import { accountCurrencyLabel } from '../../utils/currency';
 import { useTransactionStore } from '../../store/transactionStore';
 import { useActivityStore } from '../../store/useActivityStore';
 import { createCashEntry, updateCashEntry } from '../../services/database/cashbookDb';
+import { persistAttachment } from '../../utils/durableFile';
 import { CashEntry } from '../../types';
 import { rupeesToPaisa, paisaToRupeesString } from '../../utils/calculations';
 import { getStockItemsByUserId } from '../../services/database/stockDb';
-import { Colors } from '../../theme';
+import { color, space, radius, type as typeScale, hairline, iconSize, touchTarget } from '../../theme/tokens';
+import { Icon } from '../../components/ui/primitives';
 import { ScreenContainer } from '../../components/ui/ScreenContainer';
 import { DateField } from '../../components/ui/DateField';
 import { todayDate, isValidDateValue } from '../../utils/dates';
+import { useAttachmentOpener } from '../../components/ui/AttachmentViewer';
 
-const GREEN = '#22C55E';
-const DARK_RED = '#8B0000';
-const RED_LIGHT = '#DC2626';
+// The accent is the MEANING of the entry: money in or money out. Same pair as the
+// Cash Book's two buttons, so the form reads as a continuation of the tap that opened it.
 
 const IN_CATEGORIES = ['Sales', 'Commission', 'Loan Received', 'Recovery', 'Investment', 'Other'];
 const OUT_CATEGORIES = ['Purchase', 'Rent', 'Salary', 'Utilities', 'Transport', 'Food', 'Other'];
@@ -37,12 +42,16 @@ interface Props {
  */
 export const CashEntryModal = ({ navigation, route }: Props) => {
   const existingEntry = route?.params?.entry;
+  // One shared opener: images preview in-app, other files go to the phone, a missing
+  // file says so — the same behaviour in every book.
+  const { openAttachment, attachmentViewer } = useAttachmentOpener();
   const mode: 'in' | 'out' = existingEntry ? existingEntry.direction : (route?.params?.mode ?? 'in');
   const isIn = mode === 'in';
-  const ACCENT = isIn ? GREEN : DARK_RED;
+  const ACCENT = isIn ? color.moneyIn : color.moneyOut;
   const CATEGORIES = isIn ? IN_CATEGORIES : OUT_CATEGORIES;
 
   const { user } = useAuthStore();
+  const { t } = useLanguageStore();
   const { loadCashBook } = useTransactionStore();
   const { logActivity } = useActivityStore();
 
@@ -56,6 +65,9 @@ export const CashEntryModal = ({ navigation, route }: Props) => {
   const [category, setCategory] = useState(
     existingEntry?.category || CATEGORIES[0]
   );
+  // New entries use whatever day Cash Book was showing when this was opened — no
+  // date field needed there. Editing an existing entry still shows it, since that's
+  // the one place correcting a wrong date makes sense.
   const viewedDay = route?.params?.date;
   const [date, setDate] = useState(
     existingEntry ? existingEntry.date : (viewedDay && isValidDateValue(viewedDay) ? viewedDay : todayDate())
@@ -76,7 +88,7 @@ export const CashEntryModal = ({ navigation, route }: Props) => {
   const handleTakePhoto = async () => {
     const permissionResult = await ImagePicker.requestCameraPermissionsAsync();
     if (!permissionResult.granted) {
-      Alert.alert('Permission Denied', 'Camera permission is required to take photos.');
+      Alert.alert(t('commonPermissionDenied'), t('commonCameraPermission'));
       return;
     }
 
@@ -93,7 +105,7 @@ export const CashEntryModal = ({ navigation, route }: Props) => {
   const handlePickFromGallery = async () => {
     const permissionResult = await ImagePicker.requestMediaLibraryPermissionsAsync();
     if (!permissionResult.granted) {
-      Alert.alert('Permission Denied', 'Gallery permission is required to choose photos.');
+      Alert.alert(t('commonPermissionDenied'), t('commonGalleryPermission'));
       return;
     }
 
@@ -110,7 +122,7 @@ export const CashEntryModal = ({ navigation, route }: Props) => {
 
   const handleSelectPhoto = () => {
     Alert.alert(
-      'Attach Photo',
+      t('cashAddPhoto'),
       'Choose an option to add a photo attachment',
       [
         {
@@ -155,11 +167,11 @@ export const CashEntryModal = ({ navigation, route }: Props) => {
   const validate = (): boolean => {
     const e: Record<string, string> = {};
     const paisa = rupeesToPaisa(amount);
-    if (!amount.trim()) e.amount = 'Amount is required';
-    else if (paisa === null) e.amount = 'Enter a valid positive amount';
-    if (!description.trim()) e.description = 'Description / Item is required';
-    if (!category) e.category = 'Please select a category';
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) e.date = 'Date must be YYYY-MM-DD';
+    if (!amount.trim()) e.amount = t('commonAmountRequired');
+    else if (paisa === null) e.amount = t('commonAmountInvalid');
+    if (!description.trim()) e.description = t('cashDescriptionRequired');
+    if (!category) e.category = t('commonCategoryRequired');
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) e.date = t('commonDateInvalid');
     setErrors(e);
     return Object.keys(e).length === 0;
   };
@@ -171,6 +183,9 @@ export const CashEntryModal = ({ navigation, route }: Props) => {
     try {
       const cleanDescription = description.trim();
       const cleanNote = note.trim() || null;
+      // The picker hands back a CACHE path Android may clear at any time; file a durable
+      // copy first and save only that. An already-durable path (editing) is kept as-is.
+      const durableAttachment = attachmentUrl ? await persistAttachment('cash', attachmentUrl) : null;
 
       if (existingEntry) {
         await updateCashEntry(existingEntry.id, user.id, {
@@ -180,7 +195,7 @@ export const CashEntryModal = ({ navigation, route }: Props) => {
           date: date,
           category: category,
           note: cleanNote,
-          attachment_url: attachmentUrl || null,
+          attachment_url: durableAttachment,
         });
 
         await logActivity({
@@ -195,7 +210,7 @@ export const CashEntryModal = ({ navigation, route }: Props) => {
       } else {
         const entry = await createCashEntry(
           user.id, cleanDescription, paisa, mode, date,
-          attachmentUrl || null, category, cleanNote
+          durableAttachment, category, cleanNote
         );
 
         await logActivity({
@@ -213,7 +228,7 @@ export const CashEntryModal = ({ navigation, route }: Props) => {
       navigation.goBack();
     } catch (err: any) {
       if (__DEV__) console.error('[CashEntry] Failed to save:', err);
-      Alert.alert('Error', err?.message || 'Failed to save entry. Please try again.');
+      Alert.alert(t('commonError'), err?.message || t('commonSaveFailed'));
     } finally {
       setLoading(false);
     }
@@ -225,7 +240,7 @@ export const CashEntryModal = ({ navigation, route }: Props) => {
         <TouchableOpacity onPress={() => navigation.goBack()} style={styles.backBtn}>
           <Text style={styles.backArrow}>{'<'}</Text>
         </TouchableOpacity>
-        <Text style={styles.headerTitle}>{existingEntry ? 'Edit Entry' : (isIn ? 'Cash In' : 'Cash Out')}</Text>
+        <Text style={styles.headerTitle}>{existingEntry ? t('cashEditEntry') : t(isIn ? 'cashIn' : 'cashOut')}</Text>
         <View style={{ width: 36 }} />
       </View>
 
@@ -233,7 +248,10 @@ export const CashEntryModal = ({ navigation, route }: Props) => {
 
         {/* Amount Stepper & Presets */}
         <View style={styles.fieldWrap}>
-          <Text style={styles.label}>Amount (Rs.) *</Text>
+          {/* No picker here by decision: a cashbook entry is denominated in the ACCOUNT
+              default (CLAUDE.md). The label therefore has to NAME that currency — it read
+              "(Rs.)" in every account, telling a Dubai shop to type rupees into a dirham field. */}
+          <Text style={styles.label}>{t('cashAmountLabel', { currency: accountCurrencyLabel(user?.defaultCurrency) })} *</Text>
           <View style={[styles.stepperBox, errors.amount ? styles.inputError : null]}>
             <TouchableOpacity
               style={styles.stepperBtn}
@@ -246,11 +264,11 @@ export const CashEntryModal = ({ navigation, route }: Props) => {
             </TouchableOpacity>
 
             <View style={styles.stepperCenter}>
-              <Text style={[styles.rsPrefix, { color: isIn ? GREEN : RED_LIGHT }]}>Rs.</Text>
+              <Text style={[styles.rsPrefix, { color: ACCENT }]}>Rs.</Text>
               <TextInput
                 style={styles.amountInput}
                 placeholder="0"
-                placeholderTextColor={Colors.textGray}
+                placeholderTextColor={color.textMuted}
                 value={amount}
                 onChangeText={t => { setAmount(t); setErrors(p => ({ ...p, amount: '' })); }}
                 keyboardType="decimal-pad"
@@ -288,12 +306,12 @@ export const CashEntryModal = ({ navigation, route }: Props) => {
 
         {/* Description / Item */}
         <View style={styles.fieldWrap}>
-          <Text style={styles.label}>Description / Item *</Text>
+          <Text style={styles.label}>{t('cashDescriptionLabel')} *</Text>
           <View style={{ flexDirection: 'row', gap: 8 }}>
             <TextInput
               style={[styles.input, { flex: 1 }, errors.description ? styles.inputError : null]}
-              placeholder="e.g. Shop Rent, Sales"
-              placeholderTextColor={Colors.textGray}
+              placeholder={t('cashDescriptionPlaceholder')}
+              placeholderTextColor={color.textMuted}
               value={description}
               onChangeText={t => { setDescription(t); setErrors(p => ({ ...p, description: '' })); }}
             />
@@ -302,7 +320,8 @@ export const CashEntryModal = ({ navigation, route }: Props) => {
                 style={styles.selectStockBtn}
                 onPress={() => setShowItemModal(true)}
               >
-                <Text style={styles.selectStockBtnText}>📦 Stock</Text>
+                <Icon name="package" size={iconSize.sm} tint={color.brand} />
+                <Text style={styles.selectStockBtnText}>{t('cashStockButton')}</Text>
               </TouchableOpacity>
             )}
           </View>
@@ -311,7 +330,7 @@ export const CashEntryModal = ({ navigation, route }: Props) => {
 
         {/* Category */}
         <View style={styles.fieldWrap}>
-          <Text style={styles.label}>Category *</Text>
+          <Text style={styles.label}>{t('commonCategory')} *</Text>
           <View style={styles.chips}>
             {CATEGORIES.map(cat => (
               <TouchableOpacity
@@ -319,36 +338,37 @@ export const CashEntryModal = ({ navigation, route }: Props) => {
                 style={[styles.chip, category === cat && { backgroundColor: ACCENT, borderColor: ACCENT }]}
                 onPress={() => { setCategory(cat); setErrors(p => ({ ...p, category: '' })); }}
               >
-                <Text style={[styles.chipText, category === cat && styles.chipTextActive]}>
-                  {cat}
-                </Text>
+                <Text style={[styles.chipText, category === cat && styles.chipTextActive]}>{categoryLabel(t, cat)}</Text>
               </TouchableOpacity>
             ))}
           </View>
           {!!errors.category && <Text style={styles.errText}>{errors.category}</Text>}
         </View>
 
-        {/* Date */}
-        <View style={styles.fieldWrap}>
-          <Text style={styles.label}>Date *</Text>
-          <DateField
-            style={[styles.input, errors.date ? styles.inputError : null]}
-            value={date}
-            onChange={(txt) => {
-              setDate(txt);
-              if (errors.date) setErrors((p) => ({ ...p, date: '' }));
-            }}
-          />
-          {!!errors.date && <Text style={styles.errText}>{errors.date}</Text>}
-        </View>
+        {/* Date — only shown when editing; a new entry uses the day Cash Book
+            was already showing, so asking again would just repeat it. */}
+        {!!existingEntry && (
+          <View style={styles.fieldWrap}>
+            <Text style={styles.label}>{t('commonDate')} *</Text>
+            <DateField
+              style={[styles.input, errors.date ? styles.inputError : null]}
+              value={date}
+              onChange={(txt) => {
+                setDate(txt);
+                if (errors.date) setErrors((p) => ({ ...p, date: '' }));
+              }}
+            />
+            {!!errors.date && <Text style={styles.errText}>{errors.date}</Text>}
+          </View>
+        )}
 
         {/* Note / Details */}
         <View style={styles.fieldWrap}>
-          <Text style={styles.label}>Note / Details (Optional)</Text>
+          <Text style={styles.label}>{t('cashNoteLabel')}</Text>
           <TextInput
             style={[styles.input, styles.textArea]}
-            placeholder="Add notes, invoice number, party name..."
-            placeholderTextColor={Colors.textGray}
+            placeholder={t('cashNotePlaceholder')}
+            placeholderTextColor={color.textMuted}
             multiline
             numberOfLines={3}
             value={note}
@@ -358,24 +378,26 @@ export const CashEntryModal = ({ navigation, route }: Props) => {
 
         {/* Photo / Bill Attachment */}
         <View style={styles.fieldWrap}>
-          <Text style={styles.label}>Photo / Bill Attachment (Optional)</Text>
+          <Text style={styles.label}>{t('cashPhotoLabel')}</Text>
           {attachmentUrl ? (
             <View style={styles.attachmentContainer}>
-              <Image source={{ uri: attachmentUrl }} style={styles.attachmentPreview} />
+              <TouchableOpacity onPress={() => openAttachment(attachmentUrl)} activeOpacity={0.85} accessibilityRole="imagebutton">
+                <Image source={{ uri: attachmentUrl }} style={styles.attachmentPreview} />
+              </TouchableOpacity>
               <View style={styles.attachmentInfo}>
-                <Text style={styles.attachmentTitle}>Photo Attached</Text>
+                <Text style={styles.attachmentTitle}>{t('cashPhotoAttached')}</Text>
                 <TouchableOpacity onPress={handleSelectPhoto}>
-                  <Text style={styles.attachmentChangeText}>Change Photo</Text>
+                  <Text style={styles.attachmentChangeText}>{t('cashChangePhoto')}</Text>
                 </TouchableOpacity>
               </View>
               <TouchableOpacity style={styles.attachmentRemoveBtn} onPress={() => setAttachmentUrl(null)}>
-                <Text style={styles.attachmentRemoveText}>✕</Text>
+                <Icon name="x" size={iconSize.sm} tint={color.textSecondary} />
               </TouchableOpacity>
             </View>
           ) : (
             <TouchableOpacity style={styles.attachmentButton} onPress={handleSelectPhoto}>
-              <Text style={styles.attachmentButtonIcon}>📷</Text>
-              <Text style={styles.attachmentButtonText}>Add Receipt or Photo</Text>
+              <Icon name="camera" size={iconSize.md} tint={color.textSecondary} />
+              <Text style={styles.attachmentButtonText}>{t('cashAddPhoto')}</Text>
             </TouchableOpacity>
           )}
         </View>
@@ -383,18 +405,18 @@ export const CashEntryModal = ({ navigation, route }: Props) => {
         {/* Buttons */}
         <View style={styles.btnRow}>
           <TouchableOpacity style={styles.cancelBtn} onPress={() => navigation.goBack()} disabled={loading}>
-            <Text style={styles.cancelText}>Cancel</Text>
+            <Text style={styles.cancelText}>{t('commonCancel')}</Text>
           </TouchableOpacity>
 
           <TouchableOpacity
-            style={[styles.submitBtn, { backgroundColor: ACCENT, shadowColor: ACCENT }, loading && { opacity: 0.65 }]}
+            style={[styles.submitBtn, { backgroundColor: ACCENT }, loading && { opacity: 0.4 }]}
             onPress={handleSubmit}
             disabled={loading}
           >
             {loading ? (
-              <ActivityIndicator color="#fff" />
+              <ActivityIndicator color={color.textInverse} />
             ) : (
-              <Text style={styles.submitText}>{isIn ? '+ CASH IN' : '- CASH OUT'}</Text>
+              <Text style={styles.submitText}>{t(isIn ? 'cashIn' : 'cashOut')}</Text>
             )}
           </TouchableOpacity>
         </View>
@@ -411,17 +433,17 @@ export const CashEntryModal = ({ navigation, route }: Props) => {
           <View style={styles.modalContent}>
             {/* Modal Header */}
             <View style={styles.modalHeader}>
-              <Text style={styles.modalTitle}>Select Stock Item</Text>
+              <Text style={styles.modalTitle}>{t('cashSelectStockItem')}</Text>
               <TouchableOpacity onPress={() => { setShowItemModal(false); setSearchQuery(''); }}>
-                <Text style={styles.closeBtnText}>✕</Text>
+                <Icon name="x" size={iconSize.md} tint={color.textSecondary} />
               </TouchableOpacity>
             </View>
 
             {/* Search Box */}
             <TextInput
               style={styles.modalSearchInput}
-              placeholder="Search items by name or category..."
-              placeholderTextColor={Colors.textGray}
+              placeholder={t('cashSearchStockPlaceholder')}
+              placeholderTextColor={color.textMuted}
               value={searchQuery}
               onChangeText={setSearchQuery}
             />
@@ -431,9 +453,7 @@ export const CashEntryModal = ({ navigation, route }: Props) => {
               {filteredStockItems.length === 0 ? (
                 <View style={styles.emptyContainer}>
                   <Text style={styles.emptyText}>
-                    {stockItems.length === 0 
-                      ? "No items saved in stock.\nGo to 'Stock Book' to add items."
-                      : "No matching items found."}
+                    {t(stockItems.length === 0 ? 'cashNoStockItems' : 'cashNoMatchingItems')}
                   </Text>
                 </View>
               ) : (
@@ -475,137 +495,149 @@ export const CashEntryModal = ({ navigation, route }: Props) => {
           </View>
         </View>
       </Modal>
+      {attachmentViewer}
     </SafeAreaView>
   );
 };
 
 const styles = StyleSheet.create({
-  safe: { flex: 1, backgroundColor: Colors.bgPrimary },
+  safe: { flex: 1, backgroundColor: color.surface },
   header: {
     flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
-    paddingHorizontal: 16, height: 56, backgroundColor: Colors.bgCard,
-    borderBottomWidth: 1, borderBottomColor: Colors.border,
+    paddingHorizontal: space.lg, height: 56, backgroundColor: color.surface,
+    borderBottomWidth: hairline, borderBottomColor: color.border,
   },
-  closeBtnText: { fontSize: 18, color: Colors.textGray, fontWeight: '700' },
-  backBtn: { width: 36, justifyContent: 'center' },
-  backArrow: { fontSize: 24, color: Colors.textWhite, fontWeight: '700' },
-  headerTitle: { fontSize: 18, fontWeight: '700', color: Colors.textWhite },
+  closeBtnText: { ...typeScale.body, color: color.textSecondary },
+  backBtn: { width: touchTarget, justifyContent: 'center' },
+  backArrow: { fontSize: 24, color: color.textPrimary },
+  headerTitle: { ...typeScale.title, color: color.textPrimary },
 
-  form: { padding: 20, paddingBottom: 40 },
-  fieldWrap: { marginBottom: 20 },
-  label: { fontSize: 13, fontWeight: '700', color: Colors.textWhite, marginBottom: 8 },
+  form: { padding: space.xl, paddingBottom: space.xxxl },
+  fieldWrap: { marginBottom: space.xl },
+  label: { ...typeScale.label, color: color.textSecondary, marginBottom: space.sm },
 
   input: {
-    backgroundColor: Colors.bgInput, borderWidth: 1, borderColor: Colors.border,
-    borderRadius: 12, paddingHorizontal: 16, paddingVertical: 12,
-    fontSize: 15, color: Colors.textWhite, minHeight: 48,
+    backgroundColor: color.surfaceRaised, borderWidth: hairline, borderColor: color.border,
+    borderRadius: radius.md, paddingHorizontal: space.lg, paddingVertical: space.md,
+    ...typeScale.body, color: color.textPrimary, minHeight: touchTarget,
   },
   textArea: { minHeight: 85, textAlignVertical: 'top' },
-  inputError: { borderColor: Colors.error },
-  errText: { fontSize: 12, color: Colors.error, marginTop: 4 },
+  inputError: { borderColor: color.moneyOut },
+  errText: { ...typeScale.caption, color: color.moneyOut, marginTop: space.xs },
 
   selectStockBtn: {
-    backgroundColor: Colors.bgInput, borderWidth: 1, borderColor: Colors.primary,
-    borderRadius: 12, paddingHorizontal: 14, justifyContent: 'center', alignItems: 'center', height: 48,
+    flexDirection: 'row', alignItems: 'center', gap: space.xs,
+    backgroundColor: color.surface, borderWidth: hairline, borderColor: color.borderStrong,
+    borderRadius: radius.md, paddingHorizontal: space.md,
+    justifyContent: 'center', minHeight: touchTarget,
   },
-  selectStockBtnText: { fontSize: 13, fontWeight: '700', color: Colors.primaryLight },
+  selectStockBtnText: { ...typeScale.label, color: color.brand },
 
+  // The amount is the one figure that matters on this screen, so it gets the space.
   stepperBox: {
-    flexDirection: 'row', alignItems: 'center', backgroundColor: Colors.bgInput,
-    borderRadius: 16, paddingHorizontal: 12, height: 56,
-    borderWidth: 1, borderColor: Colors.border,
+    flexDirection: 'row', alignItems: 'center', backgroundColor: color.surfaceRaised,
+    borderRadius: radius.lg, paddingHorizontal: space.md, minHeight: 56,
+    borderWidth: hairline, borderColor: color.border,
   },
   stepperBtn: {
-    width: 36, height: 36, borderRadius: 18,
-    backgroundColor: Colors.bgCard, alignItems: 'center', justifyContent: 'center',
-    borderWidth: 1, borderColor: Colors.border,
+    width: touchTarget, height: touchTarget, borderRadius: radius.pill,
+    backgroundColor: color.surface, alignItems: 'center', justifyContent: 'center',
+    borderWidth: hairline, borderColor: color.border,
   },
-  stepperIcon: { fontSize: 22, fontWeight: '700', color: Colors.textWhite },
+  stepperIcon: { fontSize: 22, color: color.textPrimary },
   stepperCenter: { flex: 1, flexDirection: 'row', alignItems: 'center', justifyContent: 'center' },
-  rsPrefix: { fontSize: 18, fontWeight: '700', marginRight: 4, color: Colors.textGray },
-  amountInput: { fontSize: 24, fontWeight: '900', color: Colors.textWhite, minWidth: 100, textAlign: 'center' },
+  rsPrefix: { ...typeScale.title, marginRight: space.xs },
+  amountInput: {
+    fontSize: 28, fontWeight: '500', color: color.textPrimary,
+    minWidth: 100, textAlign: 'center',
+  },
 
-  presetPillRow: { flexDirection: 'row', gap: 8, marginTop: 12, justifyContent: 'space-between' },
+  presetPillRow: { flexDirection: 'row', gap: space.sm, marginTop: space.md, justifyContent: 'space-between' },
   presetPill: {
-    flex: 1, backgroundColor: Colors.bgInput,
-    borderWidth: 1, borderColor: Colors.border,
-    borderRadius: 18, paddingVertical: 10, alignItems: 'center',
+    flex: 1, backgroundColor: color.surface,
+    borderWidth: hairline, borderColor: color.border,
+    borderRadius: radius.pill, paddingVertical: space.sm, alignItems: 'center',
   },
-  presetPillActive: { backgroundColor: Colors.primary, borderColor: Colors.primary },
-  presetPillText: { fontSize: 12, fontWeight: '700', color: Colors.textGray },
-  presetPillTextActive: { fontSize: 12, fontWeight: '900', color: Colors.textWhite },
+  presetPillActive: { backgroundColor: color.accent, borderColor: color.accent },
+  presetPillText: { ...typeScale.caption, color: color.textSecondary },
+  presetPillTextActive: { ...typeScale.caption, color: color.textInverse },
 
-  chips: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
+  chips: { flexDirection: 'row', flexWrap: 'wrap', gap: space.sm },
+  // No fixed width: a longer Urdu category simply makes its own chip wider.
   chip: {
-    backgroundColor: Colors.bgInput, borderWidth: 1, borderColor: Colors.border,
-    borderRadius: 20, paddingHorizontal: 16, paddingVertical: 8,
+    backgroundColor: color.surface, borderWidth: hairline, borderColor: color.border,
+    borderRadius: radius.pill, paddingHorizontal: space.lg, paddingVertical: space.sm,
+    minHeight: 36, justifyContent: 'center',
   },
-  chipText: { fontSize: 13, fontWeight: '600', color: Colors.textGray },
-  chipTextActive: { color: Colors.textWhite, fontWeight: '700' },
+  chipText: { ...typeScale.label, color: color.textSecondary },
+  chipTextActive: { color: color.textInverse },
 
   attachmentButton: {
     flexDirection: 'row', alignItems: 'center', justifyContent: 'center',
-    backgroundColor: Colors.bgInput, borderWidth: 1.5, borderColor: Colors.border,
-    borderStyle: 'dashed', borderRadius: 12, paddingVertical: 14, gap: 8, minHeight: 48,
+    backgroundColor: color.surfaceRaised, borderWidth: hairline, borderColor: color.borderStrong,
+    borderStyle: 'dashed', borderRadius: radius.md, paddingVertical: space.md,
+    gap: space.sm, minHeight: touchTarget,
   },
   attachmentButtonIcon: { fontSize: 18 },
-  attachmentButtonText: { fontSize: 14, color: Colors.textGray, fontWeight: '600' },
+  attachmentButtonText: { ...typeScale.body, color: color.textSecondary },
 
   attachmentContainer: {
     flexDirection: 'row', alignItems: 'center',
-    backgroundColor: Colors.bgInput, borderWidth: 1, borderColor: Colors.border,
-    borderRadius: 12, padding: 10,
+    backgroundColor: color.surfaceRaised, borderWidth: hairline, borderColor: color.border,
+    borderRadius: radius.md, padding: space.md,
   },
-  attachmentPreview: { width: 48, height: 48, borderRadius: 8, backgroundColor: Colors.bgCard },
-  attachmentInfo: { flex: 1, marginLeft: 12 },
-  attachmentTitle: { fontSize: 14, fontWeight: '700', color: Colors.textWhite },
-  attachmentChangeText: { fontSize: 13, color: Colors.primaryLight, fontWeight: '600', marginTop: 2 },
+  attachmentPreview: { width: 48, height: 48, borderRadius: radius.sm, backgroundColor: color.surface },
+  attachmentInfo: { flex: 1, marginLeft: space.md },
+  attachmentTitle: { ...typeScale.bodyMedium, color: color.textPrimary },
+  attachmentChangeText: { ...typeScale.label, color: color.brand, marginTop: 2 },
   attachmentRemoveBtn: {
-    width: 32, height: 32, borderRadius: 16,
-    backgroundColor: Colors.bgCard, alignItems: 'center', justifyContent: 'center',
+    width: touchTarget, height: touchTarget, borderRadius: radius.pill,
+    alignItems: 'center', justifyContent: 'center',
   },
-  attachmentRemoveText: { fontSize: 14, fontWeight: '700', color: Colors.textGray },
+  attachmentRemoveText: { ...typeScale.body, color: color.textSecondary },
 
-  btnRow: { flexDirection: 'row', gap: 12, marginTop: 10 },
+  btnRow: { flexDirection: 'row', gap: space.md, marginTop: space.md },
   cancelBtn: {
-    flex: 1, backgroundColor: Colors.bgInput, borderRadius: 12, paddingVertical: 14,
-    alignItems: 'center', justifyContent: 'center', borderWidth: 1, borderColor: Colors.border, minHeight: 48,
+    flex: 1, backgroundColor: color.surface, borderRadius: radius.md,
+    paddingVertical: space.md, alignItems: 'center', justifyContent: 'center',
+    borderWidth: hairline, borderColor: color.borderStrong, minHeight: touchTarget,
   },
-  cancelText: { fontSize: 14, fontWeight: '700', color: Colors.textGray },
+  cancelText: { ...typeScale.bodyMedium, color: color.textPrimary },
 
   submitBtn: {
-    flex: 2, borderRadius: 12, paddingVertical: 14, alignItems: 'center', justifyContent: 'center',
-    minHeight: 48, shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.5, shadowRadius: 8, elevation: 6,
+    flex: 2, borderRadius: radius.md, paddingVertical: space.md,
+    alignItems: 'center', justifyContent: 'center', minHeight: touchTarget,
   },
-  submitText: { color: '#fff', fontSize: 15, fontWeight: '800', letterSpacing: 0.5 },
+  submitText: { ...typeScale.bodyMedium, color: color.textInverse },
 
-  modalOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.75)', justifyContent: 'flex-end' },
+  modalOverlay: { flex: 1, backgroundColor: color.scrim, justifyContent: 'flex-end' },
   modalContent: {
-    backgroundColor: Colors.bgCard, borderTopLeftRadius: 24, borderTopRightRadius: 24,
-    padding: 20, maxHeight: '80%', borderWidth: 1, borderColor: Colors.border,
+    backgroundColor: color.surface, borderTopLeftRadius: radius.lg, borderTopRightRadius: radius.lg,
+    padding: space.xl, maxHeight: '80%', borderWidth: hairline, borderColor: color.border,
   },
-  modalHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 },
-  modalTitle: { fontSize: 18, fontWeight: '800', color: Colors.textWhite },
+  modalHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: space.md },
+  modalTitle: { ...typeScale.title, color: color.textPrimary },
   modalSearchInput: {
-    backgroundColor: Colors.bgInput, borderWidth: 1, borderColor: Colors.border,
-    borderRadius: 12, paddingHorizontal: 16, paddingVertical: 10,
-    fontSize: 14, color: Colors.textWhite, marginBottom: 12,
+    backgroundColor: color.surfaceRaised, borderWidth: hairline, borderColor: color.border,
+    borderRadius: radius.md, paddingHorizontal: space.lg, paddingVertical: space.md,
+    ...typeScale.body, color: color.textPrimary, marginBottom: space.md,
   },
   modalList: { maxHeight: 350 },
-  emptyContainer: { paddingVertical: 32, alignItems: 'center' },
-  emptyText: { fontSize: 14, color: Colors.textGray, textAlign: 'center', lineHeight: 20 },
+  emptyContainer: { paddingVertical: space.xxxl, alignItems: 'center' },
+  emptyText: { ...typeScale.body, color: color.textMuted, textAlign: 'center', lineHeight: 20 },
 
   itemRow: {
     flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center',
-    paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: Colors.border,
+    paddingVertical: space.md, borderBottomWidth: hairline, borderBottomColor: color.border,
+    minHeight: touchTarget,
   },
-  itemInfo: { flex: 1, paddingRight: 8 },
-  itemNameEn: { fontSize: 15, fontWeight: '600', color: Colors.textWhite },
-  itemNameUr: { fontSize: 13, color: Colors.textGray, marginTop: 2 },
-  itemCategory: { fontSize: 11, color: Colors.textMuted, marginTop: 2 },
-  itemMeta: { alignItems: 'flex-end' },
-  itemPrice: { fontSize: 15, fontWeight: '700', color: Colors.primaryLight },
-  itemQty: { fontSize: 12, marginTop: 2, fontWeight: '600' },
-  normalStock: { color: Colors.textGray },
-  lowStock: { color: Colors.error },
+  itemInfo: { flex: 1, paddingRight: space.sm },
+  itemNameEn: { ...typeScale.bodyMedium, color: color.textPrimary },
+  itemNameUr: { ...typeScale.label, color: color.textSecondary, marginTop: 2 },
+  itemCategory: { ...typeScale.caption, color: color.textMuted, marginTop: 2 },
+  itemMeta: { alignItems: 'flex-end', flexShrink: 0 },
+  itemPrice: { ...typeScale.bodyMedium, color: color.textPrimary },
+  itemQty: { ...typeScale.caption, marginTop: 2 },
+  normalStock: { color: color.textSecondary },
+  lowStock: { color: color.moneyOut },
 });

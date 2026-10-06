@@ -1,29 +1,79 @@
-import React, { useEffect, useRef } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
+import { useLanguageStore } from '../../store/useLanguageStore';
 import {
   View, Text, TouchableOpacity, StyleSheet, SectionList, ScrollView,
-  Animated, ActivityIndicator, Dimensions, Keyboard, Platform
+  Animated, ActivityIndicator, Keyboard, Platform
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useAuthStore } from '../../store/authStore';
 import { useExpenseStore } from '../../store/useExpenseStore';
 import { Expense } from '../../types/expense.types';
-import { Colors } from '../../theme';
 import { TopHeaderWithBooks } from '../../components/TopHeaderWithBooks';
-import { formatCurrency } from '../../utils/calculations';
+import { ReadOnlyBanner } from '../../components/ui/ReadOnlyBanner';
+import { PdfReportButton } from '../../components/ui/PdfReportButton';
+import { SummaryBar, SummaryFigure, AmountText, Icon, Button, AmountStack } from '../../components/ui/primitives';
+import { color, space, radius, hairline, touchTarget, iconSize, type as typeScale, chrome } from '../../theme/tokens';
+import { DateField } from '../../components/ui/DateField';
 import { DateRangeFilter, DateRange, describeRange } from '../../components/ui/DateRangeFilter';
-import { toDateValue, formatDisplayDate } from '../../utils/dates';
+import { toDateValue, todayDate, localDate, parseDateValue, formatDisplayDate } from '../../utils/dates';
 
-export const ExpenseBookScreen = ({ navigation }: any) => {
+export const ExpenseBookScreen = ({ navigation, route }: any) => {
+  // Staff Book → staff → Entries → Expense: that person's expenses, read-only.
+  const viewAs: { userId: string; name: string } | undefined = route?.params?.viewAs;
   const insets = useSafeAreaInsets();
   const { user } = useAuthStore();
+  const { t } = useLanguageStore();
   const {
     expenses, loading, loadingMore, dayTotals, monthlyTotal,
     fetchExpenses, loadMoreExpenses, filter, setFilter
   } = useExpenseStore();
 
+  /**
+   * ONE authoritative filter: the store's {startDate, endDate}. The day navigator
+   * and the range control are two ways of writing to it, never two competing
+   * states — which is what made the previous mount-time override swallow the
+   * store's "this month" default.
+   *
+   *   • A single day is simply the range collapsed onto itself (start === end).
+   *     Stepping or tapping Today writes that day to both ends.
+   *   • Setting a real from–to range leaves start !== end, so the day selection
+   *     stops being a day selection by definition — nothing to clear by hand.
+   *
+   * So "is a day selected?" is derived, never stored.
+   */
   const range: DateRange = { startDate: filter.startDate, endDate: filter.endDate };
+  const selectedDay =
+    filter.startDate && filter.startDate === filter.endDate ? filter.startDate : null;
+
+  const [today, setToday] = useState(todayDate());
+  const isToday = selectedDay === today;
+
   const setRange = (next: DateRange) => {
-    if (user) setFilter(user.id, { ...filter, ...next });
+    if (user) setFilter(user.id, { ...filter, ...next }, viewAs?.userId);
+  };
+  const selectDay = (day: string) => {
+    if (user) setFilter(user.id, { ...filter, startDate: day, endDate: day }, viewAs?.userId);
+  };
+
+  // Midnight rollover: only meaningful while a single day is being viewed, and only
+  // when that day is the one that just stopped being today.
+  useEffect(() => {
+    const interval = setInterval(() => {
+      const now = todayDate();
+      if (now !== today) {
+        if (selectedDay === today) selectDay(now);
+        setToday(now);
+      }
+    }, 60000);
+    return () => clearInterval(interval);
+  }, [today, selectedDay]);
+
+  const stepDay = (days: number) => {
+    const base = parseDateValue(selectedDay || today) || new Date();
+    base.setDate(base.getDate() + days);
+    const next = localDate(base);
+    if (next > today) return;
+    selectDay(next);
   };
 
   const pulseAnim = useRef(new Animated.Value(0)).current;
@@ -55,7 +105,7 @@ export const ExpenseBookScreen = ({ navigation }: any) => {
   }, [pulseAnim]);
 
   const loadData = () => {
-    if (user) fetchExpenses(user.id);
+    if (user) fetchExpenses(user.id, undefined, viewAs?.userId);
   };
 
   useEffect(() => {
@@ -69,7 +119,11 @@ export const ExpenseBookScreen = ({ navigation }: any) => {
     loadData();
   }, [user]);
 
-  const rangeLabel = describeRange(range);
+  // The headline says which control is actually driving the figure below it.
+  const periodLabel = selectedDay
+    ? (isToday ? t('commonToday') : formatDisplayDate(selectedDay))
+    : describeRange(range);
+  const dayNavLabel = t('expensePickDay');
 
   // Loaded expenses grouped by expense day; a day straddling a page boundary keeps
   // ONE section whose header shows the day's whole SQL subtotal.
@@ -83,19 +137,19 @@ export const ExpenseBookScreen = ({ navigation }: any) => {
     return [...byDay.entries()].map(([day, data]) => ({ day, data }));
   }, [expenses]);
 
-  // Day header: entry count and the day's total spend.
+  // Day header: entry count and the day's total spend (money out, so red).
   const renderSectionHeader = React.useCallback(({ section }: { section: { day: string } }) => {
-    const t = dayTotals[section.day];
+    const day = dayTotals[section.day];
     return (
       <View style={styles.dayHeader}>
-        <View style={{ flex: 1 }}>
+        <View style={styles.dayLeft}>
           <Text style={styles.dayTitle}>{formatDisplayDate(section.day)}</Text>
-          {t && <Text style={styles.dayCount}>{t.entryCount} {t.entryCount === 1 ? 'Entry' : 'Entries'}</Text>}
+          {day && <Text style={styles.dayCount}>{day.entryCount} {t(day.entryCount === 1 ? 'commonEntry' : 'commonEntries')}</Text>}
         </View>
-        {t && (
+        {day && (
           <View style={styles.dayRight}>
-            <Text style={[styles.dayColLabel, { color: Colors.textGray }]}>Spent</Text>
-            <Text style={[styles.dayColVal, { color: Colors.error }]}>{formatCurrency(t.totalExpense)}</Text>
+            <Text style={styles.dayColLabel}>{t('expenseSpent')}</Text>
+            <AmountStack totals={day.totalExpense} tone="out" size="label" />
           </View>
         )}
       </View>
@@ -106,13 +160,13 @@ export const ExpenseBookScreen = ({ navigation }: any) => {
 
   const renderItem = ({ item }: { item: Expense }) => {
     return (
-      <TouchableOpacity 
+      <TouchableOpacity
         style={styles.itemRow}
         onPress={() => navigation.navigate('ExpenseDetail', { expense: item })}
       >
         <View style={styles.itemTopLine}>
           <Text style={styles.description} numberOfLines={1}>{item.description}</Text>
-          <Text style={styles.amount}>{formatCurrency(item.amount)}</Text>
+          <AmountText paisa={item.amount} tone="out" currency={item.currency} />
         </View>
 
         <View style={styles.itemBottomLine}>
@@ -125,34 +179,87 @@ export const ExpenseBookScreen = ({ navigation }: any) => {
   };
 
   return (
-    <View style={[styles.container, { paddingBottom: insets.bottom }]}>
-      
+    <View style={styles.container}>
+
       {/* Top Header with Profile & Books Bar */}
-      <TopHeaderWithBooks navigation={navigation} activeBook="ExpensesTab" />
+      {viewAs
+        ? <ReadOnlyBanner name={viewAs.name} book="Expense" onBack={() => navigation.goBack()} />
+        : <TopHeaderWithBooks navigation={navigation} activeBook="ExpensesTab" />}
 
       {/* Summary Card — total is the SQL sum of the SAME filter the list uses */}
-      <View style={styles.summaryCard}>
-        <Text style={styles.summaryTitle}>Total expense {rangeLabel}</Text>
-        <Text style={styles.summaryAmount}>{formatCurrency(monthlyTotal)}</Text>
+      <SummaryBar>
+        <SummaryFigure label={t('expenseHeroTotal', { period: periodLabel })}>
+          <AmountStack totals={monthlyTotal} size="title" fit textStyle={styles.summaryAmount} />
+        </SummaryFigure>
+      </SummaryBar>
+
+      {/* Day navigator — a shortcut that collapses the range onto one day. The
+          from–to control below is the same filter, widened. */}
+      <View style={styles.dayNavRow}>
+        <TouchableOpacity onPress={() => stepDay(-1)} style={styles.dayNavBtn} activeOpacity={0.7} accessibilityRole="button" accessibilityLabel={t('expensePreviousDay')}>
+          <Icon name="chevron-left" size={iconSize.md} tint={color.textPrimary} />
+        </TouchableOpacity>
+
+        {/* Jump straight to a day. Empty while a multi-day range is active, so the
+            placeholder is the honest state rather than a date nothing is filtered to. */}
+        <View style={styles.dayNavFieldWrap}>
+          <DateField
+            value={selectedDay || ''}
+            onChange={selectDay}
+            maximumDate={new Date()}
+            placeholder={dayNavLabel}
+            style={styles.dayNavField}
+            textStyle={styles.dayNavFieldText}
+          />
+        </View>
+
+        <TouchableOpacity
+          onPress={() => stepDay(1)}
+          style={[styles.dayNavBtn, isToday && styles.dayNavBtnDisabled]}
+          disabled={isToday}
+          activeOpacity={0.7}
+          accessibilityRole="button"
+          accessibilityLabel={t('expenseNextDay')}
+        >
+          <Icon name="chevron-right" size={iconSize.md} tint={isToday ? color.textMuted : color.textPrimary} />
+        </TouchableOpacity>
+
+        {!isToday && (
+          <TouchableOpacity onPress={() => selectDay(today)} style={styles.todayChip} activeOpacity={0.7}>
+            <Text style={styles.todayChipText}>{t('commonToday')}</Text>
+          </TouchableOpacity>
+        )}
       </View>
 
-      <View style={{ paddingHorizontal: 12 }}>
-        <DateRangeFilter value={range} onChange={setRange}
-          fieldStyle={styles.rangeField} textStyle={styles.rangeText} />
+      {/* Range filter — previous months stay reachable, and the total above follows it.
+          The export shares this line, the same arrangement the Bill Book uses, and goes
+          through the same PdfReportButton so the books' exports cannot drift apart. The
+          expense PDF and CSV were already written (pdfGenerator's `expense` branch, over
+          the very rows this screen shows) and simply had no way in from here. The sheet
+          opens on its own default month; the presets still reach a day, a week or any
+          custom span, so the range above is not passed as a period. */}
+      <View style={styles.rangeWrap}>
+        <View style={styles.rangeFilter}>
+          <DateRangeFilter value={range} onChange={setRange}
+            fieldStyle={styles.rangeField} textStyle={styles.rangeText} />
+        </View>
+        {/* The export covers the VIEWER's own book, never the person being viewed — hidden in read-only. */}
+        {!viewAs && <PdfReportButton onPress={() => navigation.navigate('DownloadOptionsModal', { reportType: 'expense' })} />}
       </View>
 
       {/* Content */}
       {loading ? (
         <View style={styles.center}>
-          <ActivityIndicator size="large" color={Colors.primary} />
+          <ActivityIndicator size="large" color={color.accent} />
         </View>
       ) : expenses.length === 0 ? (
-        <ScrollView contentContainerStyle={{ flexGrow: 1, paddingBottom: 140, justifyContent: 'center', alignItems: 'center', paddingHorizontal: 20 }}>
+        <ScrollView contentContainerStyle={styles.emptyScroll}>
           <View style={styles.emptyState}>
-            <View style={{ alignItems: 'center' }}>
-              <Text style={styles.instructionText}>1- Create expenses</Text>
-              <Text style={styles.instructionText}>2- Manage your expense</Text>
-              <Text style={styles.instructionText}>3- Keep record of all expenses</Text>
+            <Icon name="file-text" size={40} tint={color.textMuted} />
+            <View style={styles.instructions}>
+              <Text style={styles.instructionText}>{t('expenseStep1')}</Text>
+              <Text style={styles.instructionText}>{t('expenseStep2')}</Text>
+              <Text style={styles.instructionText}>{t('expenseStep3')}</Text>
             </View>
           </View>
         </ScrollView>
@@ -163,11 +270,11 @@ export const ExpenseBookScreen = ({ navigation }: any) => {
           renderItem={renderItem}
           renderSectionHeader={renderSectionHeader}
           stickySectionHeadersEnabled
-          contentContainerStyle={{ padding: 12, paddingBottom: 140 }}
-          SectionSeparatorComponent={() => <View style={{ height: 8 }} />}
+          contentContainerStyle={styles.listContent}
+          SectionSeparatorComponent={() => <View style={styles.gap} />}
           onEndReached={loadMore}
           onEndReachedThreshold={0.5}
-          ListFooterComponent={loadingMore ? <ActivityIndicator style={{ margin: 16 }} color={Colors.primary} /> : null}
+          ListFooterComponent={loadingMore ? <ActivityIndicator style={styles.footerSpinner} color={color.accent} /> : null}
           initialNumToRender={10}
           maxToRenderPerBatch={10}
           windowSize={5}
@@ -176,11 +283,9 @@ export const ExpenseBookScreen = ({ navigation }: any) => {
       )}
 
       {/* Add Button */}
-      {!isKeyboardVisible && (
-        <View style={[styles.addBtnContainer, { bottom: 85 + Math.max(insets.bottom, 8) }]}>
-          <TouchableOpacity style={styles.addBtn} onPress={() => navigation.navigate('AddExpenseModal')}>
-            <Text style={styles.addBtnText}>+ CREATE EXPENSE</Text>
-          </TouchableOpacity>
+      {!isKeyboardVisible && !viewAs && (
+        <View style={[styles.addBtnContainer, { bottom: space.lg }]}>
+          <Button label={t('expenseCreate')} icon="plus" onPress={() => navigation.navigate('AddExpenseModal')} style={styles.addBtn} />
         </View>
       )}
     </View>
@@ -188,85 +293,74 @@ export const ExpenseBookScreen = ({ navigation }: any) => {
 };
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: Colors.bgPrimary },
+  container: { flex: 1, backgroundColor: color.surface },
 
-  header: {
-    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
-    backgroundColor: Colors.bgCard, paddingHorizontal: 16, height: 56,
-    borderBottomWidth: 1, borderBottomColor: Colors.border,
+  dayNavRow: {
+    flexDirection: 'row', alignItems: 'center', gap: space.sm,
+    marginHorizontal: space.md, marginTop: space.xs, marginBottom: space.md,
   },
-  backBtn: { width: 36, justifyContent: 'center' },
-  backArrow: { fontSize: 28, color: Colors.textWhite, fontWeight: '300' },
-  headerTitle: { fontSize: 18, fontWeight: '700', color: Colors.textWhite },
-
-  summaryCard: {
-    flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center',
-    backgroundColor: Colors.bgCard, marginHorizontal: 12, marginTop: 12,
-    borderRadius: 14, padding: 16,
-    borderWidth: 1, borderColor: Colors.border,
-    shadowColor: '#000', shadowOffset: { width: 0, height: 3 }, shadowOpacity: 0.25, elevation: 3,
-    marginBottom: 12
+  dayNavBtn: {
+    width: touchTarget, height: touchTarget, borderRadius: radius.pill,
+    backgroundColor: color.surface, borderWidth: hairline, borderColor: color.borderStrong,
+    alignItems: 'center', justifyContent: 'center',
   },
+  dayNavBtnDisabled: { borderColor: color.border },
+  dayNavFieldWrap: { flex: 1 },
+  dayNavField: {
+    justifyContent: 'center',
+    backgroundColor: color.surfaceRaised, borderWidth: hairline, borderColor: color.border,
+    borderRadius: radius.md, paddingHorizontal: space.md, paddingVertical: space.sm, minHeight: touchTarget,
+  },
+  dayNavFieldText: { ...typeScale.label, color: color.textPrimary },
+  rangeWrap: { flexDirection: 'row', alignItems: 'center', gap: space.sm, paddingHorizontal: space.md },
+  rangeFilter: { flex: 1 },
   rangeField: {
-    backgroundColor: Colors.bgInput, borderWidth: 1, borderColor: Colors.border,
-    borderRadius: 12, paddingHorizontal: 12, paddingVertical: 10, marginTop: 4,
+    backgroundColor: color.surfaceRaised, borderWidth: hairline, borderColor: color.border,
+    borderRadius: radius.md, paddingHorizontal: space.md, minHeight: touchTarget, marginTop: space.xs,
   },
-  rangeText: { fontSize: 12, color: Colors.textGray, fontWeight: '600' },
-  // Day header — the Cash Book day-header banner with the day's spend.
-  dayHeader: {
-    flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center',
-    backgroundColor: Colors.bgCard, borderRadius: 12, paddingVertical: 12, paddingHorizontal: 14,
-    borderWidth: 1, borderColor: Colors.border, marginBottom: 8,
+  rangeText: { ...typeScale.label, color: color.textPrimary },
+  todayChip: {
+    minHeight: touchTarget, paddingHorizontal: space.md, borderRadius: radius.pill,
+    backgroundColor: color.accent, justifyContent: 'center',
   },
-  dayTitle: { fontSize: 13, fontWeight: '800', color: Colors.textWhite, letterSpacing: 0.5 },
-  dayCount: { fontSize: 12, color: Colors.textGray, marginTop: 2 },
-  dayRight: { alignItems: 'flex-end' },
-  dayColLabel: { fontSize: 12, fontWeight: '700', textAlign: 'right', marginBottom: 2 },
-  dayColVal: { fontSize: 13, fontWeight: '800', textAlign: 'right', flexShrink: 0 },
+  todayChipText: { ...typeScale.label, fontWeight: typeScale.bodyMedium.fontWeight, color: color.textInverse },
 
-  summaryTitle: { fontSize: 13, color: Colors.textGray, fontWeight: '600', flex: 1, marginRight: 12 },
-  summaryAmount: { fontSize: 16, fontWeight: '800', color: Colors.error, flexShrink: 0, textAlign: 'right' },
+  // Day header — a raised band with the day's spend.
+  dayHeader: {
+    flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', gap: space.md,
+    backgroundColor: color.surfaceRaised, borderRadius: radius.md, paddingVertical: chrome.dayPadY, paddingHorizontal: space.md,
+    borderWidth: hairline, borderColor: color.border, marginBottom: space.sm,
+  },
+  dayLeft: { flex: 1 },
+  dayTitle: { ...typeScale.caption, color: color.textSecondary },
+  dayCount: { ...typeScale.caption, color: color.textSecondary, marginTop: 2 },
+  dayRight: { alignItems: 'flex-end', flexShrink: 0 },
+  dayColLabel: { ...typeScale.caption, color: color.textSecondary, marginBottom: 2 },
+
+  summaryAmount: { color: color.onBrand },
 
   itemRow: {
-    backgroundColor: Colors.bgCard, borderRadius: 14, padding: 14, marginBottom: 10,
-    borderWidth: 1, borderColor: Colors.border,
-    shadowColor: '#000', shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.2, elevation: 2
+    backgroundColor: color.surface, borderRadius: radius.md, padding: space.md, marginBottom: chrome.rowGap,
+    borderWidth: hairline, borderColor: color.border, minHeight: touchTarget + space.md,
   },
-  itemTopLine: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 },
-  description: { flex: 1, fontSize: 15, fontWeight: '700', color: Colors.textWhite, marginRight: 16 },
-  amount: { fontSize: 15, fontWeight: '800', color: Colors.error },
+  itemTopLine: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', gap: space.lg, marginBottom: space.xs },
+  description: { ...typeScale.bodyMedium, flex: 1, color: color.textPrimary },
 
   itemBottomLine: { flexDirection: 'row', alignItems: 'center' },
-  dateText: { fontSize: 11, color: Colors.textGray },
-  divider: { width: 1, height: 10, backgroundColor: Colors.border, marginHorizontal: 8 },
-  noteText: { flex: 1, fontSize: 11, color: Colors.textMuted },
+  dateText: { ...typeScale.caption, color: color.textSecondary },
+  divider: { width: hairline, height: 10, backgroundColor: color.border, marginHorizontal: space.sm },
+  noteText: { ...typeScale.caption, flex: 1, color: color.textMuted },
 
   center: { flex: 1, justifyContent: 'center', alignItems: 'center' },
-  emptyState: { flex: 1, justifyContent: 'center', alignItems: 'center' },
-  emptyIcons: { position: 'relative', width: 140, height: 140, alignItems: 'center', justifyContent: 'center' },
-  shieldWrap: { position: 'absolute', top: -10, left: -10, backgroundColor: Colors.bgCard, borderRadius: 40 },
-  instructionText: { fontSize: 14, color: Colors.textGray, marginBottom: 8 },
-  arrowWrap: { marginTop: 24 },
-  arrowIcon: { fontSize: 36, color: Colors.primaryLight, fontWeight: '800' },
+  emptyScroll: { flexGrow: 1, paddingBottom: chrome.listBottom, justifyContent: 'center', alignItems: 'center', paddingHorizontal: space.xl },
+  emptyState: { flex: 1, justifyContent: 'center', alignItems: 'center', gap: space.lg },
+  instructions: { alignItems: 'flex-start', gap: space.sm },
+  instructionText: { ...typeScale.body, color: color.textSecondary },
 
-  addBtnContainer: {
-    position: 'absolute', bottom: 75, left: 0, right: 0, alignItems: 'center'
-  },
-  addBtn: {
-    backgroundColor: Colors.primary, width: '80%', height: 50, borderRadius: 25,
-    justifyContent: 'center', alignItems: 'center',
-    shadowColor: Colors.primary, shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.5, shadowRadius: 8, elevation: 6
-  },
-  addBtnText: { color: Colors.textWhite, fontSize: 15, fontWeight: '800', letterSpacing: 0.5 },
+  listContent: { padding: space.md, paddingBottom: chrome.listBottom },
+  gap: { height: space.sm },
+  footerSpinner: { margin: space.lg },
 
-  tabBar: {
-    backgroundColor: Colors.bgCard, borderTopWidth: 1, borderTopColor: Colors.border, height: 60, flexDirection: 'row'
-  },
-  tabItem: { width: Dimensions.get('window').width / 5, alignItems: 'center', justifyContent: 'center', paddingVertical: 6 },
-  tabItemActive: {},
-  tabIcon: { fontSize: 18, marginBottom: 2 },
-  tabLabel: { fontSize: 11, fontWeight: '600', color: Colors.textGray },
-  tabLabelActive: { color: Colors.primaryLight },
-  tabIndicator: { position: 'absolute', bottom: 2, width: 24, height: 3, backgroundColor: Colors.primaryLight, borderRadius: 2 },
+  addBtnContainer: { position: 'absolute', right: space.lg, alignItems: 'flex-end' },
+  addBtn: { minHeight: chrome.fab, paddingHorizontal: space.lg, borderRadius: radius.pill },
 });
-

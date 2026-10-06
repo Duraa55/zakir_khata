@@ -19,19 +19,19 @@ export const IS_FIREBASE_CONFIGURED =
 let firebaseInitialized = false;
 
 export const initializeFirebase = (): void => {
-  console.log('[Firebase] Starting initialization...');
+  if (__DEV__) console.log('[Firebase] Starting initialization...');
   try {
     if (!IS_FIREBASE_CONFIGURED) {
-      console.log('[Firebase] Env vars missing, skipping Firebase init.');
+      if (__DEV__) console.log('[Firebase] Env vars missing, skipping Firebase init.');
       return;
     }
     if (!getApps().length) {
       initializeApp(firebaseConfig);
     }
     firebaseInitialized = true;
-    console.log('[Firebase] Auth ready.');
+    if (__DEV__) console.log('[Firebase] Auth ready.');
   } catch (error) {
-    console.error('[Firebase] Init failed:', error);
+    if (__DEV__) console.error('[Firebase] Init failed:', error);
   }
 };
 

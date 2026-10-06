@@ -82,10 +82,10 @@ export const getReminders = async (
   
   let query = `
     SELECT * FROM reminders 
-    WHERE (user_id = ? OR user_id IN (SELECT id FROM users WHERE parentId = ?) OR user_id IN (SELECT id FROM users WHERE parentId IN (SELECT id FROM users WHERE parentId = ?))) 
+    WHERE user_id = ? 
       AND is_deleted = 0
   `;
-  const params: any[] = [userId, userId, userId];
+  const params: any[] = [userId];
 
   if (statusFilter) {
     query += ' AND status = ?';
@@ -103,11 +103,11 @@ export const getTodayPendingRemindersCount = async (userId: string): Promise<num
 
   const result = await db.getFirstAsync<{ count: number }>(
     `SELECT COUNT(*) as count FROM reminders 
-     WHERE (user_id = ? OR user_id IN (SELECT id FROM users WHERE parentId = ?) OR user_id IN (SELECT id FROM users WHERE parentId IN (SELECT id FROM users WHERE parentId = ?))) 
+     WHERE user_id = ? 
        AND is_deleted = 0
        AND status = 'pending'
        AND date(due_date) <= date(?)`,
-    [userId, userId, userId, today]
+    [userId, today]
   );
   
   return result?.count || 0;

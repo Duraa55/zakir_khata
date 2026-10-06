@@ -1,5 +1,5 @@
 import { getDatabase } from '../db';
-import { DateRangeFilter, buildReportQuery } from './types';
+import { DateRangeFilter } from './types';
 
 export type CashFlowSummary = {
   openingCash: number;
@@ -14,8 +14,14 @@ export const getCashFlowSummary = async (
   filters: DateRangeFilter
 ): Promise<CashFlowSummary> => {
   const db = await getDatabase();
-  const { whereClause, params } = buildReportQuery(userId, 'date', filters);
-  const whereClauseWithoutDates = buildReportQuery(userId, 'date', {}).whereClause;
+  // OWN-ONLY, on the columns cashbook really has (userId / isDeleted — it has no
+  // user_id, so the shared report builder never matched a row). Same owner and the
+  // same live-row predicate as the Cash Book, so the report equals the book.
+  const whereClauseWithoutDates = 'userId = ? AND isDeleted = 0 AND COALESCE(is_deleted, 0) = 0';
+  let whereClause = whereClauseWithoutDates;
+  const params: string[] = [userId];
+  if (filters.startDate) { whereClause += ' AND date(date) >= date(?)'; params.push(filters.startDate); }
+  if (filters.endDate) { whereClause += ' AND date(date) <= date(?)'; params.push(filters.endDate); }
 
   // 1. Opening Cash (All cash up to the startDate)
   let openingCash = 0;
@@ -27,7 +33,7 @@ export const getCashFlowSummary = async (
       FROM cashbook
       WHERE ${whereClauseWithoutDates} AND date(date) < date(?)
     `;
-    const startRes = await db.getFirstAsync<{ balance: number }>(startQuery, [params[0], params[1], params[2], filters.startDate]);
+    const startRes = await db.getFirstAsync<{ balance: number }>(startQuery, [userId, filters.startDate]);
     openingCash = startRes?.balance || 0;
   } else {
     // If no start date, opening cash is 0

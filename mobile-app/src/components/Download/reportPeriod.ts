@@ -10,11 +10,17 @@ export type ReportPeriod = { startDate?: string; endDate?: string };
 
 export type ReportPreset = 'today' | 'week' | 'month' | 'custom';
 
-export const REPORT_PRESETS: { key: ReportPreset; label: string }[] = [
-  { key: 'today', label: 'Today' },
-  { key: 'week', label: '7 days' },
-  { key: 'month', label: 'This month' },
-  { key: 'custom', label: 'Custom' },
+/**
+ * The presets, in the order they are shown. KEY ONLY — these carried English `label`
+ * strings that nothing ever read: DownloadOptionsModal maps the key to a dictionary key
+ * itself. A second set of labels that no one renders is a label free to disagree with
+ * the one on screen, and in two languages it can only ever be wrong in one of them.
+ */
+export const REPORT_PRESETS: { key: ReportPreset }[] = [
+  { key: 'today' },
+  { key: 'week' },
+  { key: 'month' },
+  { key: 'custom' },
 ];
 
 /** Concrete local-calendar bounds for a preset, computed at `now`. */

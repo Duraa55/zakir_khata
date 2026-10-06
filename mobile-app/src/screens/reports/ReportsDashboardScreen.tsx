@@ -1,49 +1,83 @@
 import React from 'react';
-import { View, Text, ScrollView, TouchableOpacity, Dimensions } from 'react-native';
+import { useLanguageStore } from '../../store/useLanguageStore';
+import type { TKey } from '../../i18n/en';
+import { View, Text, ScrollView, Pressable, StyleSheet } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import { StackScreenProps } from '@react-navigation/stack';
-import { useAuthStore } from '../../store/authStore';
+import { Icon, IconName } from '../../components/ui/primitives';
+import { color, space, radius, hairline, iconSize, type as typeScale } from '../../theme/tokens';
 
 type Props = StackScreenProps<any, any>;
 
+// Each tile says in plain words what question the report answers.
+const reportTiles: { id: string; titleKey: TKey; descKey: TKey; icon: IconName; screen: string }[] = [
+  { id: 'sales', titleKey: 'repSales', descKey: 'repSalesDesc', icon: 'trending-up', screen: 'SalesReport' },
+  { id: 'pnl', titleKey: 'repPnl', descKey: 'repPnlDesc', icon: 'pie-chart', screen: 'ProfitLossReport' },
+  { id: 'expense', titleKey: 'repExpenses', descKey: 'repExpensesDesc', icon: 'credit-card', screen: 'ExpenseReport' },
+  { id: 'cash', titleKey: 'repCashFlow', descKey: 'repCashFlowDesc', icon: 'repeat', screen: 'CashFlowReport' },
+  { id: 'inventory', titleKey: 'repInventory', descKey: 'repInventoryDesc', icon: 'package', screen: 'InventoryReport' },
+  { id: 'parties', titleKey: 'repCustomers', descKey: 'repCustomersDesc', icon: 'users', screen: 'PartyReport' },
+  { id: 'staff', titleKey: 'repStaff', descKey: 'repStaffDesc', icon: 'user-check', screen: 'StaffReport' },
+];
+
 export const ReportsDashboardScreen: React.FC<Props> = ({ navigation }) => {
-  const user = useAuthStore(state => state.user);
-  
-  const reportTiles = [
-    { id: 'sales', title: 'Sales Report', icon: '📈', desc: 'Daily, weekly trends & averages', screen: 'SalesReport' },
-    { id: 'pnl', title: 'Profit & Loss', icon: '💰', desc: 'Revenue, COGS & margins', screen: 'ProfitLossReport' },
-    { id: 'expense', title: 'Expense Report', icon: '📉', desc: 'Category breakdown', screen: 'ExpenseReport' },
-    { id: 'cash', title: 'Cash Flow', icon: '💸', desc: 'In & out balance flow', screen: 'CashFlowReport' },
-    { id: 'inventory', title: 'Inventory', icon: '📦', desc: 'Valuation & performance', screen: 'InventoryReport' },
-    { id: 'parties', title: 'Parties', icon: '👥', desc: 'Customers & Suppliers', screen: 'PartyReport' },
-    { id: 'staff', title: 'Staff', icon: '🧑‍💼', desc: 'Performance & Attendance', screen: 'StaffReport' },
-  ];
-
+  const { t } = useLanguageStore();
   return (
-    <View className="flex-1 bg-gray-50">
-      <View className="bg-blue-600 px-6 pt-12 pb-6 rounded-b-3xl shadow-sm">
-        <Text className="text-blue-100 text-sm font-medium uppercase tracking-wider mb-1">Analytics</Text>
-        <Text className="text-white text-3xl font-bold">Reports Center</Text>
-        <Text className="text-blue-100 mt-2 text-base">Gain insights into your business</Text>
-      </View>
-
-      <ScrollView className="flex-1 px-4 pt-6" contentContainerStyle={{ paddingBottom: 40 }}>
-        <View className="flex-row flex-wrap justify-between">
-          {reportTiles.map((tile) => (
-            <TouchableOpacity 
-              key={tile.id}
-              className="bg-white p-4 rounded-2xl mb-4 shadow-sm border border-gray-100"
-              style={{ width: '48%' }}
-              onPress={() => navigation.navigate(tile.screen)}
-            >
-              <View className="bg-blue-50 w-12 h-12 rounded-full items-center justify-center mb-3">
-                <Text className="text-2xl">{tile.icon}</Text>
-              </View>
-              <Text className="text-gray-900 font-bold text-base mb-1">{tile.title}</Text>
-              <Text className="text-gray-500 text-xs leading-tight">{tile.desc}</Text>
-            </TouchableOpacity>
-          ))}
-        </View>
-      </ScrollView>
+  <SafeAreaView style={styles.safe} edges={['top']}>
+    <View style={styles.header}>
+      <Text style={styles.title}>{t('repTitle')}</Text>
+      <Text style={styles.subtitle}>{t('repPick')}</Text>
     </View>
+
+    <ScrollView contentContainerStyle={styles.content}>
+      {reportTiles.map(tile => (
+        <Pressable
+          key={tile.id}
+          onPress={() => navigation.navigate(tile.screen)}
+          accessibilityRole="button"
+          accessibilityLabel={t(tile.titleKey)}
+          style={({ pressed }) => [styles.row, pressed && styles.rowPressed]}
+        >
+          <View style={styles.iconBox}>
+            <Icon name={tile.icon} size={iconSize.md} tint={color.accent} />
+          </View>
+          <View style={styles.rowText}>
+            <Text style={styles.rowTitle}>{t(tile.titleKey)}</Text>
+            <Text style={styles.rowDesc}>{t(tile.descKey)}</Text>
+          </View>
+          <Text style={styles.chevron}>›</Text>
+        </Pressable>
+      ))}
+    </ScrollView>
+  </SafeAreaView>
   );
 };
+
+const styles = StyleSheet.create({
+  safe: { flex: 1, backgroundColor: color.surface },
+  header: {
+    paddingHorizontal: space.lg, paddingTop: space.lg, paddingBottom: space.md,
+    borderBottomWidth: hairline, borderBottomColor: color.border,
+  },
+  title: { ...typeScale.title, color: color.textPrimary },
+  subtitle: { ...typeScale.label, color: color.textSecondary, marginTop: space.xs },
+
+  content: { padding: space.lg, gap: space.sm, paddingBottom: space.xxxl },
+  // One full-width row per report: Urdu titles and descriptions get the whole line.
+  row: {
+    flexDirection: 'row', alignItems: 'center', gap: space.md,
+    backgroundColor: color.surface, borderRadius: radius.md,
+    borderWidth: hairline, borderColor: color.border,
+    paddingVertical: space.md, paddingHorizontal: space.lg, minHeight: 64,
+  },
+  rowPressed: { backgroundColor: color.surfacePressed },
+  iconBox: {
+    width: 40, height: 40, borderRadius: radius.md,
+    backgroundColor: color.surfaceRaised, borderWidth: hairline, borderColor: color.border,
+    alignItems: 'center', justifyContent: 'center',
+  },
+  rowText: { flex: 1 },
+  rowTitle: { ...typeScale.bodyMedium, color: color.textPrimary },
+  rowDesc: { ...typeScale.caption, color: color.textSecondary, marginTop: 2 },
+  chevron: { fontSize: 22, color: color.textMuted },
+});

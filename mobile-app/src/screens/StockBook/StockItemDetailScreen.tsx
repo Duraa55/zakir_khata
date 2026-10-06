@@ -1,14 +1,15 @@
 import React, { useEffect, useState, useMemo, useRef } from 'react';
-import { View, Text, StyleSheet, FlatList, TouchableOpacity, ActivityIndicator, Modal, TextInput, Alert, ScrollView } from 'react-native';
+import { useLanguageStore } from '../../store/useLanguageStore';
+import { View, Text, StyleSheet, FlatList, TouchableOpacity, ActivityIndicator, Modal, TextInput, Alert, ScrollView, KeyboardAvoidingView, Platform } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { StockItem, StockMovement } from '../../types/stock.types';
-import { getItemMovements, getItemMovementMonths, addStockMovement } from '../../services/database/stockDb';
+import { getItemMovements, getItemMovementMonths, addStockMovement, getItemSales, ItemSales } from '../../services/database/stockDb';
 import { PAGE_SIZE, PageCursor } from '../../services/database/pagination';
-import { formatCurrency } from '../../utils/calculations';
+import { formatCurrency, rupeesToPaisa, paisaToRupeesString } from '../../utils/calculations';
 import { getDisplayName } from '../../utils/displayName';
-import { useSettingsStore } from '../../store/useSettingsStore';
 import { useAuthStore } from '../../store/authStore';
-import { Colors } from '../../theme';
+import { color, space, radius, type as typeScale, hairline, iconSize, touchTarget } from '../../theme/tokens';
+import { Icon, AmountText } from '../../components/ui/primitives';
 import { ScreenContainer } from '../../components/ui/ScreenContainer';
 import { DateField } from '../../components/ui/DateField';
 import { todayDate } from '../../utils/dates';
@@ -21,14 +22,20 @@ const getCurrentMonthKey = () => {
 };
 
 export const StockItemDetailScreen = ({ route, navigation }: any) => {
-  const { item } = route.params as { item: StockItem };
+  // readOnly: opened from someone else's (Staff Book drill-down) Stock — no stock in/out.
+  const { item, readOnly } = route.params as { item: StockItem; readOnly?: boolean };
+  // Sold all time and its selling value, net of customer returns (SQL aggregates).
+  const [sales, setSales] = useState<ItemSales>({ soldQty: 0, returnedQty: 0, netSoldQty: 0, soldValue: 0, returnedValue: 0, netSoldValue: 0 });
+  // The price for THIS entry. Prices change month to month, so every stock in / out /
+  // return carries its own — the item's saved price is just the starting value.
+  const [inputPrice, setInputPrice] = useState('');
   const [movements, setMovements] = useState<StockMovement[]>([]);
   const [loading, setLoading] = useState(true);
-  const { nameDisplayMode } = useSettingsStore();
   const { user } = useAuthStore();
+  const { t } = useLanguageStore();
 
   const [modalVisible, setModalVisible] = useState(false);
-  const [modalMode, setModalMode] = useState<'in' | 'out'>('in');
+  const [modalMode, setModalMode] = useState<'in' | 'out' | 'return'>('in');
   const [inputQty, setInputQty] = useState('');
   const [inputNote, setInputNote] = useState('');
   const [inputDate, setInputDate] = useState(() => todayDate());
@@ -78,6 +85,14 @@ export const StockItemDetailScreen = ({ route, navigation }: any) => {
   };
 
   useEffect(() => { loadMovements(); }, [item.id, selectedMonth]);
+  // All-time figures: they do not depend on the month being viewed.
+  useEffect(() => {
+    let active = true;
+    getItemSales(item.id)
+      .then(s => { if (active) setSales(s); })
+      .catch(err => { if (__DEV__) console.error('[Stock] sales failed:', err); });
+    return () => { active = false; };
+  }, [item.id]);
 
   // Generate available month options in chronological sequential order (Jan to Dec)
   const availableMonths = useMemo(() => {
@@ -111,10 +126,13 @@ export const StockItemDetailScreen = ({ route, navigation }: any) => {
   const filteredMovements = movements;
   const monthlyStats = { totalIn: stats.totalIn, totalOut: stats.totalOut, netChange: stats.totalIn - stats.totalOut };
 
-  const openModal = (mode: 'in' | 'out') => {
+  const openModal = (mode: 'in' | 'out' | 'return') => {
     setModalMode(mode);
     setInputQty('');
     setInputNote('');
+    // Starts from the item's saved price (blank when it was never set), and can be changed.
+    const saved = mode === 'in' ? item.purchase_price : item.sale_price;
+    setInputPrice(saved ? paisaToRupeesString(saved) : '');
     // Default entry date to current selected month date or today
     const todayStr = todayDate();
     if (selectedMonth !== 'ALL' && !todayStr.startsWith(selectedMonth)) {
@@ -128,41 +146,60 @@ export const StockItemDetailScreen = ({ route, navigation }: any) => {
   const handleSaveMovement = async () => {
     const qty = parseFloat(inputQty);
     if (isNaN(qty) || qty <= 0) {
-      Alert.alert('Invalid Quantity', 'Please enter a valid positive quantity.');
+      Alert.alert(t('sidQtyInvalidTitle'), t('sidQtyInvalid'));
       return;
     }
     if (!user?.id) return;
+    const pricePaisa = inputPrice.trim() ? rupeesToPaisa(inputPrice) : 0;
+    if (pricePaisa === null) {
+      Alert.alert(t('sidPriceInvalidTitle'), t('sidPriceInvalid'));
+      return;
+    }
+    if (modalMode !== 'in' && !pricePaisa) {
+      Alert.alert(t('sidPriceNeededTitle'), modalMode === 'out'
+        ? t('sidPriceNeededOut')
+        : t('sidPriceNeededReturn'));
+      return;
+    }
+    if (modalMode === 'return' && qty > sales.netSoldQty) {
+      Alert.alert(t('sidMoreThanSoldTitle'), t('sidMoreThanSold', { qty: sales.netSoldQty, unit: item.unit }));
+      return;
+    }
 
     const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
     if (!inputDate || !dateRegex.test(inputDate)) {
-      Alert.alert('Invalid Date', 'Please enter a valid date in YYYY-MM-DD format.');
+      Alert.alert(t('salaryDateInvalidTitle'), t('salaryDateInvalid'));
       return;
     }
 
     setSaving(true);
     try {
       const isOut = modalMode === 'out';
+      const isReturn = modalMode === 'return';
 
       const movement: Omit<StockMovement, 'id' | 'synced' | 'is_deleted'> = {
         item_id: item.id,
         change: isOut ? -qty : qty,
-        reason: isOut ? 'sale' : 'purchase',
+        reason: isOut ? 'sale' : isReturn ? 'customer_return' : 'purchase',
         // stock_movements.date is a plain YYYY-MM-DD calendar day, like every other
         // book. It previously stored a UTC timestamp anchored at local noon.
         date: inputDate,
-        cost_per_unit: !isOut ? item.purchase_price : undefined,
-        sale_price_unit: isOut ? item.sale_price : undefined,
+        // The price typed for THIS entry, in paisa. A return carries the selling price
+        // it is reversing, so that value leaves the total sold.
+        cost_per_unit: modalMode === 'in' ? pricePaisa : undefined,
+        sale_price_unit: modalMode === 'in' ? undefined : pricePaisa,
         user_id: user.id,
         note: inputNote.trim() || undefined,
       };
 
       await addStockMovement(movement);
       await loadMovements();
+      setSales(await getItemSales(item.id));
       item.quantity += movement.change;
       setModalVisible(false);
     } catch (error) {
       if (__DEV__) console.error(error);
-      Alert.alert('Error', 'Failed to save stock movement.');
+      Alert.alert(t('commonError'), t('sidMovementFailed'));
     } finally {
       setSaving(false);
     }
@@ -185,7 +222,7 @@ export const StockItemDetailScreen = ({ route, navigation }: any) => {
           <Text style={styles.movDate}>{date}{mov.note ? ` • ${mov.note}` : ''}</Text>
         </View>
         <View style={styles.movRight}>
-          <Text style={[styles.movChange, isOut ? { color: Colors.error } : { color: Colors.success }]}>
+          <Text style={[styles.movChange, isOut ? { color: color.moneyOut } : { color: color.moneyIn }]}>
             {isOut ? '' : '+'}{mov.change} {item.unit}
           </Text>
           {(mov.cost_per_unit || mov.sale_price_unit) ? (
@@ -206,7 +243,7 @@ export const StockItemDetailScreen = ({ route, navigation }: any) => {
           <Text style={styles.backArrow}>{'<'}</Text>
         </TouchableOpacity>
         <Text style={styles.headerTitle} numberOfLines={1}>
-          {getDisplayName(item, nameDisplayMode)}
+          {getDisplayName(item)}
         </Text>
         <View style={{ width: 40 }} />
       </View>
@@ -218,6 +255,18 @@ export const StockItemDetailScreen = ({ route, navigation }: any) => {
             <Text style={styles.compactCategory}>{item.category} • {item.location || 'No Loc'}</Text>
             <Text style={styles.compactStock}>Stock: <Text style={styles.stockBold}>{item.quantity} {item.unit}</Text></Text>
           </View>
+          {/* Sold all time and what it brought in — the selling price of each sale,
+              less anything customers returned. */}
+          <View style={styles.infoRow}>
+            <Text style={styles.compactCategory}>Sold all time: {sales.netSoldQty} {item.unit}</Text>
+            <View style={styles.soldValueLine}>
+              <Text style={styles.compactCategory}>{t('sidTotalSelling')}</Text>
+              <AmountText paisa={sales.netSoldValue} size="label" tone="in" />
+            </View>
+          </View>
+          {sales.returnedQty > 0 && (
+            <Text style={styles.returnNote}>Returned stock: {sales.returnedQty} {item.unit}</Text>
+          )}
           <View style={styles.pricesRow}>
             <Text style={styles.priceLabel}>Buy: {formatCurrency(item.purchase_price)}</Text>
             <Text style={styles.priceLabel}>Sell: {formatCurrency(item.sale_price)}</Text>
@@ -226,14 +275,24 @@ export const StockItemDetailScreen = ({ route, navigation }: any) => {
         </View>
 
         {/* Compact Action Buttons */}
+        {!readOnly && (
         <View style={styles.actionRow}>
-          <TouchableOpacity style={[styles.actionBtn, { backgroundColor: Colors.success }]} onPress={() => openModal('in')}>
+          <TouchableOpacity style={[styles.actionBtn, { backgroundColor: color.moneyIn }]} onPress={() => openModal('in')}>
             <Text style={styles.actionBtnText}>+ IN / BUY</Text>
           </TouchableOpacity>
-          <TouchableOpacity style={[styles.actionBtn, { backgroundColor: Colors.error }]} onPress={() => openModal('out')}>
+          <TouchableOpacity style={[styles.actionBtn, { backgroundColor: color.moneyOut }]} onPress={() => openModal('out')}>
             <Text style={styles.actionBtnText}>- OUT / SELL</Text>
           </TouchableOpacity>
         </View>
+        )}
+        {/* Stock coming back from a customer: units return to stock and their selling
+            value leaves the total sold. */}
+        {!readOnly && (
+          <TouchableOpacity style={styles.returnBtn} onPress={() => openModal('return')} accessibilityRole="button">
+            <Icon name="corner-up-left" size={iconSize.sm} tint={color.textInverse} />
+            <Text style={styles.returnBtnText}>{t('sidCustomerReturn')}</Text>
+          </TouchableOpacity>
+        )}
 
         {/* Month Filter & Inline Stats Bar */}
         <View style={styles.monthSection}>
@@ -261,7 +320,7 @@ export const StockItemDetailScreen = ({ route, navigation }: any) => {
 
           <View style={styles.inlineSummary}>
             <Text style={styles.summaryText}>
-              In: <Text style={{ color: Colors.success, fontWeight: '700' }}>+{monthlyStats.totalIn}</Text> | Out: <Text style={{ color: Colors.error, fontWeight: '700' }}>-{monthlyStats.totalOut}</Text> | Net: <Text style={{ color: monthlyStats.netChange >= 0 ? Colors.success : Colors.error, fontWeight: '700' }}>{monthlyStats.netChange >= 0 ? '+' : ''}{monthlyStats.netChange}</Text>
+              In: <Text style={{ color: color.moneyIn, fontWeight: '500' }}>+{monthlyStats.totalIn}</Text> | Out: <Text style={{ color: color.moneyOut, fontWeight: '500' }}>-{monthlyStats.totalOut}</Text> | Net: <Text style={{ color: monthlyStats.netChange >= 0 ? color.moneyIn : color.moneyOut, fontWeight: '500' }}>{monthlyStats.netChange >= 0 ? '+' : ''}{monthlyStats.netChange}</Text>
             </Text>
           </View>
         </View>
@@ -273,7 +332,7 @@ export const StockItemDetailScreen = ({ route, navigation }: any) => {
           </View>
           {loading ? (
             <View style={styles.center}>
-              <ActivityIndicator size="small" color={Colors.primary} />
+              <ActivityIndicator size="small" color={color.accent} />
             </View>
           ) : filteredMovements.length === 0 ? (
             <View style={styles.emptyState}>
@@ -287,7 +346,7 @@ export const StockItemDetailScreen = ({ route, navigation }: any) => {
               contentContainerStyle={{ paddingHorizontal: 12, paddingBottom: 16 }}
               onEndReached={loadMore}
               onEndReachedThreshold={0.5}
-              ListFooterComponent={loadingMore ? <ActivityIndicator style={{ margin: 16 }} color={Colors.primary} /> : null}
+              ListFooterComponent={loadingMore ? <ActivityIndicator style={{ margin: 16 }} color={color.accent} /> : null}
             />
           )}
         </View>
@@ -295,106 +354,135 @@ export const StockItemDetailScreen = ({ route, navigation }: any) => {
 
       {/* Movement Modal */}
       <Modal visible={modalVisible} transparent animationType="slide" onRequestClose={() => setModalVisible(false)}>
-        <View style={styles.modalOverlay}>
+        <KeyboardAvoidingView
+          style={styles.modalOverlay}
+          behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+        >
           <View style={styles.modalContent}>
             <View style={styles.modalHeader}>
-              <Text style={styles.modalTitle}>{modalMode === 'in' ? 'Stock In (Buy)' : 'Stock Out (Sell)'}</Text>
+              <Text style={styles.modalTitle}>
+                {modalMode === 'in' ? 'Stock in (buy)' : modalMode === 'out' ? 'Stock out (sell)' : 'Customer return'}
+              </Text>
               <TouchableOpacity onPress={() => setModalVisible(false)}>
-                <Text style={styles.closeBtn}>✕</Text>
+                <Icon name="x" size={iconSize.md} tint={color.textSecondary} />
               </TouchableOpacity>
             </View>
 
-            <View style={styles.modalBody}>
+            {/* Scrollable so the keyboard (Note field) never hides SAVE ENTRY below it */}
+            <ScrollView style={styles.modalBody} keyboardShouldPersistTaps="handled">
               <Text style={styles.modalLabel}>Quantity ({item.unit}) *</Text>
               <TextInput
                 style={styles.modalInput}
                 placeholder="0"
-                placeholderTextColor={Colors.textGray}
+                placeholderTextColor={color.textSecondary}
                 keyboardType="numeric"
                 value={inputQty}
                 onChangeText={setInputQty}
                 autoFocus
               />
 
-              <Text style={styles.modalLabel}>Entry Date *</Text>
+              <Text style={styles.modalLabel}>{t('commonDate')} *</Text>
               <DateField
                 style={styles.modalInput}
                 value={inputDate}
                 onChange={setInputDate}
               />
 
+              {/* Price for this entry — typed here, so an item saved without prices
+                  still records what it was bought or sold for. */}
+              <Text style={styles.modalLabel}>
+                {modalMode === 'in' ? 'Buy price per ' : 'Sell price per '}{item.unit}
+                {modalMode === 'in' ? ' (optional)' : ''}
+              </Text>
+              <TextInput
+                style={styles.modalInput}
+                placeholder="0"
+                placeholderTextColor={color.textSecondary}
+                keyboardType="decimal-pad"
+                value={inputPrice}
+                onChangeText={setInputPrice}
+              />
+
               <View style={styles.calcRow}>
                 <Text style={styles.calcText}>
-                  Price: {formatCurrency((modalMode === 'in' ? item.purchase_price : item.sale_price))} / unit
+                  {(parseFloat(inputQty) || 0)} {item.unit} × {formatCurrency(rupeesToPaisa(inputPrice) ?? 0)}
                 </Text>
                 <Text style={styles.calcTotalText}>
-                  Total: {formatCurrency(((modalMode === 'in' ? item.purchase_price : item.sale_price) * (parseFloat(inputQty) || 0)))}
+                  Total: {formatCurrency(Math.round((rupeesToPaisa(inputPrice) ?? 0) * (parseFloat(inputQty) || 0)))}
                 </Text>
               </View>
 
-              <Text style={styles.modalLabel}>Note (Optional)</Text>
+              <Text style={styles.modalLabel}>{t('cashNoteLabel')}</Text>
               <TextInput
                 style={[styles.modalInput, { minHeight: 48, textAlignVertical: 'top' }]}
-                placeholder="Reason or reference..."
-                placeholderTextColor={Colors.textGray}
+                placeholder={t('sidReasonPlaceholder')}
+                placeholderTextColor={color.textSecondary}
                 value={inputNote}
                 onChangeText={setInputNote}
                 multiline
               />
 
-              <TouchableOpacity 
-                style={[styles.saveBtn, { backgroundColor: modalMode === 'in' ? Colors.success : Colors.error }]}
+              <TouchableOpacity
+                style={[styles.saveBtn, { backgroundColor: modalMode === 'in' ? color.moneyIn : color.moneyOut }]}
                 onPress={handleSaveMovement}
                 disabled={saving}
               >
                 {saving ? (
-                  <ActivityIndicator color="#fff" />
+                  <ActivityIndicator color={color.textInverse} />
                 ) : (
-                  <Text style={styles.saveBtnText}>SAVE ENTRY</Text>
+                  <Text style={styles.saveBtnText}>{t('sidSaveEntry')}</Text>
                 )}
               </TouchableOpacity>
-            </View>
+            </ScrollView>
           </View>
-        </View>
+        </KeyboardAvoidingView>
       </Modal>
     </SafeAreaView>
   );
 };
 
 const styles = StyleSheet.create({
-  safe: { flex: 1, backgroundColor: Colors.bgPrimary },
-  container: { flex: 1, backgroundColor: Colors.bgPrimary },
+  safe: { flex: 1, backgroundColor: color.surface },
+  container: { flex: 1, backgroundColor: color.surface },
   header: {
     flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
-    backgroundColor: Colors.bgCard, paddingHorizontal: 12, height: 48,
-    borderBottomWidth: 1, borderBottomColor: Colors.border,
+    backgroundColor: color.surface, paddingHorizontal: 12, height: 48,
+    borderBottomWidth: 1, borderBottomColor: color.border,
   },
   backBtn: { width: 36, justifyContent: 'center' },
-  backArrow: { fontSize: 22, color: Colors.textWhite },
-  headerTitle: { fontSize: 16, fontWeight: '700', color: Colors.textWhite, flex: 1, textAlign: 'center' },
+  backArrow: { fontSize: 22, color: color.textPrimary },
+  headerTitle: { fontSize: 16, fontWeight: '500', color: color.textPrimary, flex: 1, textAlign: 'center' },
 
   compactInfoCard: {
-    backgroundColor: Colors.bgCard,
+    backgroundColor: color.surface,
     paddingHorizontal: 12,
     paddingVertical: 8,
     borderBottomWidth: 1,
-    borderBottomColor: Colors.border,
+    borderBottomColor: color.border,
   },
   infoRow: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
   },
-  compactCategory: { fontSize: 12, color: Colors.textGray },
-  compactStock: { fontSize: 12, color: Colors.textGray },
-  stockBold: { fontSize: 13, fontWeight: '700', color: Colors.textWhite },
+  compactCategory: { fontSize: 12, color: color.textSecondary },
+  compactStock: { fontSize: 12, color: color.textSecondary },
+  stockBold: { fontSize: 13, fontWeight: '500', color: color.textPrimary },
   pricesRow: {
     flexDirection: 'row',
     gap: 12,
     marginTop: 4,
   },
-  priceLabel: { fontSize: 11, color: Colors.textMuted },
+  priceLabel: { fontSize: 11, color: color.textMuted },
 
+  soldValueLine: { flexDirection: 'row', alignItems: 'center' },
+  returnNote: { ...typeScale.caption, color: color.textSecondary, marginTop: space.xs },
+  returnBtn: {
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: space.sm,
+    backgroundColor: color.accent, minHeight: touchTarget, borderRadius: radius.md,
+    marginHorizontal: space.md, marginTop: space.sm,
+  },
+  returnBtnText: { ...typeScale.bodyMedium, color: color.textInverse },
   actionRow: {
     flexDirection: 'row',
     paddingHorizontal: 12,
@@ -408,17 +496,17 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   actionBtnText: {
-    color: '#fff',
-    fontWeight: '700',
+    color: color.textInverse,
+    fontWeight: '500',
     fontSize: 13,
   },
 
   monthSection: {
     paddingHorizontal: 12,
     paddingVertical: 4,
-    backgroundColor: Colors.bgSecondary,
+    backgroundColor: color.surfaceRaised,
     borderBottomWidth: 1,
-    borderBottomColor: Colors.border,
+    borderBottomColor: color.border,
   },
   monthScroll: {
     gap: 6,
@@ -426,37 +514,37 @@ const styles = StyleSheet.create({
     paddingVertical: 2,
   },
   monthPill: {
-    backgroundColor: Colors.bgCard,
+    backgroundColor: color.surface,
     paddingHorizontal: 10,
     paddingVertical: 4,
     borderRadius: 12,
     borderWidth: 1,
-    borderColor: Colors.border,
+    borderColor: color.border,
   },
   monthPillActive: {
-    backgroundColor: Colors.primary,
-    borderColor: Colors.primary,
+    backgroundColor: color.accent,
+    borderColor: color.accent,
   },
   monthPillText: {
-    color: Colors.textGray,
+    color: color.textSecondary,
     fontSize: 11,
-    fontWeight: '600',
+    fontWeight: '500',
   },
   monthPillTextActive: {
-    color: '#fff',
-    fontWeight: '700',
+    color: color.textInverse,
+    fontWeight: '500',
   },
 
   inlineSummary: {
     marginTop: 4,
     paddingTop: 4,
     borderTopWidth: 1,
-    borderTopColor: Colors.border,
+    borderTopColor: color.border,
     alignItems: 'center',
   },
   summaryText: {
     fontSize: 11,
-    color: Colors.textGray,
+    color: color.textSecondary,
   },
 
   listContainer: { flex: 1 },
@@ -464,10 +552,10 @@ const styles = StyleSheet.create({
     paddingHorizontal: 12,
     paddingVertical: 6,
   },
-  listTitle: { fontSize: 13, fontWeight: '700', color: Colors.textWhite },
+  listTitle: { fontSize: 13, fontWeight: '500', color: color.textPrimary },
   
   movRow: {
-    backgroundColor: Colors.bgCard,
+    backgroundColor: color.surface,
     paddingHorizontal: 12,
     paddingVertical: 8,
     borderRadius: 8,
@@ -476,32 +564,33 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
     alignItems: 'center',
     borderWidth: 1,
-    borderColor: Colors.border,
+    borderColor: color.border,
   },
   movLeft: { flex: 1 },
-  movReason: { fontSize: 12, fontWeight: '700', color: Colors.textWhite },
-  movDate: { fontSize: 11, color: Colors.textGray, marginTop: 1 },
+  movReason: { fontSize: 12, fontWeight: '500', color: color.textPrimary },
+  movDate: { fontSize: 11, color: color.textSecondary, marginTop: 1 },
   movRight: { alignItems: 'flex-end' },
-  movChange: { fontSize: 14, fontWeight: '800' },
-  movPrice: { fontSize: 10, color: Colors.textGray },
+  movChange: { fontSize: 14, fontWeight: '500' },
+  movPrice: { fontSize: 10, color: color.textSecondary },
 
   center: { flex: 1, justifyContent: 'center', alignItems: 'center', minHeight: 100 },
   emptyState: { padding: 20, alignItems: 'center' },
-  emptyText: { color: Colors.textGray, fontSize: 12 },
+  emptyText: { color: color.textSecondary, fontSize: 12 },
 
   modalOverlay: {
     flex: 1,
-    backgroundColor: 'rgba(0, 0, 0, 0.75)',
+    backgroundColor: color.scrim,
     justifyContent: 'flex-end',
   },
   modalContent: {
-    backgroundColor: Colors.bgCard,
+    backgroundColor: color.surface,
     borderTopLeftRadius: 16,
     borderTopRightRadius: 16,
     padding: 16,
     paddingBottom: 28,
     borderWidth: 1,
-    borderColor: Colors.border,
+    borderColor: color.border,
+    maxHeight: '85%',
   },
   modalHeader: {
     flexDirection: 'row',
@@ -511,49 +600,49 @@ const styles = StyleSheet.create({
   },
   modalTitle: {
     fontSize: 16,
-    fontWeight: '700',
-    color: Colors.textWhite,
+    fontWeight: '500',
+    color: color.textPrimary,
   },
   closeBtn: {
     fontSize: 18,
-    fontWeight: '700',
-    color: Colors.textGray,
+    fontWeight: '500',
+    color: color.textSecondary,
     padding: 4,
   },
   modalBody: {},
   modalLabel: {
     fontSize: 12,
-    fontWeight: '700',
-    color: Colors.textWhite,
+    fontWeight: '500',
+    color: color.textPrimary,
     marginBottom: 4,
   },
   modalInput: {
-    backgroundColor: Colors.bgInput,
+    backgroundColor: color.surfaceRaised,
     borderWidth: 1,
-    borderColor: Colors.border,
+    borderColor: color.border,
     borderRadius: 8,
     paddingHorizontal: 12,
     paddingVertical: 8,
     fontSize: 14,
-    color: Colors.textWhite,
+    color: color.textPrimary,
     marginBottom: 12,
   },
   calcRow: {
-    backgroundColor: Colors.bgSecondary,
+    backgroundColor: color.surfaceRaised,
     padding: 8,
     borderRadius: 6,
     marginBottom: 12,
     borderWidth: 1,
-    borderColor: Colors.border,
+    borderColor: color.border,
   },
   calcText: {
     fontSize: 12,
-    color: Colors.textGray,
+    color: color.textSecondary,
   },
   calcTotalText: {
     fontSize: 13,
-    fontWeight: '700',
-    color: Colors.textWhite,
+    fontWeight: '500',
+    color: color.textPrimary,
     marginTop: 2,
   },
   saveBtn: {
@@ -564,8 +653,8 @@ const styles = StyleSheet.create({
   },
   saveBtnText: {
     fontSize: 16,
-    fontWeight: '800',
-    color: '#fff',
+    fontWeight: '500',
+    color: color.textInverse,
     letterSpacing: 0.5,
   },
 });

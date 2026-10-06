@@ -1,4 +1,6 @@
 import React, { useState } from 'react';
+import { useLanguageStore } from '../../store/useLanguageStore';
+import { messageLabel } from '../../i18n/messageLabel';
 import {
   View, Text, TextInput, TouchableOpacity, StyleSheet,
   ActivityIndicator, Alert
@@ -9,82 +11,143 @@ import { useActivityStore } from '../../store/useActivityStore';
 import { useStaffStore } from '../../store/useStaffStore';
 import { TranslateToUrdu } from '../../components/TranslateToUrdu';
 import { ScreenContainer } from '../../components/ui/ScreenContainer';
-import { Colors } from '../../theme';
+import { Icon } from '../../components/ui/primitives';
+import { color, space, radius, hairline, touchTarget, iconSize, type as typeScale } from '../../theme/tokens';
 import { DateField } from '../../components/ui/DateField';
+import { CustomerAvatar } from '../../components/ui/CustomerAvatar';
+import { pickStaffPhoto, persistStaffPhoto, pickStaffDocument, persistStaffDocument, documentLabel } from '../../utils/customerPhoto';
+import { updateStaffPhoto, updateStaffDocuments } from '../../services/database/staffDb';
 import { todayDate } from '../../utils/dates';
+import { rupeesToPaisa } from '../../utils/calculations';
+import { accountPasswordProblem } from '../../services/database/managedAccountDb';
+import { useAttachmentOpener } from '../../components/ui/AttachmentViewer';
+import { CountryCodePicker } from '../../components/CountryCodePicker';
+import { CurrencyPicker } from '../../components/ui/CurrencyPicker';
+import { currencyFromPhone, accountCurrencyLabel, type CurrencyCode } from '../../utils/currency';
 
 export const AddStaffModal = ({ navigation }: any) => {
   const { user } = useAuthStore();
+  // One shared opener: images preview in-app, other files go to the phone, a missing
+  // file says so — the same behaviour in every book.
+  const { openAttachment, attachmentViewer } = useAttachmentOpener();
   const { addStaff } = useStaffStore();
   const { logActivity } = useActivityStore();
 
-  const [pictureUrl, setPictureUrl] = useState<string | null>(null);
+  // The picker's cache URI while the form is open; only the durable copy is ever saved.
+  const [photoUri, setPhotoUri] = useState<string | null>(null);
   const [documentUrls, setDocumentUrls] = useState<string[]>([]);
 
   const [nameEn, setNameEn] = useState('');
   const [nameUr, setNameUr] = useState('');
   
+  // The dial code is part of the LOGIN number, and it is what suggests the currency.
+  // Without it a Dubai number typed the local way ("0501234567") reads as Pakistani.
+  const [dialCode, setDialCode] = useState('+92');
   const [phone, setPhone] = useState('');
+  // A SUGGESTION, re-derived while the admin is still typing the number, and dropped the
+  // moment they pick a currency themselves — a person with a Pakistani number may work
+  // in Dubai, so their choice must never be overwritten by the next keystroke.
+  const [currency, setCurrency] = useState<CurrencyCode>('PKR');
+  const [currencyTouched, setCurrencyTouched] = useState(false);
+  const suggestCurrency = (code: string, local: string) => {
+    if (currencyTouched) return;
+    setCurrency(currencyFromPhone(code + local.replace(/^0+/, '')));
+  };
   const [role, setRole] = useState('');
   const [joiningDate, setJoiningDate] = useState(todayDate());
   const [area, setArea] = useState('');
   const [businessType, setBusinessType] = useState('');
   const [email, setEmail] = useState('');
   const [address, setAddress] = useState('');
-  const [status, setStatus] = useState<'active' | 'inactive'>('active');
+  // The staff member's phone is their login username; the admin types the password.
+  const [password, setPassword] = useState('');
+  const [salary, setSalary] = useState('');
+
+  // An admin adds staff; a staff member adds their own sub-staff (same form).
+  const addingSubStaff = user?.role !== 'admin';
+  const { t } = useLanguageStore();
 
   const [loading, setLoading] = useState(false);
   const [errors, setErrors] = useState<Record<string, string>>({});
 
   const validate = (): boolean => {
     const e: Record<string, string> = {};
-    if (!nameEn.trim()) e.nameEn = 'Name required';
-    if (!phone.trim()) e.phone = 'Phone required';
-    if (!role.trim()) e.role = 'Role required';
-    if (!joiningDate.trim()) e.joiningDate = 'Date required';
-    if (!area.trim()) e.area = 'Area required';
-    if (!businessType.trim()) e.businessType = 'Business type required';
+    if (!nameEn.trim()) e.nameEn = t('commonNameRequired');
+    // The number IS the login username, so it is required only when there is a login.
+    if (!addingSubStaff && !phone.trim()) e.phone = t('commonPhoneRequired');
+    if (!role.trim()) e.role = t('staffRoleRequired');
+    if (!joiningDate.trim()) e.joiningDate = t('commonDateRequired');
+    if (!area.trim()) e.area = t('staffAreaRequired');
 
-    if (email && !/^\S+@\S+\.\S+$/.test(email)) e.email = 'Invalid email';
+    if (email && !/^\S+@\S+\.\S+$/.test(email)) e.email = t('commonEmailInvalid');
+    // No password for a sub-staff record — there is nothing to log in to.
+    if (!addingSubStaff) {
+      const pwProblem = accountPasswordProblem(password);
+      if (pwProblem) e.password = messageLabel(t, pwProblem);
+    }
+    if (salary.trim() && rupeesToPaisa(salary) === null) e.salary = t('commonAmountInvalid');
 
     setErrors(e);
     return Object.keys(e).length === 0;
   };
 
-  const handlePickPicture = () => {
-    Alert.alert('Image Picker', 'Select profile picture (Placeholder)');
+  const handlePickPicture = async () => {
+    const uri = await pickStaffPhoto();
+    if (uri) setPhotoUri(uri);
   };
 
-  const handleAddDocument = () => {
-    Alert.alert('Document Picker', 'Select document to upload (Placeholder)');
-    setDocumentUrls([...documentUrls, `doc_${Date.now()}.pdf`]);
+  const handleAddDocument = async () => {
+    // Was a placeholder that invented a filename like "doc_1726…​.pdf" and stored it —
+    // a name pointing at nothing. Now it picks a real file.
+    const uri = await pickStaffDocument();
+    if (uri) setDocumentUrls(prev => [...prev, uri]);
   };
 
   const handleSubmit = async () => {
     if (!validate() || !user) {
       if (Object.keys(errors).length > 0) {
-        Alert.alert('Error', 'Please fix the highlighted fields.');
+        Alert.alert(t('commonError'), t('commonFixFields'));
       }
       return;
     }
 
     setLoading(true);
     try {
-      await addStaff({
-        user_id: user.id,
+      // One save: creates the login and the staff record together, linked.
+      const created = await addStaff({
         name_en: nameEn.trim(),
         name_ur: nameUr.trim() || undefined,
-        phone: phone.trim(),
+        // A blank optional number is absent, not an empty dial code: '+92' alone would
+        // be stored as a phone number that is really just a country.
+        phone: phone.trim() ? dialCode + phone.trim().replace(/^0+/, '') : undefined,
+        // Both belong to a LOGIN. A sub-staff record has none, so sending either would
+        // imply a password was set and a currency chosen when neither exists.
+        password: addingSubStaff ? undefined : password,
+        default_currency: addingSubStaff ? undefined : currency,
         role: role.trim(),
         joining_date: joiningDate,
         area: area.trim(),
-        business_type: businessType.trim(),
+        business_type: businessType.trim() || undefined,
         email: email.trim() || undefined,
         address: address.trim() || undefined,
-        status: status,
-        picture_url: pictureUrl || undefined,
         document_urls: documentUrls.length > 0 ? documentUrls : undefined,
+        monthly_salary: salary.trim() ? (rupeesToPaisa(salary) ?? 0) : 0,
       });
+      if (photoUri) {
+        // Same as customers: copy out of the picker cache into app storage, then
+        // point the row at the copy.
+        const durable = await persistStaffPhoto(photoUri, created.id);
+        await updateStaffPhoto(created.id, user.id, durable);
+        created.photo_local_path = durable;
+      }
+      if (documentUrls.length > 0) {
+        // Documents are filed under the new staff id, for the same reason: the picker's
+        // cache directory can be reclaimed by Android at any time.
+        const durableDocs: string[] = [];
+        for (const doc of documentUrls) durableDocs.push(await persistStaffDocument(doc, created.id));
+        await updateStaffDocuments(created.id, user.id, durableDocs);
+        created.document_urls = durableDocs;
+      }
       
       // Log Activity
       await logActivity({
@@ -92,15 +155,20 @@ export const AddStaffModal = ({ navigation }: any) => {
         user_name: user.name || 'User',
         action: 'create',
         entity_type: 'staff',
-        description: `added staff member ${nameEn.trim()}`
+        description: `added ${addingSubStaff ? 'sub-staff' : 'staff member'} ${nameEn.trim()}`
       });
 
-      Alert.alert('Success', 'Staff added successfully', [
-        { text: 'OK', onPress: () => navigation.goBack() }
-      ]);
-    } catch (err) {
+      Alert.alert(
+        t('commonSuccess'),
+        addingSubStaff
+          ? t('staffRecordAdded', { name: nameEn.trim() })
+          : t('staffCanLogIn', { name: nameEn.trim(), phone: created.phone ?? '' }),
+        [{ text: t('commonOk'), onPress: () => navigation.goBack() }]
+      );
+    } catch (err: any) {
       if (__DEV__) console.error(err);
-      Alert.alert('Error', 'Failed to save staff record.');
+      // The data layer's own message: weak password, number already has a login, not allowed…
+      Alert.alert(t('commonError'), messageLabel(t, err?.message) || t('commonSaveFailed'));
     } finally {
       setLoading(false);
     }
@@ -113,57 +181,100 @@ export const AddStaffModal = ({ navigation }: any) => {
         <TouchableOpacity onPress={() => navigation.goBack()} style={styles.backBtn}>
           <Text style={styles.backArrow}>{'<'}</Text>
         </TouchableOpacity>
-        <Text style={styles.headerTitle}>Add Staff</Text>
-        <View style={{ width: 40 }} />
+        <Text style={styles.headerTitle} numberOfLines={1}>{t(addingSubStaff ? 'staffAddSubTitle' : 'staffAddTitle')}</Text>
+        <View style={{ width: touchTarget }} />
       </View>
 
       <ScreenContainer scrollable={true} hasTabBar={true} contentContainerStyle={styles.form}>
+        {/* A staff member adds people they PAY, not people who use the app. Saying so
+            here is why the form has no password and an optional number. */}
+        {addingSubStaff && <Text style={styles.noteText}>{t('staffSubNoLoginNote')}</Text>}
+
         {/* Picture Section */}
         <View style={styles.pictureContainer}>
-          <View style={styles.pictureBox}>
-            <Text style={{ fontSize: 44, color: Colors.textGray }}>👤</Text>
-          </View>
+          <TouchableOpacity onPress={handlePickPicture} accessibilityRole="button" accessibilityLabel={photoUri ? 'Change photo' : 'Add photo'}>
+            <CustomerAvatar name={nameEn || '?'} uri={photoUri} style={styles.pictureBox} textStyle={styles.pictureInitial} />
+          </TouchableOpacity>
           <TouchableOpacity style={styles.cameraIconBtn} onPress={handlePickPicture}>
-            <Text style={{ fontSize: 18, color: '#fff' }}>📷</Text>
+            <Icon name="camera" size={iconSize.md} tint={color.textInverse} />
           </TouchableOpacity>
         </View>
 
         {/* Name */}
         <View style={styles.fieldWrap}>
-          <Text style={styles.label}>Staff Name *</Text>
+          <Text style={styles.label}>{t('staffNameLabel')} *</Text>
           <TextInput
             style={[styles.input, errors.nameEn ? styles.inputError : null]}
-            placeholder="e.g. Ahmed Ali"
-            placeholderTextColor={Colors.textGray}
+            placeholder={t('staffNamePlaceholder')}
+            placeholderTextColor={color.textMuted}
             value={nameEn}
             onChangeText={t => { setNameEn(t); setErrors(p => ({ ...p, nameEn: '' })); }}
             autoFocus
           />
-          <TranslateToUrdu value={nameUr} onSave={setNameUr} sourceText={nameEn} />
+          <TranslateToUrdu value={nameUr} onSave={setNameUr} />
           {!!errors.nameEn && <Text style={styles.errText}>{errors.nameEn}</Text>}
         </View>
 
         {/* Phone */}
         <View style={styles.fieldWrap}>
-          <Text style={styles.label}>Phone Number *</Text>
-          <TextInput
-            style={[styles.input, errors.phone ? styles.inputError : null]}
-            placeholder="+92 300 1234567"
-            placeholderTextColor={Colors.textGray}
-            keyboardType="phone-pad"
-            value={phone}
-            onChangeText={t => { setPhone(t); setErrors(p => ({ ...p, phone: '' })); }}
-          />
+          <Text style={styles.label}>{addingSubStaff ? t('staffPhoneOptional') : `${t('staffPhoneLabel')} *`}</Text>
+          <View style={styles.phoneRow}>
+            <CountryCodePicker
+              selectedCode={dialCode}
+              onSelect={code => { setDialCode(code); suggestCurrency(code, phone); }}
+            />
+            <TextInput
+              style={[styles.input, styles.phoneInput, errors.phone ? styles.inputError : null]}
+              placeholder="300 1234567"
+              placeholderTextColor={color.textMuted}
+              keyboardType="phone-pad"
+              value={phone}
+              onChangeText={v => { setPhone(v); setErrors(p => ({ ...p, phone: '' })); suggestCurrency(dialCode, v); }}
+            />
+          </View>
           {!!errors.phone && <Text style={styles.errText}>{errors.phone}</Text>}
+          {!addingSubStaff && <Text style={styles.hintText}>{t('staffPhoneHint')}</Text>}
         </View>
+
+        {/* Currency and password both belong to the LOGIN (users.default_currency,
+            users.passwordHash). A sub-staff record has neither, so showing them would
+            collect two answers that go nowhere. */}
+        {!addingSubStaff && (
+          <>
+            {/* Currency — suggested from the dial code above, always changeable. */}
+            <View style={styles.fieldWrap}>
+              <Text style={styles.label}>{t('currencyLabel')}</Text>
+              <CurrencyPicker
+                value={currency}
+                onChange={code => { setCurrency(code); setCurrencyTouched(true); }}
+              />
+              <Text style={styles.hintText}>{t('currencyHint')}</Text>
+            </View>
+
+            {/* Login password */}
+            <View style={styles.fieldWrap}>
+              <Text style={styles.label}>{t('staffPasswordLabel')} *</Text>
+              <TextInput
+                style={[styles.input, errors.password ? styles.inputError : null]}
+                placeholder={t('staffPasswordPlaceholder')}
+                placeholderTextColor={color.textMuted}
+                secureTextEntry
+                autoCapitalize="none"
+                value={password}
+                onChangeText={t => { setPassword(t); setErrors(p => ({ ...p, password: '' })); }}
+              />
+              {!!errors.password && <Text style={styles.errText}>{errors.password}</Text>}
+            </View>
+          </>
+        )}
 
         {/* Role */}
         <View style={styles.fieldWrap}>
-          <Text style={styles.label}>Role / Position *</Text>
+          <Text style={styles.label}>{t('staffRoleLabel')} *</Text>
           <TextInput
             style={[styles.input, errors.role ? styles.inputError : null]}
-            placeholder="e.g., Manager, Sales, Driver"
-            placeholderTextColor={Colors.textGray}
+            placeholder={t('staffRolePlaceholder')}
+            placeholderTextColor={color.textMuted}
             value={role}
             onChangeText={t => { setRole(t); setErrors(p => ({ ...p, role: '' })); }}
           />
@@ -172,7 +283,7 @@ export const AddStaffModal = ({ navigation }: any) => {
 
         {/* Joining Date */}
         <View style={styles.fieldWrap}>
-          <Text style={styles.label}>Joining Date *</Text>
+          <Text style={styles.label}>{t('staffJoiningDateLabel')} *</Text>
           <DateField
             style={[styles.input, errors.joiningDate ? styles.inputError : null]}
             value={joiningDate}
@@ -181,14 +292,29 @@ export const AddStaffModal = ({ navigation }: any) => {
           {!!errors.joiningDate && <Text style={styles.errText}>{errors.joiningDate}</Text>}
         </View>
 
+        {/* Monthly salary */}
+        <View style={styles.fieldWrap}>
+          {/* staff_records.monthly_salary has no currency column: the account's own. */}
+          <Text style={styles.label}>{t('staffSalaryLabel', { currency: accountCurrencyLabel(user?.defaultCurrency) })}</Text>
+          <TextInput
+            style={[styles.input, errors.salary ? styles.inputError : null]}
+            placeholder="e.g. 30000"
+            placeholderTextColor={color.textMuted}
+            keyboardType="numeric"
+            value={salary}
+            onChangeText={t => { setSalary(t); setErrors(p => ({ ...p, salary: '' })); }}
+          />
+          {!!errors.salary && <Text style={styles.errText}>{errors.salary}</Text>}
+        </View>
+
         {/* Area & Business */}
-        <View style={{ flexDirection: 'row', gap: 12 }}>
+        <View style={{ flexDirection: 'row', gap: space.md }}>
           <View style={[styles.fieldWrap, { flex: 1 }]}>
-            <Text style={styles.label}>Area / City *</Text>
+            <Text style={styles.label}>{t('staffAreaLabel')} *</Text>
             <TextInput
               style={[styles.input, errors.area ? styles.inputError : null]}
-              placeholder="e.g., Lahore"
-              placeholderTextColor={Colors.textGray}
+              placeholder={t('staffAreaPlaceholder')}
+              placeholderTextColor={color.textMuted}
               value={area}
               onChangeText={t => { setArea(t); setErrors(p => ({ ...p, area: '' })); }}
             />
@@ -196,11 +322,11 @@ export const AddStaffModal = ({ navigation }: any) => {
           </View>
 
           <View style={[styles.fieldWrap, { flex: 1 }]}>
-            <Text style={styles.label}>Business Type *</Text>
+            <Text style={styles.label}>{t('staffBusinessTypeLabel')}</Text>
             <TextInput
               style={[styles.input, errors.businessType ? styles.inputError : null]}
-              placeholder="e.g., Retail"
-              placeholderTextColor={Colors.textGray}
+              placeholder={t('staffBusinessTypePlaceholder')}
+              placeholderTextColor={color.textMuted}
               value={businessType}
               onChangeText={t => { setBusinessType(t); setErrors(p => ({ ...p, businessType: '' })); }}
             />
@@ -210,11 +336,11 @@ export const AddStaffModal = ({ navigation }: any) => {
 
         {/* Optional: Email & Address */}
         <View style={styles.fieldWrap}>
-          <Text style={styles.label}>Email (Optional)</Text>
+          <Text style={styles.label}>{t('staffEmailLabel')}</Text>
           <TextInput
             style={[styles.input, errors.email ? styles.inputError : null]}
-            placeholder="email@example.com"
-            placeholderTextColor={Colors.textGray}
+            placeholder={t('customerEmailExample')}
+            placeholderTextColor={color.textMuted}
             keyboardType="email-address"
             value={email}
             onChangeText={t => { setEmail(t); setErrors(p => ({ ...p, email: '' })); }}
@@ -223,11 +349,11 @@ export const AddStaffModal = ({ navigation }: any) => {
         </View>
 
         <View style={styles.fieldWrap}>
-          <Text style={styles.label}>Address (Optional)</Text>
+          <Text style={styles.label}>{t('staffAddressLabel')}</Text>
           <TextInput
             style={styles.input}
-            placeholder="Complete address"
-            placeholderTextColor={Colors.textGray}
+            placeholder={t('staffAddressPlaceholder')}
+            placeholderTextColor={color.textMuted}
             value={address}
             onChangeText={setAddress}
           />
@@ -235,97 +361,102 @@ export const AddStaffModal = ({ navigation }: any) => {
 
         {/* Documents */}
         <View style={styles.fieldWrap}>
-          <Text style={styles.label}>Documents (Optional)</Text>
+          <Text style={styles.label}>{t('staffDocumentsLabel')}</Text>
           {documentUrls.map((doc, i) => (
             <View key={i} style={styles.docItem}>
-              <Text style={styles.docText}>📎 {doc}</Text>
-              <TouchableOpacity onPress={() => setDocumentUrls(documentUrls.filter((_, idx) => idx !== i))}>
-                <Text style={{ color: Colors.error, fontWeight: 'bold' }}>X</Text>
+              <TouchableOpacity style={styles.docOpen} onPress={() => openAttachment(doc)} accessibilityRole="button">
+                <Icon name="paperclip" size={iconSize.sm} tint={color.textSecondary} />
+                <Text style={styles.docText} numberOfLines={1}>{documentLabel(doc)}</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={styles.removeBtn} onPress={() => setDocumentUrls(documentUrls.filter((_, idx) => idx !== i))}>
+                <Text style={styles.removeText}>×</Text>
               </TouchableOpacity>
             </View>
           ))}
           <TouchableOpacity style={styles.attachBtn} onPress={handleAddDocument}>
-            <Text style={{ color: Colors.primaryLight, fontWeight: '600' }}>+ Add Document / Image</Text>
+            <Text style={styles.attachText}>{t('staffAddDocument')}</Text>
           </TouchableOpacity>
         </View>
 
         {/* Save Button inside ScreenContainer */}
         <TouchableOpacity
-          style={[styles.submitBtn, loading && { opacity: 0.65 }, { marginTop: 12, marginBottom: 24 }]}
+          style={[styles.submitBtn, loading && { opacity: 0.65 }, { marginTop: space.md, marginBottom: space.xxl }]}
           onPress={handleSubmit}
           disabled={loading}
         >
           {loading
-            ? <ActivityIndicator color="#fff" />
-            : <Text style={styles.submitText}>SAVE STAFF</Text>
+            ? <ActivityIndicator color={color.textInverse} />
+            : <Text style={styles.submitText}>{t('staffSave')}</Text>
           }
         </TouchableOpacity>
 
       </ScreenContainer>
+      {attachmentViewer}
     </SafeAreaView>
   );
 };
 
 const styles = StyleSheet.create({
-  safe: { flex: 1, backgroundColor: Colors.bgPrimary },
+  safe: { flex: 1, backgroundColor: color.surface },
   header: {
     flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
-    backgroundColor: Colors.bgCard, paddingHorizontal: 16, height: 56,
-    borderBottomWidth: 1, borderBottomColor: Colors.border,
+    backgroundColor: color.surface, paddingHorizontal: space.lg, height: 56,
+    borderBottomWidth: hairline, borderBottomColor: color.border,
   },
-  backBtn: { width: 40, justifyContent: 'center' },
-  backArrow: { fontSize: 24, color: Colors.textWhite, fontWeight: '400' },
-  headerTitle: { fontSize: 18, fontWeight: '700', color: Colors.textWhite },
+  backBtn: { width: touchTarget, height: touchTarget, justifyContent: 'center' },
+  backArrow: { fontSize: 24, color: color.textPrimary },
+  headerTitle: { ...typeScale.heading, fontSize: 18, color: color.textPrimary, flex: 1, textAlign: 'center' },
 
-  form: { padding: 16, paddingBottom: 40 },
-  fieldWrap: { marginBottom: 16 },
-  label: { fontSize: 14, fontWeight: '600', color: Colors.textWhite, marginBottom: 6 },
+  form: { padding: space.lg, paddingBottom: 40 },
+  noteText: { ...typeScale.label, color: color.textSecondary, marginBottom: space.lg },
+  phoneRow: { flexDirection: 'row', alignItems: 'center', gap: space.sm },
+  // flex so the number takes whatever the dial-code chip leaves.
+  phoneInput: { flex: 1 },
+  fieldWrap: { marginBottom: space.lg },
+  label: { ...typeScale.label, fontSize: 14, fontWeight: '500', color: color.textPrimary, marginBottom: 6 },
 
   input: {
-    backgroundColor: Colors.bgInput, borderWidth: 1, borderColor: Colors.border,
-    borderRadius: 10, paddingHorizontal: 12, paddingVertical: 12,
-    fontSize: 14, color: Colors.textWhite,
+    backgroundColor: color.surfaceRaised, borderWidth: hairline, borderColor: color.border,
+    borderRadius: radius.sm, paddingHorizontal: space.md, paddingVertical: space.md, minHeight: touchTarget,
+    fontSize: 14, color: color.textPrimary,
   },
-  inputError: { borderColor: Colors.error },
-  errText: { fontSize: 12, color: Colors.error, marginTop: 4 },
+  inputError: { borderColor: color.moneyOut },
+  errText: { ...typeScale.caption, color: color.moneyOut, marginTop: space.xs },
+  hintText: { ...typeScale.caption, color: color.textSecondary, marginTop: space.xs },
 
-  pictureContainer: { alignSelf: 'center', marginVertical: 16, position: 'relative' },
+  pictureContainer: { alignSelf: 'center', marginVertical: space.lg, position: 'relative' },
   pictureBox: {
-    width: 110, height: 110, backgroundColor: Colors.bgInput,
-    borderRadius: 55, justifyContent: 'center', alignItems: 'center',
-    borderWidth: 1, borderColor: Colors.border,
+    width: 110, height: 110, backgroundColor: color.surfaceRaised,
+    borderRadius: radius.pill, justifyContent: 'center', alignItems: 'center',
+    borderWidth: hairline, borderColor: color.border,
   },
+  pictureInitial: { ...typeScale.title, fontSize: 40, color: color.textMuted },
   cameraIconBtn: {
     position: 'absolute', bottom: 0, right: 0,
-    backgroundColor: Colors.primary, width: 36, height: 36,
-    borderRadius: 18, justifyContent: 'center', alignItems: 'center',
-    borderWidth: 2, borderColor: Colors.bgCard
+    backgroundColor: color.accent, width: touchTarget, height: touchTarget,
+    borderRadius: radius.pill, justifyContent: 'center', alignItems: 'center',
+    borderWidth: 2, borderColor: color.surface,
   },
-
-  radioBtn: {
-    flex: 1, height: 44, borderWidth: 1, borderColor: Colors.border,
-    borderRadius: 10, justifyContent: 'center', alignItems: 'center', backgroundColor: Colors.bgInput
-  },
-  radioActive: { borderColor: Colors.primary, backgroundColor: Colors.bgCard },
-  radioInactive: { borderColor: Colors.error, backgroundColor: Colors.bgCard },
-  radioText: { fontSize: 14, fontWeight: '500', color: Colors.textGray },
-  radioTextActive: { color: Colors.primaryLight, fontWeight: '700' },
-  radioTextInactive: { color: Colors.error, fontWeight: '700' },
 
   attachBtn: {
-    borderWidth: 1, borderStyle: 'dashed', borderColor: Colors.primary,
-    borderRadius: 10, height: 46, justifyContent: 'center', alignItems: 'center', backgroundColor: Colors.bgInput
+    borderWidth: hairline, borderStyle: 'dashed', borderColor: color.accent,
+    borderRadius: radius.sm, minHeight: 46, paddingHorizontal: space.md,
+    justifyContent: 'center', alignItems: 'center', backgroundColor: color.surface,
   },
+  attachText: { ...typeScale.label, fontSize: 14, fontWeight: '500', color: color.accent, textAlign: 'center' },
   docItem: {
-    flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center',
-    backgroundColor: Colors.bgCard, padding: 12, borderRadius: 10, borderWidth: 1, borderColor: Colors.border,
-    marginBottom: 8
+    flexDirection: 'row', alignItems: 'center', gap: space.sm,
+    backgroundColor: color.surface, paddingLeft: space.md, borderRadius: radius.sm,
+    borderWidth: hairline, borderColor: color.border, marginBottom: space.sm,
   },
-  docText: { fontSize: 14, color: Colors.textWhite },
+  docOpen: { flex: 1, flexDirection: 'row', alignItems: 'center', gap: space.sm, minHeight: touchTarget },
+  docText: { ...typeScale.body, fontSize: 14, color: color.textPrimary, flex: 1 },
+  removeBtn: { width: touchTarget, height: touchTarget, alignItems: 'center', justifyContent: 'center' },
+  removeText: { fontSize: 20, color: color.moneyOut },
 
   submitBtn: {
-    backgroundColor: Colors.primary, borderRadius: 14, height: 50,
+    backgroundColor: color.accent, borderRadius: radius.md, minHeight: 50,
     justifyContent: 'center', alignItems: 'center',
   },
-  submitText: { fontSize: 16, fontWeight: '700', color: Colors.textWhite },
+  submitText: { ...typeScale.bodyMedium, fontSize: 16, color: color.textInverse },
 });

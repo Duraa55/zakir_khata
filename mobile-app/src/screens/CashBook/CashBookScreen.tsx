@@ -1,35 +1,43 @@
 import React, { useEffect, useState, useRef } from 'react';
+import { useLanguageStore } from '../../store/useLanguageStore';
 import {
   View, Text, TouchableOpacity, StyleSheet,
   Animated, FlatList, Dimensions, Keyboard, Platform, Alert
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { LinearGradient } from 'expo-linear-gradient';
 import { useAuthStore } from '../../store/authStore';
 import { useTransactionStore } from '../../store/transactionStore';
-import { getDayBook, DayTotals } from '../../services/database/cashbookDb';
-import { closeDay, getDayStatus, DayStatus } from '../../services/database/dayClosingDb';
+import { getDayBook, getCashBalanceSummary, DayTotals } from '../../services/database/cashbookDb';
+import { ReadOnlyBanner } from '../../components/ui/ReadOnlyBanner';
+import { PdfReportButton } from '../../components/ui/PdfReportButton';
 import { CashEntry } from '../../types';
-import { Colors } from '../../theme';
 import { TopHeaderWithBooks } from '../../components/TopHeaderWithBooks';
 import { formatCurrency } from '../../utils/calculations';
 import { todayDate, localDate, parseDateValue } from '../../utils/dates';
 import { DateField } from '../../components/ui/DateField';
+import { color, space, radius, type as typeScale, hairline, iconSize, touchTarget, chrome } from '../../theme/tokens';
+import { Icon, AmountText, SummaryBar, SummaryFigure, SummaryDivider } from '../../components/ui/primitives';
 
-export const CashBookScreen = ({ navigation }: any) => {
+export const CashBookScreen = ({ navigation, route }: any) => {
   const insets = useSafeAreaInsets();
   const { user } = useAuthStore();
+  const { t } = useLanguageStore();
   const { cashSummary, loadCashBook } = useTransactionStore();
+  // Opened from a staff member's Entries: only THEIR rows, and nothing can be changed.
+  // Its figures live in local state — writing them into the shared store would show
+  // the staff member's balance on the viewer's own Cash Book afterwards.
+  const viewAs: { userId: string; name: string } | undefined = route?.params?.viewAs;
+  const [viewAsBalance, setViewAsBalance] = useState(0);
+  const [viewAsError, setViewAsError] = useState<string | null>(null);
   
   // The day being viewed. Defaults to today; stepping back shows past days on this
   // same screen. Nothing is archived or hidden when the date rolls over.
   const [viewDate, setViewDate] = useState(todayDate());
+  // Tracks the real-world "today" so the view can hop to the new day on its own —
+  // see the midnight-rollover effect below.
+  const [today, setToday] = useState(todayDate());
   const [todayEntries, setTodayEntries] = useState<CashEntry[]>([]);
   const [dayTotals, setDayTotals] = useState<DayTotals>({ cashIn: 0, cashOut: 0, net: 0, entryCount: 0 });
-  // Closing a day is optional: when nothing is ever closed this stays null and the
-  // screen behaves exactly as it did before the feature existed.
-  const [dayStatus, setDayStatus] = useState<DayStatus | null>(null);
-  const [closing, setClosing] = useState(false);
   const [loading, setLoading] = useState(false);
   const [isKeyboardVisible, setIsKeyboardVisible] = useState(false);
   
@@ -63,13 +71,19 @@ export const CashBookScreen = ({ navigation }: any) => {
     if (!user) return;
     setLoading(true);
     try {
-      await loadCashBook(user.id);
-      const { entries, dayTotals: totals } = await getDayBook(user.id, viewDate);
+      if (viewAs) {
+        setViewAsBalance((await getCashBalanceSummary(user.id, { createdBy: viewAs.userId })).cashBalance);
+      } else {
+        await loadCashBook(user.id);
+      }
+      const { entries, dayTotals: totals } = await getDayBook(user.id, viewDate, viewAs ? { createdBy: viewAs.userId } : {});
+      setViewAsError(null);
       setTodayEntries(entries);
       setDayTotals(totals);
-      setDayStatus(await getDayStatus(user.id, viewDate));
-    } catch (err) {
+    } catch (err: any) {
       if (__DEV__) console.error('[CashBook] day load failed:', err);
+      // A refused drill-down (outside the viewer's team) says so instead of going blank.
+      if (viewAs) setViewAsError(err?.message || t('cashViewAsFailed'));
     } finally {
       setLoading(false);
     }
@@ -86,17 +100,30 @@ export const CashBookScreen = ({ navigation }: any) => {
     loadDailyData();
   }, [user, viewDate]);
 
-  // Header label for the day being viewed, e.g. "SAT, 05 SEP 2026"
+  // The calendar day changes on its own — no "Close Day" action needed. As long as
+  // the shopkeeper was looking at today, a midnight rollover moves the view to the
+  // new day automatically; nothing is deleted, and the old day stays one tap back.
+  useEffect(() => {
+    const interval = setInterval(() => {
+      const now = todayDate();
+      if (now !== today) {
+        setViewDate(prev => (prev === today ? now : prev));
+        setToday(now);
+      }
+    }, 60000);
+    return () => clearInterval(interval);
+  }, [today]);
+
+  // Header label for the day being viewed, e.g. "Sat, 05 Sep 2026" — sentence case.
   const formatDayTitle = (value: string) => {
     const d = parseDateValue(value);
     if (!d) return value;
-    const dayName = d.toLocaleDateString('en-US', { weekday: 'short' }).toUpperCase();
+    const dayName = d.toLocaleDateString('en-US', { weekday: 'short' });
     const dayNum = String(d.getDate()).padStart(2, '0');
-    const monthName = d.toLocaleDateString('en-US', { month: 'short' }).toUpperCase();
+    const monthName = d.toLocaleDateString('en-US', { month: 'short' });
     return `${dayName}, ${dayNum} ${monthName} ${d.getFullYear()}`;
   };
 
-  const today = todayDate();
   const isToday = viewDate === today;
   const stepDay = (days: number) => {
     const base = parseDateValue(viewDate) || new Date();
@@ -105,43 +132,6 @@ export const CashBookScreen = ({ navigation }: any) => {
     // There is nothing to browse in the future.
     if (next > today) return;
     setViewDate(next);
-  };
-
-  const handleCloseDay = () => {
-    const already = dayStatus?.latest;
-    Alert.alert(
-      already ? 'Close Day Again?' : 'Close Day',
-      `${formatDayTitle(viewDate)}\n\n` +
-      `In ${formatCurrency(dayTotals.cashIn)} · Out ${formatCurrency(dayTotals.cashOut)}\n` +
-      `Balance ${formatCurrency(dayTotals.net)} · ${dayTotals.entryCount} ${dayTotals.entryCount === 1 ? 'entry' : 'entries'}\n\n` +
-      (already
-        ? 'This day was already closed. A new closing will be recorded alongside the existing one — the earlier closing is kept.'
-        : 'This records the day\'s totals. Entries are never deleted, and you can still add to this day afterwards.'),
-      [
-        { text: 'Cancel', style: 'cancel' },
-        {
-          text: already ? 'Close Again' : 'Close Day',
-          onPress: async () => {
-            setClosing(true);
-            try {
-              await closeDay(viewDate);
-              await loadDailyData();
-            } catch (err: any) {
-              if (__DEV__) console.error('[CashBook] close day failed:', err);
-              Alert.alert('Error', err?.message || 'Could not close the day.');
-            } finally {
-              setClosing(false);
-            }
-          },
-        },
-      ]
-    );
-  };
-
-  const formatClosedAt = (iso: string) => {
-    const d = new Date(iso);
-    if (isNaN(d.getTime())) return iso;
-    return d.toLocaleString([], { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit', hour12: true });
   };
 
   const formatEntryTime = (createdAt?: string, date?: string) => {
@@ -169,7 +159,7 @@ export const CashBookScreen = ({ navigation }: any) => {
     return (
       <TouchableOpacity 
         style={styles.entryRow}
-        onPress={() => navigation.navigate('CashEntryDetail', { entry: item })}
+        onPress={() => navigation.navigate('CashEntryDetail', { entry: item, readOnly: !!viewAs })}
         activeOpacity={0.7}
       >
         <View style={styles.entryLeft}>
@@ -181,18 +171,10 @@ export const CashBookScreen = ({ navigation }: any) => {
 
         <View style={styles.entryAmountsRight}>
           <View style={styles.amountCol}>
-            {!isIn && (
-              <Text style={[styles.entryAmount, { color: Colors.error }]}>
-                {formatCurrency(item.amount_paisa)}
-              </Text>
-            )}
+            {!isIn && <AmountText paisa={item.amount_paisa} tone="out" />}
           </View>
           <View style={styles.amountCol}>
-            {isIn && (
-              <Text style={[styles.entryAmount, { color: Colors.success }]}>
-                {formatCurrency(item.amount_paisa)}
-              </Text>
-            )}
+            {isIn && <AmountText paisa={item.amount_paisa} tone="in" />}
           </View>
         </View>
       </TouchableOpacity>
@@ -200,56 +182,54 @@ export const CashBookScreen = ({ navigation }: any) => {
   };
 
   return (
-    <View style={[styles.container, { paddingBottom: insets.bottom }]}>
-      {/* Top Header with Profile & Books Bar */}
-      <TopHeaderWithBooks navigation={navigation} activeBook="CashBook" />
+    <View style={styles.container}>
+      {/* Top Header with Profile & Books Bar — or, when viewing a staff member's
+          entries, a read-only banner (the books bar would jump to the viewer's own books). */}
+      {viewAs
+        ? <ReadOnlyBanner name={viewAs.name} book="Cash" onBack={() => navigation.goBack()} />
+        : <TopHeaderWithBooks navigation={navigation} activeBook="CashBook" />}
 
       {/* Sub Header — same row and button as the Bill Book. The export opens on the day
           being viewed; the sheet's presets still offer a week, a month or a custom span. */}
-      <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingHorizontal: 16, paddingTop: 10 }}>
-        <Text style={{ fontSize: 18, fontWeight: '800', color: '#fff' }}>Cash Book</Text>
-        <TouchableOpacity
-          style={{ padding: 6 }}
-          onPress={() => navigation.navigate('DownloadOptionsModal', { reportType: 'cash', date: viewDate })}
-        >
-          <Text style={{ fontSize: 14, fontWeight: '800', color: '#1dd1a1' }}>⬇ PDF Report</Text>
-        </TouchableOpacity>
+      <View style={styles.subHeader}>
+        {/* The export covers the viewer's whole book, not one person's — hidden in read-only. */}
+        {!viewAs && (
+        <PdfReportButton onPress={() => navigation.navigate('DownloadOptionsModal', { reportType: 'cash', date: viewDate })} />
+        )}
       </View>
 
-      {/* Summary Card Header */}
-      <View style={styles.summaryCard}>
-        <View style={styles.summaryCol}>
-          <Text style={[styles.summaryVal, { color: Colors.success }]} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.7}>
-            {formatCurrency(cashSummary.cashBalance || 0)}
-          </Text>
-          <Text style={styles.summarySubLabel}>Cash in Hand (all time)</Text>
-        </View>
+      {!!viewAsError && <Text style={styles.viewAsError}>{viewAsError}</Text>}
 
-        <View style={styles.summaryDivider} />
+      {/* Summary — the dashboard's brand surface, so the two read as one app.
+          Figures are white here, not green/red: the tone colours were chosen for
+          contrast against white, and neither is legible on cyan. */}
+      <SummaryBar>
+        <SummaryFigure label={t('cashInHandAllTime')} align="center">
+          <AmountText paisa={(viewAs ? viewAsBalance : cashSummary.cashBalance) || 0} size="title" fit style={styles.summaryVal} />
+        </SummaryFigure>
 
-        <View style={styles.summaryCol}>
-          <Text style={[styles.summaryVal, { color: todayBalancePaisa >= 0 ? Colors.success : Colors.error }]} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.7}>
-            {formatCurrency(todayBalancePaisa)}
-          </Text>
-          <Text style={styles.summarySubLabel}>{isToday ? 'Today Balance' : 'Day Balance'}</Text>
-        </View>
+        <SummaryDivider />
 
-        <View style={styles.summaryDivider} />
+        <SummaryFigure label={t(isToday ? 'cashTodayBalance' : 'cashDayBalance')} align="center">
+          <AmountText paisa={todayBalancePaisa} size="title" fit style={styles.summaryVal} />
+        </SummaryFigure>
 
-        <TouchableOpacity 
-          style={[styles.summaryCol, { alignItems: 'center' }]}
-          onPress={() => navigation.navigate('CashHistory')}
+        <SummaryDivider />
+
+        <TouchableOpacity
+          style={styles.summaryAction}
+          onPress={() => (viewAs ? navigation.navigate('CashHistory', { viewAs }) : navigation.navigate('CashHistory'))}
           activeOpacity={0.7}
         >
-          <Text style={{ fontSize: 18, marginBottom: 2 }}>🕒</Text>
-          <Text style={styles.historyText}>History</Text>
+          <Icon name="clock" size={iconSize.md} tint={color.onBrand} />
+          <Text style={styles.historyText}>{t('cashHistory')}</Text>
         </TouchableOpacity>
-      </View>
+      </SummaryBar>
 
       {/* Day navigator — past days are this same screen, not a separate list */}
       <View style={styles.dayNavRow}>
         <TouchableOpacity onPress={() => stepDay(-1)} style={styles.dayNavBtn} activeOpacity={0.7}>
-          <Text style={styles.dayNavArrow}>‹</Text>
+          <Icon name="chevron-left" size={iconSize.md} tint={color.textPrimary} />
         </TouchableOpacity>
 
         <View style={{ flex: 1 }}>
@@ -268,12 +248,12 @@ export const CashBookScreen = ({ navigation }: any) => {
           disabled={isToday}
           activeOpacity={0.7}
         >
-          <Text style={[styles.dayNavArrow, isToday && styles.dayNavArrowDisabled]}>›</Text>
+          <Icon name="chevron-right" size={iconSize.md} tint={isToday ? color.textMuted : color.textPrimary} />
         </TouchableOpacity>
 
         {!isToday && (
           <TouchableOpacity onPress={() => setViewDate(today)} style={styles.todayChip} activeOpacity={0.7}>
-            <Text style={styles.todayChipText}>Today</Text>
+            <Text style={styles.todayChipText}>{t('commonToday')}</Text>
           </TouchableOpacity>
         )}
       </View>
@@ -283,112 +263,61 @@ export const CashBookScreen = ({ navigation }: any) => {
         <View style={styles.dateHeaderLeft}>
           <Text style={styles.dateTitle}>{formatDayTitle(viewDate)}</Text>
           <Text style={styles.entriesCountText}>
-            {dayTotals.entryCount} {dayTotals.entryCount === 1 ? 'Entry' : 'Entries'}
+            {dayTotals.entryCount} {dayTotals.entryCount === 1 ? t('commonEntry') : t('commonEntries')}
           </Text>
         </View>
 
         <View style={styles.dateHeaderRight}>
           <View style={styles.totalsHeaderRow}>
-            <Text style={[styles.columnLabel, { color: Colors.error }]}>Out</Text>
-            <Text style={[styles.columnLabel, { color: Colors.success }]}>In</Text>
+            <Text style={[styles.columnLabel, { color: color.textSecondary }]}>{t('commonOut')}</Text>
+            <Text style={[styles.columnLabel, { color: color.textSecondary }]}>{t('commonIn')}</Text>
           </View>
           <View style={styles.totalsValueRow}>
-            <Text style={[styles.columnVal, { color: Colors.error }]}>
-              {formatCurrency(todayOutPaisa)}
-            </Text>
-            <Text style={[styles.columnVal, { color: Colors.success }]}>
-              {formatCurrency(todayInPaisa)}
-            </Text>
+            <AmountText paisa={todayOutPaisa} tone="out" size="label" />
+            <AmountText paisa={todayInPaisa} tone="in" size="label" />
           </View>
         </View>
       </View>
-
-      {/* Close Day / closing status — additive, and absent until someone closes a day */}
-      {dayStatus && (dayStatus.canClose || dayStatus.latest) && (
-        <View style={styles.closeDayRow}>
-          {dayStatus.latest ? (
-            <View style={{ flex: 1 }}>
-              <Text style={styles.closedLabel}>
-                Closed {formatClosedAt(dayStatus.latest.closed_at)} by {dayStatus.latest.closed_by_name}
-                {dayStatus.closings.length > 1 ? ` · ${dayStatus.closings.length} closings` : ''}
-              </Text>
-              <Text style={styles.closedFigure}>
-                At close: {formatCurrency(dayStatus.latest.closing_balance_paisa)}
-                {' · '}{dayStatus.latest.entry_count} {dayStatus.latest.entry_count === 1 ? 'entry' : 'entries'}
-              </Text>
-              {/* Drift: both figures shown, neither silently corrected */}
-              {dayStatus.drifted && (
-                <Text style={styles.driftText}>
-                  Changed since close — now {formatCurrency(dayStatus.current.net)}
-                  {' · '}{dayStatus.current.entryCount} {dayStatus.current.entryCount === 1 ? 'entry' : 'entries'}
-                </Text>
-              )}
-            </View>
-          ) : (
-            <Text style={styles.closedLabel}>This day is not closed yet.</Text>
-          )}
-
-          {dayStatus.canClose && (
-            <TouchableOpacity
-              style={[styles.closeDayBtn, closing && { opacity: 0.6 }]}
-              onPress={handleCloseDay}
-              disabled={closing}
-              activeOpacity={0.8}
-            >
-              <Text style={styles.closeDayBtnText}>
-                {closing ? '…' : dayStatus.latest ? 'Close Again' : 'Close Day'}
-              </Text>
-            </TouchableOpacity>
-          )}
-        </View>
-      )}
 
       {/* Daily Entries List */}
       <FlatList
         data={todayEntries}
         keyExtractor={item => item.id}
         renderItem={renderEntryItem}
-        contentContainerStyle={{ paddingBottom: 150, paddingTop: 4 }}
+        contentContainerStyle={{ paddingBottom: chrome.listBottom, paddingTop: 4 }}
         ListEmptyComponent={
           <View style={styles.emptyContainer}>
-            <Text style={styles.emptyIcon}>💵</Text>
-            <Text style={styles.emptyTitle}>{isToday ? 'No Cash Entries Today' : 'No Cash Entries This Day'}</Text>
-            <Text style={styles.emptySubtitle}>Tap Cash In or Cash Out below to record a transaction.</Text>
+            <Icon name="inbox" size={32} tint={color.textMuted} />
+            <Text style={styles.emptyTitle}>{isToday ? t('cashNoEntriesToday') : t('cashNoEntriesThisDay')}</Text>
+            <Text style={styles.emptySubtitle}>{viewAs ? `${viewAs.name} made no cash entries on this day.` : t('cashTapToRecord')}</Text>
           </View>
         }
       />
 
       {/* Bottom Action Row (Cash Out / Cash In) - Hidden when typing / keyboard open */}
-      {!isKeyboardVisible && (
-        <View style={[styles.actionRow, { marginBottom: 85 + Math.max(insets.bottom, 8) }]}>
+      {/* Read-only: no way to add an entry for someone else. */}
+      {!isKeyboardVisible && !viewAs && (
+        <View style={[styles.actionRow, { marginBottom: 0 }]}>
+          {/* A matched pair, coloured by MEANING: these two buttons are money out and
+              money in. Both carry white text (6.47:1 and 5.02:1 on their fills). */}
           <TouchableOpacity
-            style={styles.cashBtnWrap}
+            style={[styles.cashBtn, styles.cashBtnOut]}
             onPress={() => navigation.navigate('CashOutModal', { mode: 'out', date: viewDate })}
             activeOpacity={0.85}
+            accessibilityRole="button"
           >
-            <LinearGradient
-              colors={['#c0392b', '#ee5a6f']}
-              start={{ x: 0, y: 0 }}
-              end={{ x: 1, y: 1 }}
-              style={[styles.cashBtn, styles.redGlow]}
-            >
-              <Text style={styles.btnText}>CASH OUT</Text>
-            </LinearGradient>
+            <Icon name="arrow-up-right" size={iconSize.sm} tint={color.textInverse} />
+            <Text style={styles.btnText} numberOfLines={1}>{t('dashCashOut')}</Text>
           </TouchableOpacity>
 
           <TouchableOpacity
-            style={styles.cashBtnWrap}
+            style={[styles.cashBtn, styles.cashBtnIn]}
             onPress={() => navigation.navigate('CashInModal', { mode: 'in', date: viewDate })}
             activeOpacity={0.85}
+            accessibilityRole="button"
           >
-            <LinearGradient
-              colors={['#00A651', '#1dd1a1']}
-              start={{ x: 0, y: 0 }}
-              end={{ x: 1, y: 1 }}
-              style={[styles.cashBtn, styles.greenGlow]}
-            >
-              <Text style={styles.btnText}>CASH IN</Text>
-            </LinearGradient>
+            <Icon name="arrow-down-left" size={iconSize.sm} tint={color.textInverse} />
+            <Text style={styles.btnText} numberOfLines={1}>{t('dashCashIn')}</Text>
           </TouchableOpacity>
         </View>
       )}
@@ -397,116 +326,97 @@ export const CashBookScreen = ({ navigation }: any) => {
 };
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: Colors.bgPrimary },
+  container: { flex: 1, backgroundColor: color.surface },
 
+  subHeader: {
+    flexDirection: 'row', justifyContent: 'flex-end', alignItems: 'center',
+    paddingHorizontal: space.lg, paddingTop: chrome.barPadY,
+  },
+  // Flat: one step of tone and a hairline, no shadow or elevation.
   summaryCard: {
     flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
-    backgroundColor: Colors.bgCard, marginHorizontal: 12, marginTop: 12, marginBottom: 8,
-    borderRadius: 14, paddingVertical: 14, paddingHorizontal: 16,
-    borderWidth: 1, borderColor: Colors.border,
-    shadowColor: '#000', shadowOffset: { width: 0, height: 3 }, shadowOpacity: 0.25, elevation: 3,
+    backgroundColor: color.surfaceRaised, marginHorizontal: space.lg,
+    marginTop: chrome.cardMarginY, marginBottom: chrome.cardMarginY,
+    borderRadius: radius.lg, paddingVertical: chrome.cardPadY, paddingHorizontal: space.lg,
+    borderWidth: hairline, borderColor: color.border,
   },
   summaryCol: { flex: 1, alignItems: 'center' },
-  summaryVal: { fontSize: 15, fontWeight: '800' },
-  summarySubLabel: { fontSize: 11, color: Colors.textGray, fontWeight: '600', marginTop: 2 },
-  summaryDivider: { width: 1, height: 28, backgroundColor: Colors.border },
-  historyText: { fontSize: 12, color: Colors.error, fontWeight: '700' },
+  summaryAction: { flex: 1, alignItems: 'center', justifyContent: 'center' },
+  summaryVal: { textAlign: 'center', color: color.onBrand },
+  summarySubLabel: { ...typeScale.caption, color: color.textSecondary, marginTop: 2, textAlign: 'center' },
+  summaryDivider: { width: hairline, height: 28, backgroundColor: color.border },
+  historyText: { ...typeScale.caption, color: color.onBrandMuted, marginTop: 2 },
 
   dayNavRow: {
-    flexDirection: 'row', alignItems: 'center', gap: 8,
-    marginHorizontal: 12, marginTop: 4, marginBottom: 8,
+    flexDirection: 'row', alignItems: 'center', gap: space.sm,
+    marginHorizontal: space.lg, marginTop: space.xs, marginBottom: space.sm,
   },
   dayNavBtn: {
-    width: 36, height: 36, borderRadius: 18,
-    backgroundColor: Colors.bgInput, borderWidth: 1, borderColor: Colors.border,
+    width: touchTarget, height: touchTarget, borderRadius: radius.pill,
+    backgroundColor: color.surfaceRaised, borderWidth: hairline, borderColor: color.border,
     alignItems: 'center', justifyContent: 'center',
   },
   dayNavBtnDisabled: { opacity: 0.4 },
-  dayNavArrow: { fontSize: 20, color: Colors.textWhite, fontWeight: '700', marginTop: -2 },
-  dayNavArrowDisabled: { color: Colors.textGray },
   dayNavField: {
-    backgroundColor: Colors.bgInput, borderWidth: 1, borderColor: Colors.border,
-    borderRadius: 12, paddingHorizontal: 12, paddingVertical: 8,
+    backgroundColor: color.surfaceRaised, borderWidth: hairline, borderColor: color.border,
+    borderRadius: radius.md, paddingHorizontal: space.md, minHeight: touchTarget,
   },
-  dayNavFieldText: { fontSize: 13, color: Colors.textWhite, fontWeight: '700' },
+  dayNavFieldText: { ...typeScale.label, color: color.textPrimary },
   todayChip: {
-    paddingHorizontal: 12, paddingVertical: 8, borderRadius: 20,
-    backgroundColor: Colors.primary,
+    paddingHorizontal: space.md, minHeight: touchTarget, justifyContent: 'center',
+    borderRadius: radius.pill, backgroundColor: color.accent,
   },
-  todayChipText: { fontSize: 12, color: Colors.textWhite, fontWeight: '800' },
-  closeDayRow: {
-    flexDirection: 'row', alignItems: 'center', gap: 10,
-    marginHorizontal: 12, marginBottom: 8, padding: 12,
-    backgroundColor: Colors.bgCard, borderRadius: 12,
-    borderWidth: 1, borderColor: Colors.border,
-  },
-  closedLabel: { fontSize: 11, color: Colors.textGray, fontWeight: '600' },
-  closedFigure: { fontSize: 12, color: Colors.textWhite, fontWeight: '700', marginTop: 2 },
-  driftText: { fontSize: 11, color: Colors.warning, fontWeight: '700', marginTop: 3 },
-  closeDayBtn: {
-    paddingHorizontal: 14, paddingVertical: 9, borderRadius: 20,
-    backgroundColor: Colors.primary,
-  },
-  closeDayBtnText: { fontSize: 12, color: Colors.textWhite, fontWeight: '800' },
+  todayChipText: { ...typeScale.label, color: color.textInverse },
+
   dateHeaderBanner: {
     flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center',
-    backgroundColor: Colors.bgCard, marginHorizontal: 12, marginBottom: 8,
-    borderRadius: 12, paddingVertical: 12, paddingHorizontal: 14,
-    borderWidth: 1, borderColor: Colors.border,
+    backgroundColor: color.surface, marginHorizontal: space.lg, marginBottom: space.sm,
+    borderRadius: radius.md, paddingVertical: chrome.dayPadY, paddingHorizontal: space.lg,
+    borderWidth: hairline, borderColor: color.border,
   },
-  dateHeaderLeft: { flex: 1 },
-  dateTitle: { fontSize: 13, fontWeight: '800', color: Colors.textWhite, letterSpacing: 0.5 },
-  entriesCountText: { fontSize: 12, color: Colors.textGray, marginTop: 2 },
+  // flex: 1 so a long day title takes the slack rather than squeezing the figures.
+  dateHeaderLeft: { flex: 1, marginRight: space.md },
+  dateTitle: { ...typeScale.bodyMedium, color: color.textPrimary },
+  entriesCountText: { ...typeScale.caption, color: color.textSecondary, marginTop: 2 },
 
-  dateHeaderRight: { alignItems: 'flex-end' },
-  totalsHeaderRow: { flexDirection: 'row', gap: 16, marginBottom: 2 },
-  totalsValueRow: { flexDirection: 'row', gap: 16 },
-  columnLabel: { fontSize: 12, fontWeight: '700', minWidth: 60, textAlign: 'right' },
-  columnVal: { fontSize: 13, fontWeight: '800', minWidth: 60, textAlign: 'right', flexShrink: 0 },
+  dateHeaderRight: { alignItems: 'flex-end', flexShrink: 0 },
+  totalsHeaderRow: { flexDirection: 'row', gap: space.lg, marginBottom: 2 },
+  totalsValueRow: { flexDirection: 'row', gap: space.lg },
+  columnLabel: { ...typeScale.caption, minWidth: 60, textAlign: 'right' },
 
   entryRow: {
     flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center',
-    backgroundColor: Colors.bgCard, borderRadius: 12, paddingVertical: 10, paddingHorizontal: 14,
-    marginBottom: 8, borderWidth: 1, borderColor: Colors.border, marginHorizontal: 12,
+    backgroundColor: color.surface, borderRadius: radius.md,
+    paddingVertical: chrome.rowPadY, paddingHorizontal: space.lg,
+    marginBottom: chrome.rowGap, marginHorizontal: space.lg,
+    borderWidth: hairline, borderColor: color.border,
+    minHeight: touchTarget,
   },
-  entryLeft: { flex: 1, marginRight: 8 },
-  timeText: { fontSize: 11, color: Colors.textGray, marginBottom: 4 },
-  chip: {
-    backgroundColor: Colors.bgInput, borderWidth: 1, borderColor: Colors.border,
-    paddingHorizontal: 10, paddingVertical: 4, borderRadius: 12, alignSelf: 'flex-start',
-  },
-  chipText: { fontSize: 12, color: Colors.textWhite, fontWeight: '600' },
+  entryLeft: { flex: 1, marginRight: space.sm },
+  timeText: { ...typeScale.caption, color: color.textMuted, marginBottom: 2 },
+  chip: { alignSelf: 'flex-start' },
+  chipText: { ...typeScale.body, color: color.textPrimary },
 
-  entryAmountsRight: { flexDirection: 'row', gap: 16, alignItems: 'center', flexShrink: 0 },
+  entryAmountsRight: { flexDirection: 'row', gap: space.md, alignItems: 'center', flexShrink: 0 },
   amountCol: { minWidth: 60, alignItems: 'flex-end', justifyContent: 'center' },
-  entryAmount: { fontSize: 15, fontWeight: '800', textAlign: 'right', flexShrink: 0 },
 
-  emptyContainer: { alignItems: 'center', justifyContent: 'center', paddingVertical: 48 },
-  emptyIcon: { fontSize: 44, marginBottom: 10 },
-  emptyTitle: { fontSize: 16, fontWeight: '700', color: Colors.textWhite },
-  emptySubtitle: { fontSize: 12, color: Colors.textGray, marginTop: 4, textAlign: 'center' },
+  emptyContainer: { alignItems: 'center', justifyContent: 'center', paddingVertical: space.xxxl * 1.5, gap: space.sm },
+  emptyTitle: { ...typeScale.bodyMedium, color: color.textPrimary },
+  emptySubtitle: { ...typeScale.label, color: color.textSecondary, textAlign: 'center' },
 
   actionRow: {
     position: 'absolute', bottom: 0, left: 0, right: 0,
-    flexDirection: 'row', justifyContent: 'space-between', gap: 12,
-    backgroundColor: Colors.bgCard,
-    paddingHorizontal: 16, paddingVertical: 12,
-    borderTopWidth: 1, borderTopColor: Colors.border,
+    flexDirection: 'row', justifyContent: 'space-between', gap: space.md,
+    backgroundColor: color.surface,
+    paddingHorizontal: space.lg, paddingVertical: space.md,
+    borderTopWidth: hairline, borderTopColor: color.border,
   },
-  cashBtnWrap: { flex: 1 },
   cashBtn: {
-    minHeight: 48, borderRadius: 24,
-    alignItems: 'center', justifyContent: 'center',
+    flex: 1, minHeight: touchTarget, borderRadius: radius.md,
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: space.sm,
   },
-  greenGlow: {
-    shadowColor: Colors.primary, shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.4, shadowRadius: 8, elevation: 6,
-  },
-  redGlow: {
-    shadowColor: Colors.error, shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.4, shadowRadius: 8, elevation: 6,
-  },
-  btnText: { color: Colors.textWhite, fontSize: 15, fontWeight: '800', letterSpacing: 0.5 },
+  cashBtnIn: { backgroundColor: color.moneyIn },
+  cashBtnOut: { backgroundColor: color.moneyOut },
+  btnText: { ...typeScale.bodyMedium, color: color.textInverse },
+  viewAsError: { ...typeScale.label, color: color.moneyOut, paddingHorizontal: space.lg, paddingTop: space.sm },
 });
-
-

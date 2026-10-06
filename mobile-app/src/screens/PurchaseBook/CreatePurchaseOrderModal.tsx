@@ -1,4 +1,5 @@
 import React, { useState, useCallback } from 'react';
+import { useLanguageStore } from '../../store/useLanguageStore';
 import {
   View, Text, TextInput, TouchableOpacity, StyleSheet,
   ScrollView, KeyboardAvoidingView, Platform, Alert, ActivityIndicator, FlatList
@@ -10,10 +11,13 @@ import { useSupplierStore } from '../../store/useSupplierStore';
 import { getStockItemsByUserId } from '../../services/database/stockDb';
 import { PurchaseOrderItem } from '../../types/purchase.types';
 import { ScreenContainer } from '../../components/ui/ScreenContainer';
-import { Colors } from '../../theme';
+import { Icon, AmountText, Button } from '../../components/ui/primitives';
+import { color, space, radius, hairline, touchTarget, iconSize, type as typeScale } from '../../theme/tokens';
 import { formatCurrency, rupeesToPaisa, paisaToRupeesString } from '../../utils/calculations';
 import { DateField } from '../../components/ui/DateField';
 import { todayDate } from '../../utils/dates';
+import { CurrencyPicker } from '../../components/ui/CurrencyPicker';
+import { resolveCurrency, type CurrencyCode } from '../../utils/currency';
 
 interface CartItem extends Omit<PurchaseOrderItem, 'id' | 'po_id' | 'received_qty' | 'is_deleted'> {
   tempId: string;
@@ -23,7 +27,11 @@ export const CreatePurchaseOrderModal = ({ navigation, route }: any) => {
   const initSupplierId = route?.params?.supplierId;
   const initSupplierName = route?.params?.supplierName;
   const { user } = useAuthStore();
+  const { t } = useLanguageStore();
   const { createOrder } = usePurchaseStore();
+  // Opens on the account default EVERY time — never the last currency used.
+  const accountCurrency = resolveCurrency(user?.defaultCurrency).code;
+  const [currency, setCurrency] = useState<CurrencyCode>(accountCurrency);
   const { suppliers, loadSuppliers } = useSupplierStore();
 
   const [supplierId, setSupplierId] = useState(initSupplierId ?? '');
@@ -95,19 +103,19 @@ export const CreatePurchaseOrderModal = ({ navigation, route }: any) => {
   const total = cart.reduce((s, i) => s + i.line_total, 0);
 
   const handleSubmit = async () => {
-    if (!supplierId) { Alert.alert('Error', 'Please select a supplier'); return; }
-    if (cart.length === 0) { Alert.alert('Error', 'Add at least one item'); return; }
+    if (!supplierId) { Alert.alert(t('commonError'), t('poSelectSupplier')); return; }
+    if (cart.length === 0) { Alert.alert(t('commonError'), t('poAddOneItem')); return; }
     if (!user) return;
     setLoading(true);
     try {
       const items = cart.map(({ tempId, ...item }) => item);
-      const po = await createOrder(user.id, supplierId, items, orderDate, expectedDate || undefined, notes || undefined);
-      Alert.alert('PO Created', `Purchase Order PO-${String(po.po_number).padStart(4, '0')} created successfully.`, [
+      const po = await createOrder(user.id, supplierId, items, orderDate, expectedDate || undefined, notes || undefined, currency);
+      Alert.alert(t('poCreatedTitle'), t('poCreatedBody', { no: String(po.po_number).padStart(4, '0') }), [
         { text: 'View', onPress: () => { navigation.goBack(); navigation.navigate('PurchaseOrderDetail', { orderId: po.id }); } },
         { text: 'Done', onPress: () => navigation.goBack() }
       ]);
     } catch (e) {
-      Alert.alert('Error', 'Failed to create purchase order.');
+      Alert.alert(t('commonError'), t('poCreateFailed'));
     } finally {
       setLoading(false);
     }
@@ -116,22 +124,22 @@ export const CreatePurchaseOrderModal = ({ navigation, route }: any) => {
   return (
     <SafeAreaView style={styles.safe}>
       <View style={styles.header}>
-        <TouchableOpacity onPress={() => navigation.goBack()} style={styles.backBtn}>
-          <Text style={styles.backArrow}>←</Text>
+        <TouchableOpacity onPress={() => navigation.goBack()} style={styles.backBtn} accessibilityRole="button" accessibilityLabel={t('commonBack')}>
+          <Icon name="chevron-left" size={iconSize.lg} tint={color.textPrimary} />
         </TouchableOpacity>
-        <Text style={styles.headerTitle}>Create Purchase Order</Text>
-        <View style={{ width: 40 }} />
+        <Text style={styles.headerTitle} numberOfLines={1}>{t('poCreateTitle')}</Text>
+        <View style={styles.backBtn} />
       </View>
 
       <ScreenContainer scrollable={true} hasTabBar={true} contentContainerStyle={styles.form}>
 
           {/* Supplier */}
           <View style={styles.section}>
-            <Text style={styles.sectionTitle}>Supplier *</Text>
+            <Text style={styles.label}>{t('poSupplier')} *</Text>
             {supplierId && !showSupplierPicker ? (
               <TouchableOpacity style={styles.selectedSupplier} onPress={() => setShowSupplierPicker(true)}>
-                <Text style={styles.selectedSupplierName}>{supplierName}</Text>
-                <Text style={styles.changeText}>Change</Text>
+                <Text style={styles.selectedSupplierName} numberOfLines={1}>{supplierName}</Text>
+                <Text style={styles.changeText}>{t('poChange')}</Text>
               </TouchableOpacity>
             ) : (
               <View>
@@ -145,7 +153,8 @@ export const CreatePurchaseOrderModal = ({ navigation, route }: any) => {
                 ))}
                 {suppliers.length === 0 && (
                   <TouchableOpacity style={styles.addSupplierHint} onPress={() => navigation.navigate('AddSupplierModal')}>
-                    <Text style={styles.addSupplierHintText}>+ Add Supplier First</Text>
+                    <Icon name="plus" size={iconSize.sm} tint={color.accent} />
+                    <Text style={styles.addSupplierHintText}>{t('poAddSupplierFirst')}</Text>
                   </TouchableOpacity>
                 )}
               </View>
@@ -154,31 +163,34 @@ export const CreatePurchaseOrderModal = ({ navigation, route }: any) => {
 
           {/* Dates */}
           <View style={styles.row2col}>
-            <View style={[styles.section, { flex: 1 }]}>
-              <Text style={styles.sectionTitle}>Order Date</Text>
+            <View style={[styles.section, styles.col]}>
+              <Text style={styles.label}>{t('poOrderDate')}</Text>
               <DateField style={styles.input} value={orderDate} onChange={setOrderDate} />
             </View>
-            <View style={[styles.section, { flex: 1 }]}>
-              <Text style={styles.sectionTitle}>Expected Date</Text>
-              <DateField style={styles.input} value={expectedDate} onChange={setExpectedDate} placeholder="Optional" />
+            <View style={[styles.section, styles.col]}>
+              <Text style={styles.label}>{t('poExpectedDate')}</Text>
+              <DateField style={styles.input} value={expectedDate} onChange={setExpectedDate} placeholder={t('poOptional')} />
             </View>
           </View>
 
           {/* Item Search */}
           <View style={styles.section}>
-            <Text style={styles.sectionTitle}>Add Items</Text>
-            <TextInput
-              style={styles.input}
-              placeholder="🔍 Search stock items..."
-              value={stockSearch}
-              onChangeText={searchStock}
-              placeholderTextColor={Colors.textGray}
-            />
-            {searchLoading && <ActivityIndicator size="small" color={Colors.primary} style={{ marginTop: 8 }} />}
+            <Text style={styles.label}>{t('poAddItems')}</Text>
+            <View style={styles.searchBox}>
+              <Icon name="search" size={iconSize.sm} tint={color.textMuted} />
+              <TextInput
+                style={styles.searchInput}
+                placeholder={t('poSearchStock')}
+                value={stockSearch}
+                onChangeText={searchStock}
+                placeholderTextColor={color.textMuted}
+              />
+            </View>
+            {searchLoading && <ActivityIndicator size="small" color={color.accent} style={styles.spinner} />}
             {stockResults.map(item => (
               <TouchableOpacity key={item.id} style={styles.stockResult} onPress={() => addToCart(item)}>
                 <Text style={styles.stockResultName}>{item.name_en}</Text>
-                <Text style={styles.stockResultDetail}>Stock: {item.quantity} | Cost: {item.purchase_price != null ? formatCurrency(item.purchase_price) : '—'}</Text>
+                <Text style={styles.stockResultDetail}>Stock: {item.quantity} · Cost: {item.purchase_price != null ? formatCurrency(item.purchase_price) : '—'}</Text>
               </TouchableOpacity>
             ))}
           </View>
@@ -186,17 +198,17 @@ export const CreatePurchaseOrderModal = ({ navigation, route }: any) => {
           {/* Cart */}
           {cart.length > 0 && (
             <View style={styles.section}>
-              <Text style={styles.sectionTitle}>Order Items ({cart.length})</Text>
+              <Text style={styles.label}>Order items ({cart.length})</Text>
               {cart.map(item => (
                 <View key={item.tempId} style={styles.cartItem}>
                   <Text style={styles.cartItemName} numberOfLines={1}>{item.item_name}</Text>
                   <View style={styles.cartItemControls}>
-                    <TouchableOpacity style={styles.qtyBtn} onPress={() => updateQty(item.tempId, item.quantity - 1)}>
-                      <Text style={styles.qtyBtnText}>−</Text>
+                    <TouchableOpacity style={styles.qtyBtn} onPress={() => updateQty(item.tempId, item.quantity - 1)} accessibilityLabel={t('poLess')}>
+                      <Icon name="minus" size={iconSize.sm} tint={color.accent} />
                     </TouchableOpacity>
                     <Text style={styles.qtyVal}>{item.quantity}</Text>
-                    <TouchableOpacity style={styles.qtyBtn} onPress={() => updateQty(item.tempId, item.quantity + 1)}>
-                      <Text style={styles.qtyBtnText}>+</Text>
+                    <TouchableOpacity style={styles.qtyBtn} onPress={() => updateQty(item.tempId, item.quantity + 1)} accessibilityLabel={t('poMore')}>
+                      <Icon name="plus" size={iconSize.sm} tint={color.accent} />
                     </TouchableOpacity>
                     <Text style={styles.cartX}>×</Text>
                     <TextInput
@@ -204,93 +216,119 @@ export const CreatePurchaseOrderModal = ({ navigation, route }: any) => {
                       value={paisaToRupeesString(item.unit_cost)}
                       onChangeText={v => updateCost(item.tempId, rupeesToPaisa(v) ?? 0)}
                       keyboardType="decimal-pad"
-                      placeholderTextColor={Colors.textGray}
+                      placeholderTextColor={color.textMuted}
                     />
-                    <TouchableOpacity onPress={() => removeItem(item.tempId)}>
-                      <Text style={{ color: Colors.error, fontSize: 18, marginLeft: 8 }}>✕</Text>
+                    <TouchableOpacity onPress={() => removeItem(item.tempId)} style={styles.removeBtn} accessibilityLabel={t('poRemoveItem')}>
+                      <Icon name="x" size={iconSize.md} tint={color.textSecondary} />
                     </TouchableOpacity>
                   </View>
-                  <Text style={styles.lineTotal}>Rs. {item.line_total.toFixed(2)}</Text>
+                  {/* line_total is paisa: formatted once, never printed raw. */}
+                  <View style={styles.lineTotalRow}>
+                    <AmountText currency={currency} paisa={item.line_total} size="label" />
+                  </View>
                 </View>
               ))}
-              <View style={styles.totalRow}>
-                <Text style={styles.totalLabel}>Order Total</Text>
-                <Text style={styles.totalAmt}>Rs. {total.toFixed(2)}</Text>
+              {/* The currency sits WITH the figure it applies to, the same place the
+                  expense amount box puts it — pick it before the amount reads right. */}
+              <View style={[styles.totalRow, styles.totalRowGrand]}>
+                <Text style={styles.totalLabelGrand}>{t('poOrderTotal')}</Text>
+                <CurrencyPicker value={currency} onChange={setCurrency} />
+                <AmountText paisa={total} currency={currency} />
               </View>
+              <Text style={styles.currencyHint}>{t('currencyEntryHint')}</Text>
             </View>
           )}
 
+
           {/* Notes */}
           <View style={styles.section}>
-            <Text style={styles.sectionTitle}>Notes (Optional)</Text>
+            <Text style={styles.label}>{t('poNotesLabel')}</Text>
             <TextInput
-              style={[styles.input, { minHeight: 70, textAlignVertical: 'top' }]}
+              style={[styles.input, styles.notesInput]}
               value={notes} onChangeText={setNotes}
-              placeholder="Any notes for this order..."
-              placeholderTextColor={Colors.textGray}
+              placeholder={t('poNotesPlaceholder')}
+              placeholderTextColor={color.textMuted}
               multiline numberOfLines={3}
             />
           </View>
 
-          <TouchableOpacity style={[styles.submitBtn, loading && { opacity: 0.6 }]} onPress={handleSubmit} disabled={loading}>
-            {loading ? <ActivityIndicator color="#fff" /> : <Text style={styles.submitText}>📦 CREATE PURCHASE ORDER</Text>}
-          </TouchableOpacity>
+          <Button label={t('poCreate')} icon="package" onPress={handleSubmit} loading={loading} disabled={loading} fullWidth style={styles.submitBtn} />
         </ScreenContainer>
     </SafeAreaView>
   );
 };
 
 const styles = StyleSheet.create({
-  safe: { flex: 1, backgroundColor: Colors.bgPrimary },
+  safe: { flex: 1, backgroundColor: color.surface },
   header: {
     flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
-    backgroundColor: Colors.bgCard, paddingHorizontal: 16, paddingVertical: 14,
-    borderBottomWidth: 1, borderBottomColor: Colors.border,
+    backgroundColor: color.surface, paddingHorizontal: space.md, minHeight: 56,
+    borderBottomWidth: hairline, borderBottomColor: color.border,
   },
-  backBtn: { width: 36 },
-  backArrow: { fontSize: 22, color: Colors.textWhite, fontWeight: '700' },
-  headerTitle: { fontSize: 17, fontWeight: '700', color: Colors.textWhite },
-  form: { padding: 16, paddingBottom: 40 },
+  backBtn: { width: touchTarget, height: touchTarget, alignItems: 'center', justifyContent: 'center' },
+  headerTitle: { ...typeScale.heading, fontSize: 18, color: color.textPrimary, flex: 1, textAlign: 'center' },
+  form: { padding: space.lg, paddingBottom: 40 },
   section: {
-    backgroundColor: Colors.bgCard, borderRadius: 14, padding: 14, marginBottom: 12,
-    borderWidth: 1, borderColor: Colors.border, shadowColor: '#000', shadowOpacity: 0.2, elevation: 2
+    backgroundColor: color.surface, borderRadius: radius.lg, padding: space.lg, marginBottom: space.md,
+    borderWidth: hairline, borderColor: color.border,
   },
-  sectionTitle: { fontSize: 12, fontWeight: '700', color: Colors.textGray, marginBottom: 8, textTransform: 'uppercase', letterSpacing: 0.5 },
+  currencyHint: { ...typeScale.caption, color: color.textMuted, marginTop: space.xs },
+  label: { ...typeScale.label, color: color.textSecondary, marginBottom: space.sm },
   input: {
-    backgroundColor: Colors.bgInput, borderWidth: 1, borderColor: Colors.border,
-    borderRadius: 10, paddingHorizontal: 12, paddingVertical: 10, fontSize: 14, color: Colors.textWhite
+    backgroundColor: color.surfaceRaised, borderWidth: hairline, borderColor: color.border,
+    borderRadius: radius.md, paddingHorizontal: space.md, minHeight: touchTarget, paddingVertical: space.sm,
+    ...typeScale.body, color: color.textPrimary,
   },
-  row2col: { flexDirection: 'row', gap: 10, marginBottom: 0 },
+  notesInput: { minHeight: 70, textAlignVertical: 'top' },
+  row2col: { flexDirection: 'row', gap: space.md },
+  col: { flex: 1 },
+  searchBox: {
+    flexDirection: 'row', alignItems: 'center', gap: space.sm,
+    backgroundColor: color.surfaceRaised, borderWidth: hairline, borderColor: color.border,
+    borderRadius: radius.md, paddingHorizontal: space.md, minHeight: touchTarget,
+  },
+  searchInput: { ...typeScale.body, flex: 1, color: color.textPrimary, paddingVertical: space.sm },
+  spinner: { marginTop: space.sm },
   selectedSupplier: {
-    flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center',
-    padding: 12, backgroundColor: Colors.bgInput, borderRadius: 10, borderWidth: 1, borderColor: Colors.border
+    flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', gap: space.md,
+    minHeight: touchTarget, paddingHorizontal: space.md, paddingVertical: space.sm,
+    backgroundColor: color.surfaceRaised, borderRadius: radius.md, borderWidth: hairline, borderColor: color.border,
   },
-  selectedSupplierName: { fontSize: 15, fontWeight: '700', color: Colors.primaryLight },
-  changeText: { fontSize: 13, color: Colors.textGray, fontWeight: '600' },
-  supplierOption: { padding: 12, borderRadius: 10, borderWidth: 1, borderColor: Colors.border, marginBottom: 8, backgroundColor: Colors.bgInput },
-  supplierOptName: { fontSize: 14, fontWeight: '700', color: Colors.textWhite },
-  supplierOptBiz: { fontSize: 12, color: Colors.textGray, marginTop: 2 },
-  addSupplierHint: { padding: 12, alignItems: 'center' },
-  addSupplierHintText: { color: Colors.primaryLight, fontWeight: '700' },
-  stockResult: { padding: 10, borderBottomWidth: 1, borderBottomColor: Colors.border },
-  stockResultName: { fontSize: 14, fontWeight: '600', color: Colors.textWhite },
-  stockResultDetail: { fontSize: 12, color: Colors.textGray, marginTop: 2 },
-  cartItem: { paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: Colors.border },
-  cartItemName: { fontSize: 13, fontWeight: '700', color: Colors.textWhite, marginBottom: 6 },
-  cartItemControls: { flexDirection: 'row', alignItems: 'center', flexWrap: 'wrap' },
-  qtyBtn: { width: 32, height: 32, backgroundColor: Colors.bgInput, borderWidth: 1, borderColor: Colors.border, borderRadius: 8, justifyContent: 'center', alignItems: 'center' },
-  qtyBtnText: { fontSize: 18, color: Colors.primaryLight, fontWeight: '700' },
-  qtyVal: { width: 36, textAlign: 'center', fontSize: 15, fontWeight: '700', color: Colors.textWhite },
-  cartX: { fontSize: 14, color: Colors.textGray, marginHorizontal: 6 },
+  selectedSupplierName: { ...typeScale.bodyMedium, color: color.textPrimary, flex: 1 },
+  changeText: { ...typeScale.label, color: color.accent },
+  supplierOption: {
+    minHeight: touchTarget, padding: space.md, borderRadius: radius.md, borderWidth: hairline,
+    borderColor: color.borderStrong, marginBottom: space.sm, backgroundColor: color.surface,
+  },
+  supplierOptName: { ...typeScale.bodyMedium, color: color.textPrimary },
+  supplierOptBiz: { ...typeScale.caption, color: color.textSecondary, marginTop: 2 },
+  addSupplierHint: { minHeight: touchTarget, flexDirection: 'row', gap: space.sm, alignItems: 'center', justifyContent: 'center' },
+  addSupplierHintText: { ...typeScale.bodyMedium, color: color.accent },
+  stockResult: { minHeight: touchTarget, paddingVertical: space.sm, borderBottomWidth: hairline, borderBottomColor: color.border, justifyContent: 'center' },
+  stockResultName: { ...typeScale.bodyMedium, color: color.textPrimary },
+  stockResultDetail: { ...typeScale.caption, color: color.textSecondary, marginTop: 2 },
+  cartItem: { paddingVertical: space.md, borderBottomWidth: hairline, borderBottomColor: color.border },
+  cartItemName: { ...typeScale.bodyMedium, color: color.textPrimary, marginBottom: space.sm },
+  cartItemControls: { flexDirection: 'row', alignItems: 'center', flexWrap: 'wrap', gap: space.xs },
+  qtyBtn: {
+    width: touchTarget, height: touchTarget, backgroundColor: color.surface, borderWidth: hairline,
+    borderColor: color.borderStrong, borderRadius: radius.sm, justifyContent: 'center', alignItems: 'center',
+  },
+  qtyVal: { ...typeScale.bodyMedium, minWidth: 36, textAlign: 'center', color: color.textPrimary },
+  cartX: { ...typeScale.label, color: color.textSecondary, marginHorizontal: space.xs },
   costInput: {
-    width: 80, backgroundColor: Colors.bgInput, borderWidth: 1, borderColor: Colors.border,
-    borderRadius: 8, paddingHorizontal: 8, paddingVertical: 4, fontSize: 14, textAlign: 'center', color: Colors.textWhite
+    minWidth: 80, backgroundColor: color.surfaceRaised, borderWidth: hairline, borderColor: color.border,
+    borderRadius: radius.sm, paddingHorizontal: space.sm, minHeight: touchTarget, ...typeScale.body, textAlign: 'center', color: color.textPrimary,
   },
-  lineTotal: { fontSize: 12, color: Colors.textGray, marginTop: 4, textAlign: 'right', fontWeight: '600' },
-  totalRow: { flexDirection: 'row', justifyContent: 'space-between', paddingTop: 12, marginTop: 4 },
-  totalLabel: { fontSize: 14, fontWeight: '700', color: Colors.textWhite },
-  totalAmt: { fontSize: 16, fontWeight: '800', color: Colors.primaryLight },
-  submitBtn: { backgroundColor: Colors.primary, borderRadius: 14, paddingVertical: 16, alignItems: 'center', marginTop: 8 },
-  submitText: { color: Colors.textWhite, fontWeight: '800', fontSize: 15 },
+  removeBtn: { width: touchTarget, height: touchTarget, alignItems: 'center', justifyContent: 'center' },
+  lineTotalRow: { flexDirection: 'row', justifyContent: 'flex-end', marginTop: space.xs },
+  totalRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', gap: space.md, paddingVertical: space.sm },
+  totalRowGrand: { paddingTop: space.md, marginTop: space.xs, borderTopWidth: hairline, borderTopColor: color.border },
+  totalLabel: { ...typeScale.body, color: color.textSecondary, flex: 1 },
+  totalLabelGrand: { ...typeScale.bodyMedium, color: color.textPrimary, flex: 1 },
+  inlineInput: {
+    minWidth: 90, backgroundColor: color.surfaceRaised, borderWidth: hairline, borderColor: color.border,
+    borderRadius: radius.sm, paddingHorizontal: space.sm, minHeight: touchTarget, ...typeScale.body, textAlign: 'right', color: color.textPrimary,
+  },
+  submitBtn: { minHeight: 52, marginTop: space.sm },
 });
-

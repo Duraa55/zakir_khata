@@ -1,3 +1,4 @@
+import type { CurrencyCode } from '../utils/currency';
 export interface BillItem {
   id: string;
   bill_id: string;
@@ -25,6 +26,11 @@ export interface Bill {
   discount_amount?: number;    // integer paisa
   tax_amount: number;          // integer paisa
   total: number;               // integer paisa
+  /**
+   * Currency this bill was ENTERED in (v41). Subtotal, total, paid, due and every line
+   * are in this currency's minor unit, and the printed invoice prints it. Never converted.
+   */
+  currency?: CurrencyCode;
   paid: number;                // integer paisa
   due: number;                 // integer paisa
   status: 'paid' | 'unpaid' | 'partial' | 'draft' | 'hold';

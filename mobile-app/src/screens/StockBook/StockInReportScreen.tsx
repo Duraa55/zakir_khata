@@ -1,32 +1,36 @@
 import React, { useEffect, useState, useMemo } from 'react';
-import { View, Text, TouchableOpacity, StyleSheet, TextInput, SectionList, ActivityIndicator, Alert } from 'react-native';
+import { useLanguageStore } from '../../store/useLanguageStore';
+import { View, Text, TouchableOpacity, StyleSheet, TextInput, FlatList, ActivityIndicator, Alert } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import * as Print from 'expo-print';
 import { useAuthStore } from '../../store/authStore';
 import { useStockStore } from '../../store/useStockStore';
-import { StockReportEntry } from '../../services/database/stockDb';
+import { StockItemReportRow } from '../../services/database/stockDb';
 import { formatCurrency } from '../../utils/calculations';
-import { DateFilterPicker } from '../../components/reports/DateFilterPicker';
+import { DateFilterPicker, presetRange } from '../../components/reports/DateFilterPicker';
 import { DateRangeFilter } from '../../services/database/reports/types';
 import { getDisplayName } from '../../utils/displayName';
-import { useSettingsStore } from '../../store/useSettingsStore';
-import { Colors } from '../../theme';
+import { color, space, radius, type as typeScale, hairline, iconSize, touchTarget } from '../../theme/tokens';
+import { Icon, AmountText } from '../../components/ui/primitives';
 import { ScreenContainer } from '../../components/ui/ScreenContainer';
-import { localDate, toDateValue, formatDisplayDate } from '../../utils/dates';
-import * as Print from 'expo-print';
+import { localDate, toDateValue, formatDisplayDate, parseDateValue } from '../../utils/dates';
 import { useDownloadStore } from '../../store/useDownloadStore';
 
 export const StockInReportScreen = ({ navigation }: any) => {
   const { user } = useAuthStore();
-  const report = useStockStore(s => s.movementReport.in);
-  const fetchMovementReport = useStockStore(s => s.fetchMovementReport);
-  const loadMoreMovementReport = useStockStore(s => s.loadMoreMovementReport);
-  const { rows, summary, dayTotals, loading, loadingMore } = report;
-  const { nameDisplayMode } = useSettingsStore();
+  const { t } = useLanguageStore();
+  // One row per item that came IN, with that item's own SQL totals. Tapping a row
+  // opens only that item's stock-in entries.
+  const report = useStockStore(s => s.movementItems.in);
+  const fetchMovementItems = useStockStore(s => s.fetchMovementItems);
+  const loadMoreMovementItems = useStockStore(s => s.loadMoreMovementItems);
+  const { rows, summary, loading, loadingMore } = report;
 
   const { isGenerating, generateFile } = useDownloadStore();
   const [searchQuery, setSearchQuery] = useState('');
-  const [startDate, setStartDate] = useState<Date | null>(null);
-  const [endDate, setEndDate] = useState<Date | null>(null);
+  // Starts on the range the picker shows by default (current month), not all-time.
+  const [startDate, setStartDate] = useState<Date | null>(() => parseDateValue(presetRange('currentMonth').startDate));
+  const [endDate, setEndDate] = useState<Date | null>(() => parseDateValue(presetRange('currentMonth').endDate));
   
   // Range AND search are part of the SQL predicate, so the paged rows, the header
   // totals and the day subtotals always describe the same set.
@@ -34,7 +38,7 @@ export const StockInReportScreen = ({ navigation }: any) => {
     if (user) {
       const startStr = startDate ? localDate(startDate) : undefined;
       const endStr = endDate ? localDate(endDate) : undefined;
-      fetchMovementReport(user.id, 'in', { startDate: startStr, endDate: endStr, search: searchQuery });
+      fetchMovementItems(user.id, 'in', { startDate: startStr, endDate: endStr, search: searchQuery });
     }
   }, [user, startDate, endDate, searchQuery]);
 
@@ -54,7 +58,7 @@ export const StockInReportScreen = ({ navigation }: any) => {
       await Print.printAsync({ uri });
     } catch (err: any) {
       if (__DEV__) console.error('[StockReport] print failed:', err);
-      Alert.alert('Print Failed', err?.message || 'Could not print the report. Please try again.');
+      Alert.alert(t('srPrintFailed'), err?.message || 'Could not print the report. Please try again.');
     }
   };
 
@@ -67,64 +71,27 @@ export const StockInReportScreen = ({ navigation }: any) => {
   const totalQty = summary.qty;
   const totalAmount = summary.amount;
 
-  // Loaded movements grouped by day; a day straddling a page boundary keeps ONE
-  // section whose header shows the day's whole SQL subtotal.
-  const sections = useMemo(() => {
-    const byDay = new Map<string, StockReportEntry[]>();
-    for (const m of rows) {
-      const day = toDateValue(m.date) || String(m.date);
-      const list = byDay.get(day);
-      if (list) list.push(m); else byDay.set(day, [m]);
-    }
-    return [...byDay.entries()].map(([day, data]) => ({ day, data }));
-  }, [rows]);
+  const loadMore = () => { if (user) loadMoreMovementItems(user.id, 'in'); };
 
-  const renderSectionHeader = ({ section }: { section: { day: string } }) => {
-    const t = dayTotals[section.day];
-    return (
-      <View style={styles.dayHeader}>
-        <View style={{ flex: 1 }}>
-          <Text style={styles.dayTitle}>{formatDisplayDate(section.day)}</Text>
-          {t && <Text style={styles.dayCount}>{t.entries} {t.entries === 1 ? 'Entry' : 'Entries'}</Text>}
-        </View>
-        {t && (
-          <View style={styles.dayRight}>
-            <View style={styles.dayCols}>
-              <Text style={[styles.dayColLabel, { color: Colors.success }]}>Qty IN</Text>
-              <Text style={[styles.dayColLabel, { color: Colors.textGray }]}>Amount</Text>
-            </View>
-            <View style={styles.dayCols}>
-              <Text style={[styles.dayColVal, { color: Colors.success }]}>{t.qty}</Text>
-              <Text style={[styles.dayColVal, { color: Colors.success }]}>{formatCurrency(t.amount)}</Text>
-            </View>
-          </View>
-        )}
+  const renderItem = ({ item }: { item: StockItemReportRow }) => (
+    <TouchableOpacity
+      style={styles.itemRow}
+      onPress={() => navigation.navigate('StockMovementItem', {
+        direction: 'in', itemId: item.item_id, itemName: getDisplayName(item as any),
+        unit: item.unit, period: shownPeriod(),
+      })}
+      accessibilityRole="button"
+    >
+      <View style={styles.itemNameCell}>
+        <Text style={styles.itemName} numberOfLines={1}>{getDisplayName(item as any)}</Text>
+        <Text style={styles.itemEntries}>{item.entries} {item.entries === 1 ? 'entry' : 'entries'}</Text>
       </View>
-    );
-  };
-
-  const loadMore = () => { if (user) loadMoreMovementReport(user.id, 'in'); };
-
-  const renderItem = ({ item }: { item: StockReportEntry }) => {
-    const amount = item.change * (item.cost_per_unit || 0);
-    return (
-      <View style={styles.row}>
-        <View style={styles.cellName}>
-          <Text style={styles.itemName}>{getDisplayName(item as any, nameDisplayMode)}</Text>
-          <Text style={styles.itemDate}>{new Date(item.date).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })}</Text>
-        </View>
-        <View style={styles.cellQty}>
-          <Text style={[styles.valText, { color: Colors.success }]}>{item.change}</Text>
-        </View>
-        <View style={styles.cellRate}>
-          <Text style={styles.valText}>{item.cost_per_unit ? formatCurrency(item.cost_per_unit) : '-'}</Text>
-        </View>
-        <View style={styles.cellAmount}>
-          <Text style={[styles.valText, { color: Colors.success }]}>{formatCurrency(amount)}</Text>
-        </View>
-      </View>
-    );
-  };
+      {/* A quantity is a count, not money — never through formatCurrency. */}
+      <Text style={styles.itemQty}>{item.qty}{item.unit ? ` ${item.unit}` : ''}</Text>
+      <AmountText paisa={item.amount} size="label" tone="in" />
+      <Icon name="chevron-right" size={iconSize.sm} tint={color.textMuted} />
+    </TouchableOpacity>
+  );
 
   return (
     <SafeAreaView style={styles.safe}>
@@ -133,7 +100,7 @@ export const StockInReportScreen = ({ navigation }: any) => {
         <TouchableOpacity onPress={() => navigation.goBack()} style={styles.backBtn}>
           <Text style={styles.backArrow}>{'<'}</Text>
         </TouchableOpacity>
-        <Text style={styles.headerTitle}>Stock IN Report</Text>
+        <Text style={styles.headerTitle}>{t('srInTitle')}</Text>
         <View style={{ width: 40 }} />
       </View>
 
@@ -142,11 +109,11 @@ export const StockInReportScreen = ({ navigation }: any) => {
         <View style={styles.filtersContainer}>
           <View style={styles.searchRow}>
             <View style={styles.searchBox}>
-              <Text style={styles.searchIcon}>🔍</Text>
+              <Icon name="search" size={iconSize.sm} tint={color.textMuted} />
               <TextInput
                 style={styles.searchInput}
-                placeholder="Search items..."
-                placeholderTextColor={Colors.textGray}
+                placeholder={t('commonSearchItems')}
+                placeholderTextColor={color.textSecondary}
                 value={searchQuery}
                 onChangeText={setSearchQuery}
               />
@@ -158,49 +125,45 @@ export const StockInReportScreen = ({ navigation }: any) => {
         {/* Table Header */}
         <View style={styles.tableHeaderRow}>
           <View style={styles.cellNameHeader}>
-            <Text style={{ color: Colors.success, fontSize: 16, fontWeight: 'bold' }}>↓</Text>
+            <Icon name="arrow-down-left" size={iconSize.sm} tint={color.moneyIn} />
             <View style={{ marginLeft: 4 }}>
-              <Text style={styles.thText}>Entries</Text>
-              <Text style={[styles.thSubText, { color: Colors.textWhite }]}>{summary.entries}</Text>
+              <Text style={styles.thText}>{t('khataEntries')}</Text>
+              <Text style={[styles.thSubText, { color: color.textPrimary }]}>{summary.entries}</Text>
             </View>
           </View>
           <View style={styles.cellQty}>
             <Text style={styles.thText}>Qty</Text>
-            <Text style={[styles.thSubText, { color: Colors.success }]}>{totalQty}</Text>
+            <Text style={[styles.thSubText, { color: color.moneyIn }]}>{totalQty}</Text>
           </View>
-          <View style={styles.cellRate}>
-            <Text style={styles.thText}>Rate</Text>
-          </View>
+          <View style={styles.cellRate} />
           <View style={styles.cellAmount}>
-            <Text style={styles.thText}>Amount</Text>
-            <Text style={[styles.thSubText, { color: Colors.success }]}>{formatCurrency(totalAmount)}</Text>
+            <Text style={styles.thText}>{t('commonAmount')}</Text>
+            <Text style={[styles.thSubText, { color: color.moneyIn }]}>{formatCurrency(totalAmount)}</Text>
           </View>
         </View>
 
         {/* List */}
         {loading ? (
           <View style={styles.center}>
-            <ActivityIndicator size="large" color={Colors.primary} />
+            <ActivityIndicator size="large" color={color.accent} />
           </View>
         ) : (
-          <SectionList
-            sections={sections}
-            keyExtractor={(item) => item.id}
+          <FlatList
+            data={rows}
+            keyExtractor={(item) => item.item_id}
             renderItem={renderItem}
-            renderSectionHeader={renderSectionHeader}
-            stickySectionHeadersEnabled
             style={{ flex: 1 }}
-            contentContainerStyle={{ paddingBottom: 16 }}
+            contentContainerStyle={{ paddingBottom: space.lg }}
             onEndReached={loadMore}
             onEndReachedThreshold={0.5}
-            ListFooterComponent={loadingMore ? <ActivityIndicator style={{ margin: 16 }} color={Colors.primary} /> : null}
-            initialNumToRender={10}
-            maxToRenderPerBatch={10}
+            ListFooterComponent={loadingMore ? <ActivityIndicator style={styles.footerSpinner} color={color.accent} /> : null}
+            initialNumToRender={12}
+            maxToRenderPerBatch={12}
             windowSize={5}
             removeClippedSubviews={true}
             ListEmptyComponent={
               <View style={styles.center}>
-                <Text style={{ color: Colors.textGray, marginTop: 40 }}>No stock in entries found.</Text>
+                <Text style={styles.emptyText}>{t('srNoIn')}</Text>
               </View>
             }
           />
@@ -209,10 +172,11 @@ export const StockInReportScreen = ({ navigation }: any) => {
         {/* Footer Export Buttons */}
         <View style={styles.footer}>
           <TouchableOpacity style={styles.pdfBtn} onPress={handleExport} disabled={isGenerating}>
-            <Text style={styles.pdfBtnText}>📄 PDF Report</Text>
+            <Icon name="download" size={iconSize.sm} tint={color.brand} />
+            <Text style={styles.pdfBtnText}>{t('staffPdfReport')}</Text>
           </TouchableOpacity>
           <TouchableOpacity style={styles.printBtn} onPress={handlePrint} disabled={isGenerating}>
-            <Text style={styles.printBtnText}>🖨️</Text>
+            <Icon name="printer" size={iconSize.md} tint={color.textInverse} />
           </TouchableOpacity>
         </View>
       </ScreenContainer>
@@ -221,32 +185,43 @@ export const StockInReportScreen = ({ navigation }: any) => {
 };
 
 const styles = StyleSheet.create({
-  safe: { flex: 1, backgroundColor: Colors.bgPrimary },
-  container: { flex: 1, backgroundColor: Colors.bgPrimary },
+  itemRow: {
+    flexDirection: 'row', alignItems: 'center', gap: space.sm,
+    paddingHorizontal: space.lg, paddingVertical: space.md,
+    borderBottomWidth: hairline, borderBottomColor: color.border,
+  },
+  itemNameCell: { flex: 1 },
+  itemName: { ...typeScale.bodyMedium, fontSize: 15, color: color.textPrimary },
+  itemEntries: { ...typeScale.caption, color: color.textSecondary, marginTop: 2 },
+  itemQty: { ...typeScale.body, fontSize: 14, color: color.textPrimary, width: 72, textAlign: 'right' },
+  emptyText: { ...typeScale.body, color: color.textSecondary, marginTop: space.xxl },
+  footerSpinner: { margin: space.lg },
+  safe: { flex: 1, backgroundColor: color.surface },
+  container: { flex: 1, backgroundColor: color.surface },
   header: {
     flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
-    backgroundColor: Colors.bgCard, paddingHorizontal: 16, height: 56,
-    borderBottomWidth: 1, borderBottomColor: Colors.border,
+    backgroundColor: color.surface, paddingHorizontal: 16, height: 56,
+    borderBottomWidth: 1, borderBottomColor: color.border,
   },
   backBtn: { width: 40, justifyContent: 'center' },
-  backArrow: { fontSize: 24, color: Colors.textWhite, fontWeight: '400' },
-  headerTitle: { fontSize: 18, fontWeight: '700', color: Colors.textWhite },
+  backArrow: { fontSize: 24, color: color.textPrimary, fontWeight: '400' },
+  headerTitle: { fontSize: 18, fontWeight: '500', color: color.textPrimary },
 
-  filtersContainer: { backgroundColor: Colors.bgCard, padding: 12, borderBottomWidth: 1, borderBottomColor: Colors.border },
+  filtersContainer: { backgroundColor: color.surface, padding: 12, borderBottomWidth: 1, borderBottomColor: color.border },
   searchRow: { flexDirection: 'row', alignItems: 'center', marginBottom: 10 },
   searchBox: { 
     flex: 1, flexDirection: 'row', alignItems: 'center', 
-    backgroundColor: Colors.bgInput, borderWidth: 1, borderColor: Colors.border, borderRadius: 10, paddingHorizontal: 12, height: 42 
+    backgroundColor: color.surfaceRaised, borderWidth: 1, borderColor: color.border, borderRadius: 10, paddingHorizontal: 12, height: 42 
   },
-  searchIcon: { fontSize: 16, color: Colors.textGray, marginRight: 8 },
-  searchInput: { flex: 1, fontSize: 14, color: Colors.textWhite },
+  searchIcon: { fontSize: 16, color: color.textSecondary, marginRight: 8 },
+  searchInput: { flex: 1, fontSize: 14, color: color.textPrimary },
 
   tableHeaderRow: {
-    flexDirection: 'row', alignItems: 'center', backgroundColor: Colors.bgSecondary, 
-    paddingHorizontal: 16, paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: Colors.border
+    flexDirection: 'row', alignItems: 'center', backgroundColor: color.surfaceRaised, 
+    paddingHorizontal: 16, paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: color.border
   },
-  thText: { fontSize: 12, color: Colors.textGray, fontWeight: '600' },
-  thSubText: { fontSize: 12, fontWeight: '700', marginTop: 2 },
+  thText: { fontSize: 12, color: color.textSecondary, fontWeight: '500' },
+  thSubText: { fontSize: 12, fontWeight: '500', marginTop: 2 },
   
   cellNameHeader: { flex: 2, flexDirection: 'row', alignItems: 'center' },
   cellName: { flex: 2, justifyContent: 'center' },
@@ -254,43 +229,25 @@ const styles = StyleSheet.create({
   cellRate: { flex: 1, alignItems: 'flex-end', justifyContent: 'center' },
   cellAmount: { flex: 1.5, alignItems: 'flex-end', justifyContent: 'center' },
 
-  row: {
-    flexDirection: 'row', backgroundColor: Colors.bgCard, paddingHorizontal: 16, paddingVertical: 12,
-    borderBottomWidth: 1, borderBottomColor: Colors.border
-  },
-  itemName: { fontSize: 14, fontWeight: '700', color: Colors.textWhite },
-  itemDate: { fontSize: 11, color: Colors.textGray, marginTop: 2 },
-  valText: { fontSize: 13, fontWeight: '600', color: Colors.textWhite },
 
   center: { flex: 1, alignItems: 'center', justifyContent: 'center' },
 
   footer: {
     flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
-    paddingHorizontal: 16, paddingVertical: 12, backgroundColor: Colors.bgCard,
-    borderTopWidth: 1, borderTopColor: Colors.border
+    paddingHorizontal: 16, paddingVertical: 12, backgroundColor: color.surface,
+    borderTopWidth: 1, borderTopColor: color.border
   },
   pdfBtn: {
-    flex: 1, backgroundColor: Colors.bgInput, height: 48, borderRadius: 24,
-    borderWidth: 1.5, borderColor: Colors.primary, justifyContent: 'center', alignItems: 'center',
+    flex: 1, backgroundColor: color.surfaceRaised, height: 48, borderRadius: 24,
+    borderWidth: 1.5, borderColor: color.accent, justifyContent: 'center', alignItems: 'center',
     marginRight: 12,
   },
-  pdfBtnText: { color: Colors.primaryLight, fontSize: 15, fontWeight: '700' },
+  pdfBtnText: { color: color.brand, fontSize: 15, fontWeight: '500' },
   printBtn: {
-    width: 48, height: 48, borderRadius: 24, backgroundColor: Colors.warning,
+    width: 48, height: 48, borderRadius: 24, backgroundColor: color.attention,
     justifyContent: 'center', alignItems: 'center',
   },
   printBtnText: { fontSize: 22 },
 
   // Day header — the Cash Book day-header banner with Qty / Amount for the day.
-  dayHeader: {
-    flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center',
-    backgroundColor: Colors.bgCard, paddingVertical: 10, paddingHorizontal: 14,
-    borderBottomWidth: 1, borderColor: Colors.border,
-  },
-  dayTitle: { fontSize: 13, fontWeight: '800', color: Colors.textWhite, letterSpacing: 0.5 },
-  dayCount: { fontSize: 12, color: Colors.textGray, marginTop: 2 },
-  dayRight: { alignItems: 'flex-end' },
-  dayCols: { flexDirection: 'row', gap: 16 },
-  dayColLabel: { fontSize: 12, fontWeight: '700', minWidth: 60, textAlign: 'right', marginBottom: 2 },
-  dayColVal: { fontSize: 13, fontWeight: '800', minWidth: 60, textAlign: 'right', flexShrink: 0 },
 });

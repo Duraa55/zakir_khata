@@ -1,16 +1,26 @@
 import React, { useState, useEffect } from 'react';
+import { useLanguageStore } from '../../store/useLanguageStore';
+import { categoryLabel } from '../../i18n/categoryLabel';
 import {
   View, Text, TextInput, TouchableOpacity, StyleSheet,
   FlatList, Modal, SafeAreaView, ActivityIndicator, Alert
 } from 'react-native';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import { StockItem } from '../../types/stock.types';
-import { Colors } from '../../theme';
-import { formatCurrency } from '../../utils/calculations';
+import { color, space, radius, hairline, touchTarget, type as typeScale } from '../../theme/tokens';
+import { formatCurrency, rupeesToPaisa } from '../../utils/calculations';
+import { todayDate } from '../../utils/dates';
 
 interface CartItem extends StockItem {
   cartQty: number;
 }
+
+// A custom line's id always carries this prefix — the save/stock-adjustment code
+// downstream uses it to tell "typed on the spot" items apart from real stock rows,
+// since a custom item has no stock_items row to deduct from or to link a bill_item's
+// item_id to.
+const CUSTOM_ITEM_PREFIX = 'custom_';
+export const isCustomCartItem = (id: string) => id.startsWith(CUSTOM_ITEM_PREFIX);
 
 interface SelectItemsModalProps {
   visible: boolean;
@@ -18,11 +28,14 @@ interface SelectItemsModalProps {
   onSave: (cart: CartItem[]) => void;
   initialCart: CartItem[];
   stockItems: StockItem[];
+  /** The bill being built. Its cart figures are the bill’s, so they read in its currency. */
+  currency?: string;
 }
 
 export const SelectItemsModal: React.FC<SelectItemsModalProps> = ({
-  visible, onClose, onSave, initialCart, stockItems
+  visible, onClose, onSave, initialCart, stockItems, currency
 }) => {
+  const { t } = useLanguageStore();
   const [cart, setCart] = useState<CartItem[]>([]);
   const [searchQuery, setSearchQuery] = useState('');
   const [categories, setCategories] = useState<string[]>(['All']);
@@ -30,6 +43,13 @@ export const SelectItemsModal: React.FC<SelectItemsModalProps> = ({
   
   const [showScanner, setShowScanner] = useState(false);
   const [permission, requestPermission] = useCameraPermissions();
+
+  // Manual line — works with zero stock items saved, same as typing a description
+  // straight into Cash In/Out instead of picking from Stock.
+  const [showCustomInput, setShowCustomInput] = useState(false);
+  const [customName, setCustomName] = useState('');
+  const [customQty, setCustomQty] = useState('1');
+  const [customPrice, setCustomPrice] = useState('');
 
   useEffect(() => {
     if (visible) {
@@ -39,13 +59,48 @@ export const SelectItemsModal: React.FC<SelectItemsModalProps> = ({
     }
   }, [visible, initialCart, stockItems]);
 
+  const handleAddCustomItem = () => {
+    if (!customName.trim()) {
+      Alert.alert(t('commonRequired'), t('selectItemsNameRequired'));
+      return;
+    }
+    const qty = parseFloat(customQty);
+    if (isNaN(qty) || qty <= 0) {
+      Alert.alert(t('selectItemsQtyInvalidTitle'), t('selectItemsQtyInvalid'));
+      return;
+    }
+    const price = rupeesToPaisa(customPrice);
+    if (price === null) {
+      Alert.alert(t('selectItemsPriceInvalidTitle'), t('selectItemsPriceInvalid'));
+      return;
+    }
+    const customItem: CartItem = {
+      id: `${CUSTOM_ITEM_PREFIX}${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      user_id: '',
+      name_en: customName.trim(),
+      category: '',
+      unit: 'pcs',
+      quantity: 0,
+      purchase_price: 0,
+      sale_price: price,
+      low_stock_threshold: 0,
+      created_at: todayDate(),
+      synced: 0,
+      is_deleted: 0,
+      cartQty: qty,
+    };
+    setCart(prev => [...prev, customItem]);
+    setCustomName(''); setCustomQty('1'); setCustomPrice('');
+    setShowCustomInput(false);
+  };
+
   const handleBarcodeScanned = ({ data }: { data: string }) => {
     setShowScanner(false);
     const item = stockItems.find(i => i.barcode === data);
     if (item) {
       updateCartQty(item, 1);
     } else {
-      Alert.alert('No product matches this barcode.');
+      Alert.alert(t('selectItemsNoBarcodeMatch'));
     }
   };
 
@@ -79,9 +134,9 @@ export const SelectItemsModal: React.FC<SelectItemsModalProps> = ({
         <Modal visible={visible} animationType="slide">
           <SafeAreaView style={styles.safe}>
             <View style={styles.scannerFallback}>
-              <Text style={{ color: Colors.textWhite, fontSize: 16 }}>No access to camera</Text>
-              <TouchableOpacity style={styles.btnGreen} onPress={requestPermission}><Text style={styles.btnText}>Request Permission</Text></TouchableOpacity>
-              <TouchableOpacity style={styles.btnGray} onPress={() => setShowScanner(false)}><Text style={styles.btnTextBlack}>Go Back</Text></TouchableOpacity>
+              <Text style={styles.fallbackText}>{t('stockNoCameraAccess')}</Text>
+              <TouchableOpacity style={styles.btnGreen} onPress={requestPermission}><Text style={styles.btnText}>{t('stockRequestPermission')}</Text></TouchableOpacity>
+              <TouchableOpacity style={styles.btnGray} onPress={() => setShowScanner(false)}><Text style={styles.btnTextBlack}>{t('commonGoBack')}</Text></TouchableOpacity>
             </View>
           </SafeAreaView>
         </Modal>
@@ -89,7 +144,7 @@ export const SelectItemsModal: React.FC<SelectItemsModalProps> = ({
     }
     return (
       <Modal visible={visible} animationType="slide">
-        <View style={{ flex: 1, backgroundColor: Colors.bgPrimary }}>
+        <View style={{ flex: 1, backgroundColor: color.surface }}>
           <CameraView
             style={{ flex: 1 }}
             facing="back"
@@ -97,7 +152,7 @@ export const SelectItemsModal: React.FC<SelectItemsModalProps> = ({
           />
           <View style={styles.scannerOverlay}>
             <TouchableOpacity style={styles.btnGray} onPress={() => setShowScanner(false)}>
-              <Text style={styles.btnTextBlack}>Cancel Scan</Text>
+              <Text style={styles.btnTextBlack}>{t('stockCancelScan')}</Text>
             </TouchableOpacity>
           </View>
         </View>
@@ -109,27 +164,91 @@ export const SelectItemsModal: React.FC<SelectItemsModalProps> = ({
     <Modal visible={visible} animationType="slide" onRequestClose={onClose}>
       <SafeAreaView style={styles.safe}>
         <View style={styles.header}>
-          <TouchableOpacity onPress={onClose} style={{ padding: 8 }}>
-            <Text style={{ fontSize: 24, fontWeight: 'bold', color: Colors.textWhite }}>‹</Text>
+          <TouchableOpacity onPress={onClose} style={styles.headerBtn}>
+            <Text style={styles.backIcon}>‹</Text>
           </TouchableOpacity>
-          <Text style={styles.headerTitle}>Select Items</Text>
-          <TouchableOpacity onPress={() => setCart([])} style={{ padding: 8 }}>
-            <Text style={{ color: Colors.error, fontWeight: 'bold' }}>Clear</Text>
+          <Text style={styles.headerTitle} numberOfLines={1}>{t('selectItemsTitle')}</Text>
+          <TouchableOpacity onPress={() => setCart([])} style={[styles.headerBtn, { alignItems: 'flex-end' }]}>
+            <Text style={styles.clearText}>{t('commonClear')}</Text>
           </TouchableOpacity>
         </View>
 
         <View style={styles.searchRow}>
           <TextInput
             style={styles.searchInput}
-            placeholder="Search products or scan..."
-            placeholderTextColor={Colors.textGray}
+            placeholder={t('selectItemsSearch')}
+            placeholderTextColor={color.textMuted}
             value={searchQuery}
             onChangeText={setSearchQuery}
           />
           <TouchableOpacity style={styles.scanBtn} onPress={() => setShowScanner(true)}>
-            <Text style={{ fontSize: 22 }}>📷</Text>
+            <Text style={styles.scanBtnText}>{t('selectItemsScan')}</Text>
           </TouchableOpacity>
         </View>
+
+        {/* Custom line — works with zero stock items saved, same idea as typing a
+            description straight into Cash In/Out instead of picking from Stock. */}
+        {!showCustomInput ? (
+          <TouchableOpacity style={styles.customAddBtn} onPress={() => setShowCustomInput(true)}>
+            <Text style={styles.customAddBtnText}>{t('selectItemsAddCustom')}</Text>
+          </TouchableOpacity>
+        ) : (
+          <View style={styles.customForm}>
+            <TextInput
+              style={styles.customInput}
+              placeholder={t('selectItemsNamePlaceholder')}
+              placeholderTextColor={color.textMuted}
+              value={customName}
+              onChangeText={setCustomName}
+              autoFocus
+            />
+            <View style={{ flexDirection: 'row', gap: space.sm }}>
+              <TextInput
+                style={[styles.customInput, { flex: 1 }]}
+                placeholder={t('commonQty')}
+                placeholderTextColor={color.textMuted}
+                keyboardType="decimal-pad"
+                value={customQty}
+                onChangeText={setCustomQty}
+              />
+              <TextInput
+                style={[styles.customInput, { flex: 1 }]}
+                placeholder={t('selectItemsPricePlaceholder')}
+                placeholderTextColor={color.textMuted}
+                keyboardType="decimal-pad"
+                value={customPrice}
+                onChangeText={setCustomPrice}
+              />
+            </View>
+            <View style={{ flexDirection: 'row', gap: space.sm }}>
+              <TouchableOpacity
+                style={styles.customCancelBtn}
+                onPress={() => { setShowCustomInput(false); setCustomName(''); setCustomQty('1'); setCustomPrice(''); }}
+              >
+                <Text style={styles.secondaryBtnText}>{t('commonCancel')}</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={styles.customConfirmBtn} onPress={handleAddCustomItem}>
+                <Text style={styles.primaryBtnText}>{t('selectItemsAddToBill')}</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        )}
+
+        {/* Custom lines already added — they aren't stock, so they don't show in
+            the browsable list below; this is the only place to see or remove one. */}
+        {cart.filter(i => isCustomCartItem(i.id)).length > 0 && (
+          <View style={styles.customList}>
+            {cart.filter(i => isCustomCartItem(i.id)).map(i => (
+              <View key={i.id} style={styles.customListRow}>
+                <Text style={styles.customListName} numberOfLines={1}>{i.name_en} × {i.cartQty}</Text>
+                <Text style={styles.customListAmount}>{formatCurrency(i.sale_price * i.cartQty, currency)}</Text>
+                <TouchableOpacity style={styles.removeBtn} onPress={() => setCart(prev => prev.filter(c => c.id !== i.id))}>
+                  <Text style={styles.customListRemove}>×</Text>
+                </TouchableOpacity>
+              </View>
+            ))}
+          </View>
+        )}
 
         <View>
           <FlatList
@@ -143,7 +262,7 @@ export const SelectItemsModal: React.FC<SelectItemsModalProps> = ({
                 style={[styles.catChip, selectedCategory === c && styles.catChipActive]}
                 onPress={() => setSelectedCategory(c)}
               >
-                <Text style={[styles.catText, selectedCategory === c && styles.catTextActive]}>{c}</Text>
+                <Text style={[styles.catText, selectedCategory === c && styles.catTextActive]}>{c === 'All' ? t('catAll') : categoryLabel(t, c)}</Text>
               </TouchableOpacity>
             )}
           />
@@ -152,26 +271,26 @@ export const SelectItemsModal: React.FC<SelectItemsModalProps> = ({
         <FlatList
           data={filteredItems}
           keyExtractor={item => item.id}
-          contentContainerStyle={{ padding: 12, paddingBottom: 100 }}
+          contentContainerStyle={{ padding: space.md, paddingBottom: 100 }}
           renderItem={({ item }) => {
             const cartItem = cart.find(i => i.id === item.id);
             const qty = cartItem ? cartItem.cartQty : 0;
             return (
               <View style={styles.itemRow}>
-                <View style={{ flex: 1 }}>
+                <View style={{ flex: 1, marginRight: space.sm }}>
                   <Text style={styles.itemName}>{item.name_en}</Text>
                   <Text style={styles.itemPrice}>{formatCurrency(item.sale_price)}</Text>
-                  <Text style={styles.itemStock}>Stock: {item.quantity}</Text>
+                  <Text style={styles.itemStock}>{t('selectItemsStockLabel')}: {item.quantity}</Text>
                 </View>
                 
                 {qty === 0 ? (
                   <TouchableOpacity style={styles.addBtn} onPress={() => updateCartQty(item, 1)}>
-                    <Text style={styles.addBtnText}>ADD</Text>
+                    <Text style={styles.addBtnText}>{t('selectItemsAdd')}</Text>
                   </TouchableOpacity>
                 ) : (
                   <View style={styles.qtyControls}>
                     <TouchableOpacity style={styles.qtyBtn} onPress={() => updateCartQty(item, -1)}>
-                      <Text style={styles.qtyBtnText}>-</Text>
+                      <Text style={styles.qtyBtnText}>−</Text>
                     </TouchableOpacity>
                     <Text style={styles.qtyText}>{qty}</Text>
                     <TouchableOpacity style={styles.qtyBtn} onPress={() => updateCartQty(item, 1)}>
@@ -186,11 +305,11 @@ export const SelectItemsModal: React.FC<SelectItemsModalProps> = ({
 
         <View style={styles.bottomBar}>
           <View style={{ flex: 1 }}>
-            <Text style={styles.bottomTotalItems}>{cart.reduce((s, i) => s + i.cartQty, 0)} Items Selected</Text>
-            <Text style={styles.bottomTotalAmount}>{formatCurrency(totalAmount)}</Text>
+            <Text style={styles.bottomTotalItems}>{t('selectItemsCount', { count: cart.reduce((s, i) => s + i.cartQty, 0) })}</Text>
+            <Text style={styles.bottomTotalAmount}>{formatCurrency(totalAmount, currency)}</Text>
           </View>
           <TouchableOpacity style={styles.doneBtn} onPress={() => onSave(cart)}>
-            <Text style={styles.doneBtnText}>DONE</Text>
+            <Text style={styles.doneBtnText}>{t('commonDone')}</Text>
           </TouchableOpacity>
         </View>
       </SafeAreaView>
@@ -199,64 +318,116 @@ export const SelectItemsModal: React.FC<SelectItemsModalProps> = ({
 };
 
 const styles = StyleSheet.create({
-  safe: { flex: 1, backgroundColor: Colors.bgPrimary },
+  safe: { flex: 1, backgroundColor: color.surface },
   header: {
     flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
-    paddingHorizontal: 12, height: 56, borderBottomWidth: 1, borderBottomColor: Colors.border, backgroundColor: Colors.bgCard
+    paddingHorizontal: space.md, height: 56, borderBottomWidth: hairline, borderBottomColor: color.border, backgroundColor: color.surface
   },
-  headerTitle: { fontSize: 18, fontWeight: '700', color: Colors.textWhite },
-  
-  searchRow: { flexDirection: 'row', padding: 12, gap: 10, alignItems: 'center', backgroundColor: Colors.bgPrimary },
+  headerBtn: { minWidth: touchTarget, height: touchTarget, justifyContent: 'center' },
+  backIcon: { fontSize: 28, color: color.textPrimary },
+  headerTitle: { ...typeScale.heading, color: color.textPrimary, flex: 1, textAlign: 'center' },
+  clearText: { ...typeScale.bodyMedium, color: color.moneyOut },
+
+  searchRow: { flexDirection: 'row', padding: space.md, gap: space.sm, alignItems: 'center', backgroundColor: color.surface },
   searchInput: {
-    flex: 1, backgroundColor: Colors.bgInput, height: 48, borderRadius: 10,
-    paddingHorizontal: 16, borderWidth: 1, borderColor: Colors.border, fontSize: 15, color: Colors.textWhite
+    flex: 1, backgroundColor: color.surfaceRaised, minHeight: 48, borderRadius: radius.md,
+    paddingHorizontal: space.lg, borderWidth: hairline, borderColor: color.border, fontSize: 15, color: color.textPrimary
   },
   scanBtn: {
-    width: 48, height: 48, backgroundColor: Colors.bgInput, borderRadius: 10,
-    borderWidth: 1, borderColor: Colors.border, justifyContent: 'center', alignItems: 'center'
+    minWidth: 48, height: 48, paddingHorizontal: space.md, backgroundColor: color.surface, borderRadius: radius.md,
+    borderWidth: hairline, borderColor: color.borderStrong, justifyContent: 'center', alignItems: 'center'
   },
-  
-  catScroll: { paddingHorizontal: 12, paddingVertical: 8, gap: 8, backgroundColor: Colors.bgPrimary },
-  catChip: { paddingHorizontal: 16, paddingVertical: 8, borderRadius: 20, backgroundColor: Colors.bgInput, borderWidth: 1, borderColor: Colors.border },
-  catChipActive: { backgroundColor: Colors.primary, borderColor: Colors.primary },
-  catText: { fontWeight: '600', color: Colors.textGray, fontSize: 13 },
-  catTextActive: { color: Colors.textWhite, fontWeight: '700' },
+  scanBtnText: { ...typeScale.label, fontWeight: '500', color: color.accent },
+
+  customAddBtn: {
+    marginHorizontal: space.md, marginBottom: space.sm, minHeight: touchTarget, justifyContent: 'center',
+    paddingHorizontal: space.md, borderRadius: radius.md,
+    borderWidth: hairline, borderColor: color.accent, borderStyle: 'dashed', alignItems: 'center',
+  },
+  customAddBtnText: { ...typeScale.label, fontWeight: '500', color: color.accent, textAlign: 'center' },
+  customForm: {
+    marginHorizontal: space.md, marginBottom: space.sm, padding: space.md, borderRadius: radius.md,
+    backgroundColor: color.surfaceRaised, borderWidth: hairline, borderColor: color.border, gap: space.sm,
+  },
+  customInput: {
+    backgroundColor: color.surface, borderWidth: hairline, borderColor: color.border,
+    borderRadius: radius.sm, paddingHorizontal: space.md, minHeight: touchTarget, fontSize: 14, color: color.textPrimary,
+  },
+  customCancelBtn: {
+    flex: 1, backgroundColor: color.surface, minHeight: touchTarget, borderRadius: radius.sm,
+    borderWidth: hairline, borderColor: color.borderStrong, alignItems: 'center', justifyContent: 'center',
+  },
+  customConfirmBtn: {
+    flex: 1, backgroundColor: color.accent, minHeight: touchTarget, borderRadius: radius.sm,
+    alignItems: 'center', justifyContent: 'center',
+  },
+  primaryBtnText: { ...typeScale.bodyMedium, fontSize: 14, color: color.textInverse },
+  secondaryBtnText: { ...typeScale.bodyMedium, fontSize: 14, color: color.textPrimary },
+  customList: { marginHorizontal: space.md, marginBottom: space.sm, gap: 6 },
+  customListRow: {
+    flexDirection: 'row', alignItems: 'center', gap: space.sm,
+    backgroundColor: color.surface, borderWidth: hairline, borderColor: color.border,
+    borderRadius: radius.sm, paddingLeft: space.md,
+  },
+  customListName: { flex: 1, ...typeScale.label, fontWeight: '500', color: color.textPrimary },
+  customListAmount: { ...typeScale.label, fontWeight: '500', color: color.textPrimary, flexShrink: 0 },
+  removeBtn: { width: touchTarget, height: touchTarget, alignItems: 'center', justifyContent: 'center' },
+  customListRemove: { fontSize: 20, color: color.moneyOut },
+
+  catScroll: { paddingHorizontal: space.md, paddingVertical: space.sm, gap: space.sm, backgroundColor: color.surface },
+  catChip: {
+    paddingHorizontal: space.lg, minHeight: 36, justifyContent: 'center', borderRadius: radius.pill,
+    backgroundColor: color.surfaceRaised, borderWidth: hairline, borderColor: color.border,
+  },
+  catChipActive: { backgroundColor: color.accent, borderColor: color.accent },
+  catText: { ...typeScale.label, color: color.textSecondary },
+  catTextActive: { color: color.textInverse, fontWeight: '500' },
 
   itemRow: {
     flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
-    backgroundColor: Colors.bgCard, padding: 14, marginBottom: 8, borderRadius: 12,
-    borderWidth: 1, borderColor: Colors.border
+    backgroundColor: color.surface, padding: space.md, marginBottom: space.sm, borderRadius: radius.md,
+    borderWidth: hairline, borderColor: color.border
   },
-  itemName: { fontSize: 15, fontWeight: '600', color: Colors.textWhite },
-  itemPrice: { fontSize: 15, fontWeight: '700', color: Colors.primaryLight, marginTop: 4 },
-  itemStock: { fontSize: 12, color: Colors.textMuted, marginTop: 2 },
-  
+  itemName: { ...typeScale.bodyMedium, color: color.textPrimary },
+  itemPrice: { ...typeScale.bodyMedium, color: color.textPrimary, marginTop: space.xs },
+  itemStock: { ...typeScale.caption, color: color.textMuted, marginTop: 2 },
+
   addBtn: {
-    paddingHorizontal: 18, paddingVertical: 8, borderRadius: 8,
-    borderWidth: 1, borderColor: Colors.primary, backgroundColor: Colors.bgInput
+    paddingHorizontal: space.lg, minHeight: touchTarget, justifyContent: 'center', borderRadius: radius.sm,
+    borderWidth: hairline, borderColor: color.accent, backgroundColor: color.surface
   },
-  addBtnText: { color: Colors.primaryLight, fontWeight: '700' },
-  
-  qtyControls: { flexDirection: 'row', alignItems: 'center', backgroundColor: Colors.bgInput, borderRadius: 8, paddingHorizontal: 4, borderWidth: 1, borderColor: Colors.border },
-  qtyBtn: { width: 32, height: 32, justifyContent: 'center', alignItems: 'center' },
-  qtyBtnText: { fontSize: 18, fontWeight: 'bold', color: Colors.textWhite },
-  qtyText: { width: 36, textAlign: 'center', fontWeight: 'bold', fontSize: 15, color: Colors.textWhite },
+  addBtnText: { ...typeScale.bodyMedium, fontSize: 14, color: color.accent },
+
+  qtyControls: {
+    flexDirection: 'row', alignItems: 'center', backgroundColor: color.surfaceRaised, borderRadius: radius.sm,
+    borderWidth: hairline, borderColor: color.border,
+  },
+  qtyBtn: { width: touchTarget, height: touchTarget, justifyContent: 'center', alignItems: 'center' },
+  qtyBtnText: { fontSize: 20, color: color.accent },
+  qtyText: { minWidth: 32, textAlign: 'center', ...typeScale.bodyMedium, color: color.textPrimary },
 
   bottomBar: {
-    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: space.md,
     position: 'absolute', bottom: 0, left: 0, right: 0,
-    backgroundColor: Colors.bgCard, padding: 16, borderTopWidth: 1, borderTopColor: Colors.border,
+    backgroundColor: color.surface, padding: space.lg, borderTopWidth: hairline, borderTopColor: color.border,
     paddingBottom: 28,
   },
-  bottomTotalItems: { fontSize: 13, color: Colors.textGray },
-  bottomTotalAmount: { fontSize: 18, fontWeight: '800', color: Colors.textWhite, marginTop: 2 },
-  doneBtn: { backgroundColor: Colors.primary, paddingHorizontal: 28, paddingVertical: 12, borderRadius: 10 },
-  doneBtnText: { color: '#fff', fontSize: 15, fontWeight: 'bold' },
+  bottomTotalItems: { ...typeScale.label, color: color.textSecondary },
+  bottomTotalAmount: { ...typeScale.title, color: color.textPrimary, marginTop: 2 },
+  doneBtn: {
+    backgroundColor: color.accent, paddingHorizontal: space.xxl, minHeight: touchTarget,
+    justifyContent: 'center', borderRadius: radius.md, flexShrink: 0,
+  },
+  doneBtnText: { ...typeScale.bodyMedium, color: color.textInverse },
 
-  scannerOverlay: { position: 'absolute', bottom: 40, left: 20, right: 20 },
-  scannerFallback: { flex: 1, justifyContent: 'center', alignItems: 'center', gap: 16 },
-  btnGray: { backgroundColor: Colors.bgInput, height: 50, borderRadius: 8, justifyContent: 'center', alignItems: 'center', paddingHorizontal: 24 },
-  btnGreen: { backgroundColor: Colors.primary, height: 50, borderRadius: 8, justifyContent: 'center', alignItems: 'center', paddingHorizontal: 24 },
-  btnText: { color: '#fff', fontSize: 16, fontWeight: 'bold' },
-  btnTextBlack: { color: Colors.textWhite, fontSize: 16, fontWeight: 'bold' },
+  scannerOverlay: { position: 'absolute', bottom: 40, left: space.xl, right: space.xl },
+  scannerFallback: { flex: 1, justifyContent: 'center', alignItems: 'center', gap: space.lg },
+  fallbackText: { ...typeScale.body, fontSize: 16, color: color.textPrimary },
+  btnGray: {
+    backgroundColor: color.surface, minHeight: 50, borderRadius: radius.sm, justifyContent: 'center', alignItems: 'center',
+    paddingHorizontal: space.xxl, borderWidth: hairline, borderColor: color.borderStrong,
+  },
+  btnGreen: { backgroundColor: color.accent, minHeight: 50, borderRadius: radius.sm, justifyContent: 'center', alignItems: 'center', paddingHorizontal: space.xxl },
+  btnText: { ...typeScale.bodyMedium, fontSize: 16, color: color.textInverse },
+  btnTextBlack: { ...typeScale.bodyMedium, fontSize: 16, color: color.textPrimary },
 });

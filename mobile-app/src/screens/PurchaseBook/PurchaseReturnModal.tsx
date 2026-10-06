@@ -1,30 +1,31 @@
 import React, { useState } from 'react';
-import {
-  View, Text, TextInput, TouchableOpacity, StyleSheet,
-  ScrollView, KeyboardAvoidingView, Platform, Alert, ActivityIndicator
-} from 'react-native';
+import { useLanguageStore } from '../../store/useLanguageStore';
+import { View, Text, TextInput, TouchableOpacity, StyleSheet, Alert } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useAuthStore } from '../../store/authStore';
 import { usePurchaseStore } from '../../store/usePurchaseStore';
 import { PurchaseInvoiceItem, PurchaseReturnItem } from '../../types/purchase.types';
 import { formatCurrency } from '../../utils/calculations';
 import { ScreenContainer } from '../../components/ui/ScreenContainer';
-import { Colors } from '../../theme';
 import { DateField } from '../../components/ui/DateField';
 import { todayDate } from '../../utils/dates';
+import { Icon, AmountText, Button } from '../../components/ui/primitives';
+import { color, space, radius, hairline, touchTarget, iconSize, type as typeScale } from '../../theme/tokens';
 
-interface ReturnCartItem extends Omit<PurchaseReturnItem, 'id' | 'return_id'> {
-  tempId: string;
-  maxQty: number;
-}
-
+/**
+ * Return goods to the supplier. The data layer refuses more than was invoiced (minus
+ * earlier returns) and writes the return, its lines and the stock decrease together.
+ */
 export const PurchaseReturnModal = ({ navigation, route }: any) => {
   const {
     invoiceId, supplierId, supplierName,
-    items = [] as PurchaseInvoiceItem[]
+    items = [] as PurchaseInvoiceItem[],
+    // The INVOICE's currency: a refund is a figure of that invoice.
+    currency,
   } = route.params;
 
   const { user } = useAuthStore();
+  const { t } = useLanguageStore();
   const { createReturn } = usePurchaseStore();
 
   const [returnDate, setReturnDate] = useState(todayDate());
@@ -34,37 +35,31 @@ export const PurchaseReturnModal = ({ navigation, route }: any) => {
   );
   const [loading, setLoading] = useState(false);
 
+  const qtyOf = (id: string) => parseFloat(selected[id]?.qty ?? '0') || 0;
   const checkedItems = items.filter((i: PurchaseInvoiceItem) => selected[i.id]?.checked);
-  const totalRefund = checkedItems.reduce((s: number, i: PurchaseInvoiceItem) => {
-    const qty = parseFloat(selected[i.id]?.qty ?? '0') || 0;
-    return s + (qty * i.unit_cost);
-  }, 0);
+  // A preview only — the saved figure is computed again, in whole paisa, by the data layer.
+  const totalRefund = checkedItems.reduce((s: number, i: PurchaseInvoiceItem) => s + Math.round(qtyOf(i.id) * i.unit_cost), 0);
+
+  const setQty = (id: string, next: number, max: number) =>
+    setSelected(p => ({ ...p, [id]: { ...p[id], qty: String(Math.max(0, Math.min(max, next))) } }));
 
   const handleSubmit = async () => {
     if (!user) return;
-    if (checkedItems.length === 0) { Alert.alert('Error', 'Select at least one item to return'); return; }
+    if (checkedItems.length === 0) { Alert.alert(t('prNothingSelectedTitle'), t('prNothingSelected')); return; }
 
     const returnItems: Omit<PurchaseReturnItem, 'id' | 'return_id'>[] = checkedItems.map((i: PurchaseInvoiceItem) => {
-      const qty = parseFloat(selected[i.id]?.qty ?? '0') || 0;
-      return {
-        stock_item_id: i.stock_item_id,
-        item_name: i.item_name,
-        quantity: qty,
-        unit_cost: i.unit_cost,
-        line_total: qty * i.unit_cost,
-      };
+      const qty = qtyOf(i.id);
+      return { stock_item_id: i.stock_item_id, item_name: i.item_name, quantity: qty, unit_cost: i.unit_cost, line_total: Math.round(qty * i.unit_cost) };
     });
 
     setLoading(true);
     try {
       await createReturn(user.id, invoiceId, supplierId, returnItems, returnDate, reason.trim() || undefined);
-      Alert.alert(
-        '↩️ Return Recorded',
-        `Return of ${formatCurrency(totalRefund)} recorded. Stock has been reduced.`,
-        [{ text: 'Done', onPress: () => navigation.goBack() }]
-      );
-    } catch (e) {
-      Alert.alert('Error', 'Failed to record return. Please try again.');
+      Alert.alert(t('prRecordedTitle'), t('prRecordedBody', { amount: formatCurrency(totalRefund, currency) }), [
+        { text: 'Done', onPress: () => navigation.goBack() }
+      ]);
+    } catch (e: any) {
+      Alert.alert(t('commonError'), e?.message || t('prFailed'));
     } finally {
       setLoading(false);
     }
@@ -73,52 +68,53 @@ export const PurchaseReturnModal = ({ navigation, route }: any) => {
   return (
     <SafeAreaView style={styles.safe}>
       <View style={styles.header}>
-        <TouchableOpacity onPress={() => navigation.goBack()} style={styles.backBtn}>
-          <Text style={styles.backArrow}>←</Text>
+        <TouchableOpacity onPress={() => navigation.goBack()} style={styles.backBtn} accessibilityRole="button" accessibilityLabel={t('commonBack')}>
+          <Icon name="chevron-left" size={iconSize.lg} tint={color.textPrimary} />
         </TouchableOpacity>
-        <View>
-          <Text style={styles.headerTitle}>Purchase Return</Text>
-          <Text style={styles.headerSub}>to {supplierName}</Text>
+        <View style={styles.headerText}>
+          <Text style={styles.headerTitle} numberOfLines={1}>{t('prTitle')}</Text>
+          {!!supplierName && <Text style={styles.headerSub} numberOfLines={1}>to {supplierName}</Text>}
         </View>
-        <View style={{ width: 40 }} />
+        <View style={styles.backBtn} />
       </View>
 
       <ScreenContainer scrollable={true} hasTabBar={true} contentContainerStyle={styles.form}>
-
         <View style={styles.notice}>
-          <Text style={styles.noticeText}>↩️ Select items to return. Stock will be reduced automatically.</Text>
+          <Icon name="corner-up-left" size={iconSize.sm} tint={color.textSecondary} />
+          <Text style={styles.noticeText}>{t('prIntro')}</Text>
         </View>
 
-        {/* Return Date */}
         <View style={styles.section}>
-          <Text style={styles.label}>Return Date</Text>
-          <DateField style={styles.input} value={returnDate} onChange={setReturnDate} />
+          <Text style={styles.label}>{t('prReturnDate')}</Text>
+          <DateField style={styles.input} textStyle={styles.inputText} value={returnDate} onChange={setReturnDate} maximumDate={new Date()} />
         </View>
 
-        {/* Items */}
         <View style={styles.section}>
-          <Text style={styles.label}>Select Items to Return</Text>
-          {items.map((item: PurchaseInvoiceItem) => {
+          <Text style={styles.label}>{t('prItemsToReturn')}</Text>
+          {items.map((item: PurchaseInvoiceItem, idx: number) => {
             const sel = selected[item.id];
-            const qty = parseFloat(sel?.qty ?? '0') || 0;
+            const qty = qtyOf(item.id);
             return (
-              <View key={item.id} style={[styles.itemRow, sel?.checked && styles.itemRowActive]}>
+              <View key={item.id} style={[styles.itemRow, idx > 0 && styles.itemRowBorder]}>
                 <TouchableOpacity
-                  style={[styles.checkbox, sel?.checked && styles.checkboxActive]}
+                  style={styles.checkRow}
                   onPress={() => setSelected(p => ({ ...p, [item.id]: { ...p[item.id], checked: !p[item.id]?.checked } }))}
+                  accessibilityRole="checkbox"
+                  accessibilityState={{ checked: !!sel?.checked }}
                 >
-                  {sel?.checked && <Text style={styles.checkmark}>✓</Text>}
+                  <View style={[styles.checkbox, sel?.checked && styles.checkboxActive]}>
+                    {sel?.checked && <Icon name="check" size={iconSize.sm} tint={color.textInverse} />}
+                  </View>
+                  <View style={styles.itemInfo}>
+                    <Text style={styles.itemName}>{item.item_name}</Text>
+                    <Text style={styles.itemDetail}>Invoiced {item.quantity} · {formatCurrency(item.unit_cost, currency)} each</Text>
+                  </View>
                 </TouchableOpacity>
 
-                <View style={{ flex: 1 }}>
-                  <Text style={styles.itemName}>{item.item_name}</Text>
-                  <Text style={styles.itemDetail}>Unit cost: {formatCurrency(item.unit_cost)}</Text>
-                </View>
-
                 {sel?.checked && (
-                  <View style={styles.qtyWrap}>
-                    <TouchableOpacity style={styles.qtyBtn} onPress={() => setSelected(p => ({ ...p, [item.id]: { ...p[item.id], qty: String(Math.max(1, parseFloat(p[item.id]?.qty ?? '1') - 1)) } }))}>
-                      <Text style={styles.qtyBtnText}>−</Text>
+                  <View style={styles.qtyRow}>
+                    <TouchableOpacity style={styles.qtyBtn} onPress={() => setQty(item.id, qty - 1, item.quantity)} accessibilityLabel={t('poLess')}>
+                      <Icon name="minus" size={iconSize.sm} tint={color.accent} />
                     </TouchableOpacity>
                     <TextInput
                       style={styles.qtyInput}
@@ -126,96 +122,95 @@ export const PurchaseReturnModal = ({ navigation, route }: any) => {
                       onChangeText={v => setSelected(p => ({ ...p, [item.id]: { ...p[item.id], qty: v } }))}
                       keyboardType="decimal-pad"
                       selectTextOnFocus
-                      placeholderTextColor={Colors.textGray}
                     />
-                    <TouchableOpacity style={styles.qtyBtn} onPress={() => setSelected(p => ({ ...p, [item.id]: { ...p[item.id], qty: String(Math.min(item.quantity, parseFloat(p[item.id]?.qty ?? '0') + 1)) } }))}>
-                      <Text style={styles.qtyBtnText}>+</Text>
+                    <TouchableOpacity style={styles.qtyBtn} onPress={() => setQty(item.id, qty + 1, item.quantity)} accessibilityLabel={t('poMore')}>
+                      <Icon name="plus" size={iconSize.sm} tint={color.accent} />
                     </TouchableOpacity>
+                    <View style={styles.flex} />
+                    {qty > 0 && <AmountText paisa={Math.round(qty * item.unit_cost)} size="label" currency={currency} />}
                   </View>
-                )}
-
-                {sel?.checked && qty > 0 && (
-                  <Text style={styles.lineRefund}>{formatCurrency(qty * item.unit_cost)}</Text>
                 )}
               </View>
             );
           })}
         </View>
 
-        {/* Reason */}
         <View style={styles.section}>
-          <Text style={styles.label}>Reason for Return</Text>
+          <Text style={styles.label}>{t('prReason')}</Text>
           <TextInput
-            style={[styles.input, { minHeight: 70, textAlignVertical: 'top' }]}
+            style={[styles.input, styles.inputText, styles.notes]}
             value={reason} onChangeText={setReason}
-            placeholder="e.g. Defective goods, wrong items, excess stock..."
-            placeholderTextColor={Colors.textGray}
+            placeholder={t('prReasonPlaceholder')}
+            placeholderTextColor={color.textMuted}
             multiline numberOfLines={3}
           />
         </View>
 
-        {/* Refund Summary */}
         {totalRefund > 0 && (
-          <View style={styles.refundSummary}>
-            <Text style={styles.refundLabel}>Total Refund Amount</Text>
-            <Text style={styles.refundAmt}>{formatCurrency(totalRefund)}</Text>
+          <View style={styles.refund}>
+            <Text style={styles.refundLabel}>{t('prRefundDue')}</Text>
+            <AmountText paisa={totalRefund} size="title" currency={currency} />
           </View>
         )}
 
-        <TouchableOpacity
-          style={[styles.submitBtn, loading && { opacity: 0.6 }]}
-          onPress={handleSubmit}
-          disabled={loading || checkedItems.length === 0}
-        >
-          {loading ? <ActivityIndicator color="#fff" /> : <Text style={styles.submitText}>↩️ CONFIRM RETURN</Text>}
-        </TouchableOpacity>
+        <Button label={t('prConfirm')} icon="corner-up-left" onPress={handleSubmit} loading={loading} disabled={loading || checkedItems.length === 0} fullWidth style={styles.submit} />
       </ScreenContainer>
     </SafeAreaView>
   );
 };
 
 const styles = StyleSheet.create({
-  safe: { flex: 1, backgroundColor: Colors.bgPrimary },
+  safe: { flex: 1, backgroundColor: color.surface },
+  flex: { flex: 1 },
   header: {
     flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
-    backgroundColor: Colors.bgCard, paddingHorizontal: 16, paddingVertical: 14,
-    borderBottomWidth: 1, borderBottomColor: Colors.border,
+    paddingHorizontal: space.md, minHeight: 56, borderBottomWidth: hairline, borderBottomColor: color.border,
   },
-  backBtn: { width: 36 },
-  backArrow: { fontSize: 22, color: Colors.textWhite, fontWeight: '700' },
-  headerTitle: { fontSize: 17, fontWeight: '700', color: Colors.textWhite },
-  headerSub: { fontSize: 11, color: Colors.textGray },
-  form: { padding: 16, paddingBottom: 40 },
-  notice: { backgroundColor: Colors.bgInput, borderRadius: 12, padding: 14, marginBottom: 16, borderWidth: 1, borderColor: Colors.border },
-  noticeText: { fontSize: 13, color: Colors.warning, lineHeight: 20 },
+  backBtn: { width: touchTarget, height: touchTarget, alignItems: 'center', justifyContent: 'center' },
+  headerText: { flex: 1, alignItems: 'center' },
+  headerTitle: { ...typeScale.heading, fontSize: 18, color: color.textPrimary },
+  headerSub: { ...typeScale.caption, color: color.textSecondary },
+  form: { padding: space.lg, paddingBottom: 40 },
+  notice: {
+    flexDirection: 'row', gap: space.sm, alignItems: 'center', backgroundColor: color.surfaceRaised,
+    borderRadius: radius.md, padding: space.md, marginBottom: space.lg, borderWidth: hairline, borderColor: color.border,
+  },
+  noticeText: { ...typeScale.label, color: color.textSecondary, flex: 1 },
   section: {
-    backgroundColor: Colors.bgCard, borderRadius: 14, padding: 14, marginBottom: 12,
-    borderWidth: 1, borderColor: Colors.border, shadowColor: '#000', shadowOpacity: 0.2, elevation: 2
+    backgroundColor: color.surface, borderRadius: radius.lg, padding: space.lg, marginBottom: space.md,
+    borderWidth: hairline, borderColor: color.border,
   },
-  label: { fontSize: 12, fontWeight: '700', color: Colors.textGray, marginBottom: 8, textTransform: 'uppercase' },
+  label: { ...typeScale.label, color: color.textSecondary, marginBottom: space.sm },
   input: {
-    backgroundColor: Colors.bgInput, borderWidth: 1, borderColor: Colors.border,
-    borderRadius: 10, paddingHorizontal: 12, paddingVertical: 10, fontSize: 14, color: Colors.textWhite
+    backgroundColor: color.surfaceRaised, borderWidth: hairline, borderColor: color.border,
+    borderRadius: radius.md, paddingHorizontal: space.md, minHeight: touchTarget, justifyContent: 'center',
   },
-  itemRow: { flexDirection: 'row', alignItems: 'center', paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: Colors.border, gap: 10, flexWrap: 'wrap' },
-  itemRowActive: { backgroundColor: Colors.bgInput, borderRadius: 10, paddingHorizontal: 8, marginHorizontal: -8 },
-  checkbox: { width: 26, height: 26, borderRadius: 8, borderWidth: 2, borderColor: Colors.border, justifyContent: 'center', alignItems: 'center' },
-  checkboxActive: { backgroundColor: Colors.warning, borderColor: Colors.warning },
-  checkmark: { color: Colors.textWhite, fontSize: 14, fontWeight: '800' },
-  itemName: { fontSize: 13, fontWeight: '700', color: Colors.textWhite },
-  itemDetail: { fontSize: 11, color: Colors.textGray, marginTop: 2 },
-  qtyWrap: { flexDirection: 'row', alignItems: 'center', gap: 6 },
-  qtyBtn: { width: 30, height: 30, backgroundColor: Colors.bgInput, borderWidth: 1, borderColor: Colors.border, borderRadius: 8, justifyContent: 'center', alignItems: 'center' },
-  qtyBtnText: { fontSize: 18, color: Colors.warning, fontWeight: '700' },
+  inputText: { ...typeScale.body, color: color.textPrimary },
+  notes: { minHeight: 70, textAlignVertical: 'top', paddingTop: space.sm },
+  itemRow: { paddingVertical: space.md, gap: space.sm },
+  itemRowBorder: { borderTopWidth: hairline, borderTopColor: color.border },
+  checkRow: { flexDirection: 'row', alignItems: 'center', gap: space.md, minHeight: touchTarget },
+  checkbox: {
+    width: 24, height: 24, borderRadius: radius.sm, borderWidth: 2, borderColor: color.borderStrong,
+    alignItems: 'center', justifyContent: 'center',
+  },
+  checkboxActive: { backgroundColor: color.accent, borderColor: color.accent },
+  itemInfo: { flex: 1 },
+  itemName: { ...typeScale.bodyMedium, color: color.textPrimary },
+  itemDetail: { ...typeScale.caption, color: color.textSecondary, marginTop: 2 },
+  qtyRow: { flexDirection: 'row', alignItems: 'center', gap: space.sm, paddingLeft: 36 },
+  qtyBtn: {
+    width: touchTarget, height: touchTarget, borderWidth: hairline, borderColor: color.borderStrong,
+    borderRadius: radius.sm, alignItems: 'center', justifyContent: 'center', backgroundColor: color.surface,
+  },
   qtyInput: {
-    width: 50, backgroundColor: Colors.bgInput, borderWidth: 1, borderColor: Colors.border,
-    borderRadius: 8, textAlign: 'center', fontSize: 15, fontWeight: '700', paddingVertical: 4, color: Colors.textWhite
+    minWidth: 56, minHeight: touchTarget, backgroundColor: color.surfaceRaised, borderWidth: hairline, borderColor: color.border,
+    borderRadius: radius.sm, textAlign: 'center', ...typeScale.bodyMedium, color: color.textPrimary,
   },
-  lineRefund: { fontSize: 13, fontWeight: '800', color: Colors.warning },
-  refundSummary: { backgroundColor: Colors.bgInput, borderRadius: 14, padding: 16, marginBottom: 12, alignItems: 'center', borderWidth: 1, borderColor: Colors.border },
-  refundLabel: { fontSize: 12, color: Colors.textGray, fontWeight: '600', marginBottom: 4 },
-  refundAmt: { fontSize: 24, fontWeight: '800', color: Colors.warning },
-  submitBtn: { backgroundColor: Colors.warning, borderRadius: 14, paddingVertical: 16, alignItems: 'center', marginTop: 4, shadowColor: Colors.warning, shadowOpacity: 0.4, shadowRadius: 8, elevation: 6 },
-  submitText: { color: Colors.textWhite, fontWeight: '800', fontSize: 15 },
+  refund: {
+    flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', gap: space.md,
+    backgroundColor: color.surfaceRaised, borderRadius: radius.lg, padding: space.lg, marginBottom: space.md,
+  },
+  refundLabel: { ...typeScale.bodyMedium, color: color.textPrimary, flex: 1 },
+  submit: { minHeight: 52 },
 });
-

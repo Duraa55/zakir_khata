@@ -1,30 +1,39 @@
 import React, { useState, useEffect } from 'react';
-import { View, Text, ScrollView, ActivityIndicator, TouchableOpacity } from 'react-native';
+import { useLanguageStore } from '../../store/useLanguageStore';
 import { StackScreenProps } from '@react-navigation/stack';
-import { BarChart } from 'react-native-gifted-charts';
 import { useAuthStore } from '../../store/authStore';
 import { getProfitLossSummary, ProfitLossSummary } from '../../services/database/reports';
-import { DateFilterPicker } from '../../components/reports/DateFilterPicker';
-import { formatCurrency } from '../../utils/calculations';
+import { DateFilterPicker, presetRange } from '../../components/reports/DateFilterPicker';
+import { formatSignedCurrency } from '../../utils/calculations';
 import { handleReportExport } from '../../utils/exportUtils';
+import { ReportScreen, ReportIntro, FigureCard, FigureRow, ReportSection, BarList, BarRow, EmptyNote } from '../../components/reports/ReportParts';
+import { soleTotal, stackedTotalText, type CurrencyTotal } from '../../utils/currencyTotals';
 
 type Props = StackScreenProps<any, any>;
 
+/** What a derived figure says when the period spans currencies and cannot produce one. */
+const NOT_ACROSS = 'Not shown across currencies';
+
+/**
+ * What you earned: sales (posted bills, returns taken off) minus the cost of the goods
+ * you kept sold, minus expenses. Profit is a balance, so it is neutral ink with a sign.
+ */
 export const ProfitLossReportScreen: React.FC<Props> = ({ navigation }) => {
   const user = useAuthStore(state => state.user);
+  const { t } = useLanguageStore();
   const [loading, setLoading] = useState(true);
   const [summary, setSummary] = useState<ProfitLossSummary | null>(null);
-  const [filter, setFilter] = useState({});
+  // Starts on the same range the picker shows by default, not all-time.
+  const [filter, setFilter] = useState(() => presetRange('currentMonth'));
   const [filterLabel, setFilterLabel] = useState('Current Month');
 
   const loadData = async (newFilter: any) => {
     if (!user) return;
     setLoading(true);
     try {
-      const sum = await getProfitLossSummary(user.id, newFilter);
-      setSummary(sum);
+      setSummary(await getProfitLossSummary(user.id, newFilter));
     } catch (e) {
-      console.error(e);
+      if (__DEV__) console.error(e);
     } finally {
       setLoading(false);
     }
@@ -36,106 +45,74 @@ export const ProfitLossReportScreen: React.FC<Props> = ({ navigation }) => {
 
   const handleExport = async () => {
     if (!summary) return;
-    try {
-      const data = [
-        { Metric: 'Total Revenue', Amount: summary.totalRevenue },
-        { Metric: 'Cost of Goods Sold (COGS)', Amount: summary.totalCOGS },
-        { Metric: 'Gross Profit', Amount: summary.grossProfit },
-        { Metric: 'Total Expenses', Amount: summary.totalExpenses },
-        { Metric: 'Net Profit', Amount: summary.netProfit },
-        { Metric: 'Profit Margin %', Amount: summary.profitMarginPct.toFixed(2) + '%' },
-      ];
-      handleReportExport(`Profit_Loss_${filterLabel}`, data, 'P&L');
-    } catch (e) {
-      console.error('Export failed', e);
-    }
+    const stack = (totals: CurrencyTotal[]) => stackedTotalText(totals, formatSignedCurrency, ' / ');
+    const derived = (v: number | null) =>
+      summary.profitAvailable && v !== null ? formatSignedCurrency(v, summary.profitCurrency) : NOT_ACROSS;
+    const data = [
+      { Metric: 'Sales (after returns)', Amount: stack(summary.totalRevenue) },
+      { Metric: 'Cost of goods sold', Amount: stack(summary.totalCOGS) },
+      { Metric: 'Gross profit', Amount: derived(summary.grossProfit) },
+      { Metric: 'Expenses', Amount: stack(summary.totalExpenses) },
+      { Metric: 'Net profit', Amount: derived(summary.netProfit) },
+      { Metric: 'Profit margin', Amount: summary.profitAvailable && summary.profitMarginPct !== null
+          ? summary.profitMarginPct.toFixed(2) + '%' : NOT_ACROSS },
+    ];
+    handleReportExport(`Profit_Loss_${filterLabel}`, data, 'P&L');
   };
 
-  const chartData = summary ? [
-    { value: summary.totalRevenue, label: 'Rev', frontColor: '#3b82f6' },
-    { value: summary.totalCOGS, label: 'COGS', frontColor: '#f59e0b' },
-    { value: summary.totalExpenses, label: 'Exp', frontColor: '#ef4444' },
-    { value: Math.max(summary.netProfit, 0), label: 'Net', frontColor: '#10b981' },
-  ] : [];
+  // The comparison bars put three figures on ONE scale, which only exists when all
+  // three are in one currency — the same condition that lets profit be computed at all.
+  // Otherwise the bars are dropped rather than drawn against a scale that means nothing.
+  const scalar = (totals: CurrencyTotal[]) => soleTotal(totals)?.amount ?? 0;
+  const comparable = !!summary && summary.profitAvailable;
+  const max = summary && comparable
+    ? Math.max(scalar(summary.totalRevenue), scalar(summary.totalCOGS), scalar(summary.totalExpenses), 1)
+    : 1;
 
   return (
-    <View className="flex-1 bg-gray-50">
-      <View className="bg-blue-600 px-4 pt-4 pb-12 rounded-b-3xl">
-        <View className="flex-row justify-between items-center mb-4">
-          <TouchableOpacity onPress={() => navigation.goBack()}>
-            <Text className="text-white text-lg">← Back</Text>
-          </TouchableOpacity>
-          <Text className="text-white text-xl font-bold">Profit & Loss</Text>
-          <TouchableOpacity onPress={handleExport}>
-            <Text className="text-white text-base">Export</Text>
-          </TouchableOpacity>
-        </View>
-        <DateFilterPicker onFilterChange={(f, l) => { setFilter(f); setFilterLabel(l); }} />
-      </View>
+    <ReportScreen title={t('repPnl')} onBack={() => navigation.goBack()} onExport={handleExport} loading={loading}>
+      <DateFilterPicker onFilterChange={(f, l) => { setFilter(f); setFilterLabel(l); }} />
+      {!loading && summary && (
+        <>
+          <ReportIntro>Posted bills only — drafts and bills on hold are not sales, and returned goods are taken off.</ReportIntro>
+          {summary.profitAvailable ? (
+            <FigureCard>
+              <FigureRow label={t('repNetProfit')} hint={`${(summary.profitMarginPct ?? 0).toFixed(1)}% of sales`}
+                paisa={summary.netProfit ?? 0} currency={summary.profitCurrency ?? undefined} big />
+            </FigureCard>
+          ) : (
+            <EmptyNote>
+              This period holds more than one currency, so there is no single profit figure —
+              subtracting AED from rupees needs an exchange rate this app does not keep. Sales,
+              cost and expenses are shown per currency below.
+            </EmptyNote>
+          )}
 
-      <ScrollView className="flex-1 px-4 -mt-8" contentContainerStyle={{ paddingBottom: 40 }}>
-        {loading ? (
-          <ActivityIndicator size="large" color="#2563eb" className="mt-10" />
-        ) : summary ? (
-          <>
-            <View className="bg-white rounded-2xl p-5 shadow-sm border border-gray-100 mb-4 items-center">
-              <Text className="text-gray-500 text-sm font-medium uppercase tracking-wider mb-1">Net Profit</Text>
-              <Text className={`text-4xl font-bold ${summary.netProfit >= 0 ? 'text-green-600' : 'text-red-600'}`}>
-                {formatCurrency(summary.netProfit)}
-              </Text>
-              <View className="bg-gray-100 px-3 py-1 rounded-full mt-2">
-                <Text className="text-gray-700 font-bold">{summary.profitMarginPct.toFixed(1)}% Margin</Text>
-              </View>
-            </View>
+          <ReportSection title={t('repHowItAddsUp')}>
+            <FigureCard>
+              <FigureRow label={t('repSales')} hint="Posted bills, after returns" totals={summary.totalRevenue} tone="in" signed={false} />
+              <FigureRow label={t('repCogs')} hint="What the items you sold cost you" totals={summary.totalCOGS} tone="out" signed={false} />
+              {summary.profitAvailable
+                ? <FigureRow label={t('repGrossProfit')} hint="Sales minus cost of goods" paisa={summary.grossProfit ?? 0} currency={summary.profitCurrency ?? undefined} />
+                : <FigureRow label={t('repGrossProfit')} hint="Sales minus cost of goods" note={NOT_ACROSS} />}
+              <FigureRow label={t('repExpenses')} hint="From the Expense Book" totals={summary.totalExpenses} tone="out" signed={false} />
+              {summary.profitAvailable
+                ? <FigureRow label={t('repNetProfit')} hint="Gross profit minus expenses" paisa={summary.netProfit ?? 0} currency={summary.profitCurrency ?? undefined} />
+                : <FigureRow label={t('repNetProfit')} hint="Gross profit minus expenses" note={NOT_ACROSS} />}
+            </FigureCard>
+          </ReportSection>
 
-            <View className="bg-white rounded-2xl p-5 shadow-sm border border-gray-100 mb-4">
-              <Text className="text-gray-800 font-bold text-lg mb-4">Summary View</Text>
-              <View className="items-center pb-4">
-                <BarChart
-                  data={chartData}
-                  width={250}
-                  height={150}
-                  barWidth={35}
-                  spacing={20}
-                  roundedTop
-                  roundedBottom={false}
-                  yAxisThickness={0}
-                  xAxisThickness={1}
-                  xAxisColor="#e5e7eb"
-                  hideRules
-                />
-              </View>
-            </View>
-
-            <View className="bg-white rounded-2xl p-5 shadow-sm border border-gray-100 mb-4">
-              <Text className="text-gray-800 font-bold text-lg mb-4">Breakdown</Text>
-
-              <View className="flex-row justify-between py-3 border-b border-gray-100">
-                <Text className="text-gray-600">Total Revenue</Text>
-                <Text className="font-semibold text-gray-900">{formatCurrency(summary.totalRevenue)}</Text>
-              </View>
-              <View className="flex-row justify-between py-3 border-b border-gray-100">
-                <Text className="text-gray-600">Cost of Goods (COGS)</Text>
-                <Text className="font-semibold text-orange-500">- {formatCurrency(summary.totalCOGS)}</Text>
-              </View>
-              <View className="flex-row justify-between py-3 border-b border-gray-100 bg-gray-50 -mx-5 px-5">
-                <Text className="font-bold text-gray-800">Gross Profit</Text>
-                <Text className="font-bold text-gray-900">{formatCurrency(summary.grossProfit)}</Text>
-              </View>
-              <View className="flex-row justify-between py-3 border-b border-gray-100">
-                <Text className="text-gray-600">Total Expenses</Text>
-                <Text className="font-semibold text-red-500">- {formatCurrency(summary.totalExpenses)}</Text>
-              </View>
-              <View className="flex-row justify-between pt-3">
-                <Text className="font-bold text-gray-800">Net Profit</Text>
-                <Text className={`font-bold ${summary.netProfit >= 0 ? 'text-green-600' : 'text-red-600'}`}>
-                  {formatCurrency(summary.netProfit)}
-                </Text>
-              </View>
-            </View>
-          </>
-        ) : null}
-      </ScrollView>
-    </View>
+          {comparable && (
+            <ReportSection title={t('repCompared')}>
+              <BarList>
+                <BarRow label={t('repSales')} paisa={scalar(summary.totalRevenue)} currency={summary.profitCurrency ?? undefined} max={max} tone="in" first />
+                <BarRow label={t('repCogs')} paisa={scalar(summary.totalCOGS)} currency={summary.profitCurrency ?? undefined} max={max} tone="out" />
+                <BarRow label={t('repExpenses')} paisa={scalar(summary.totalExpenses)} currency={summary.profitCurrency ?? undefined} max={max} tone="out" />
+              </BarList>
+            </ReportSection>
+          )}
+        </>
+      )}
+    </ReportScreen>
   );
 };

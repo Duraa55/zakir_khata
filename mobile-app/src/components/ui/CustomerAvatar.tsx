@@ -10,11 +10,17 @@ import { useLanguageStore } from '../../store/useLanguageStore';
  * `avatar` / `avatarText` styles it already uses, so nothing moves on screen. If the
  * image fails to load (file reclaimed, bad URL) it silently drops to the initial.
  */
-export const CustomerAvatar = ({ name, uri, style, textStyle }: {
+export const CustomerAvatar = ({ name, uri, style, textStyle, initials }: {
   name: string;
   uri?: string | null;
   style?: StyleProp<ViewStyle>;
   textStyle?: StyleProp<TextStyle>;
+  /**
+   * Replaces the single-letter fallback. The home header shows TWO initials for a
+   * business name, so it passes its own; every other caller omits this and keeps
+   * the one-letter circle unchanged.
+   */
+  initials?: string;
 }) => {
   const t = useLanguageStore(s => s.t);
   const [failed, setFailed] = useState<string | null>(null);
@@ -29,7 +35,7 @@ export const CustomerAvatar = ({ name, uri, style, textStyle }: {
           accessibilityLabel={t('photoOf', { name })}
         />
       ) : (
-        <Text style={textStyle}>{(name.trim().charAt(0) || '?').toUpperCase()}</Text>
+        <Text style={textStyle}>{initials ?? (name.trim().charAt(0) || '?').toUpperCase()}</Text>
       )}
     </View>
   );

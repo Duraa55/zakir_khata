@@ -23,16 +23,18 @@ interface LanguageStore {
 }
 
 export const useLanguageStore = create<LanguageStore>((set, get) => ({
-  language: 'ur',
+  // English until the Urdu dictionary is complete — a fresh install labelled Urdu
+  // but showing English strings is worse than plain English. Flip back when done.
+  language: 'en',
   isLoaded: false,
 
   loadLanguage: async () => {
     try {
       const stored = await AsyncStorage.getItem(LANGUAGE_KEY);
-      const lang: AppLanguage = stored === 'en' || stored === 'ur' ? stored : 'ur';
+      const lang: AppLanguage = stored === 'en' || stored === 'ur' ? stored : 'en';
       set({ language: lang, isLoaded: true });
     } catch (_) {
-      set({ language: 'ur', isLoaded: true });
+      set({ language: 'en', isLoaded: true });
     }
   },
 

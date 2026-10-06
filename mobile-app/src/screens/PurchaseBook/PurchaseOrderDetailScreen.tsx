@@ -1,4 +1,7 @@
 import React, { useEffect, useState, useCallback } from 'react';
+import { statusLabel } from '../../i18n/categoryLabel';
+import type { TKey } from '../../i18n/en';
+import { useLanguageStore } from '../../store/useLanguageStore';
 import {
   View, Text, TouchableOpacity, StyleSheet, ScrollView,
   ActivityIndicator, Alert, TextInput
@@ -8,17 +11,25 @@ import { useAuthStore } from '../../store/authStore';
 import { usePurchaseStore } from '../../store/usePurchaseStore';
 import { formatCurrency } from '../../utils/calculations';
 import { PurchaseOrderItem, POStatus } from '../../types/purchase.types';
-import { Colors } from '../../theme';
+import { Icon, AmountText, Button, IconName } from '../../components/ui/primitives';
+import { color, space, radius, hairline, touchTarget, iconSize, type as typeScale } from '../../theme/tokens';
 
-const STATUS_ACTIONS: { from: POStatus[]; to: POStatus; label: string; color: string }[] = [
-  { from: ['draft'], to: 'sent', label: 'Mark as Sent', color: '#60A5FA' },
-  { from: ['sent', 'partial'], to: 'received', label: 'Mark All Received', color: Colors.success },
-  { from: ['draft', 'sent', 'partial'], to: 'cancelled', label: 'Cancel Order', color: Colors.error },
+const STATUS_ACTIONS: { from: POStatus[]; to: POStatus; labelKey: TKey; icon: IconName }[] = [
+  { from: ['draft'], to: 'sent', labelKey: 'poMarkSent', icon: 'send' },
+  { from: ['sent', 'partial'], to: 'received', labelKey: 'poMarkReceived', icon: 'check-circle' },
+  { from: ['draft', 'sent', 'partial'], to: 'cancelled', labelKey: 'poCancelOrder', icon: 'x-circle' },
 ];
+
+// Status carries meaning only: waiting on something is amber, settled is ink, inactive is muted.
+const STATUS_TONE: Record<string, string> = {
+  draft: color.textMuted, sent: color.attention, partial: color.attention,
+  received: color.textPrimary, cancelled: color.textMuted,
+};
 
 export const PurchaseOrderDetailScreen = ({ navigation, route }: any) => {
   const { orderId } = route.params;
   const { user } = useAuthStore();
+  const { t } = useLanguageStore();
   const { selectedOrder: order, loading, loadOrderById, updateOrderStatus, receiveGoods } = usePurchaseStore();
 
   const load = useCallback(() => loadOrderById(orderId), [orderId]);
@@ -29,11 +40,12 @@ export const PurchaseOrderDetailScreen = ({ navigation, route }: any) => {
   }, [navigation, load]);
 
   const handleStatusChange = (to: POStatus) => {
-    const label = STATUS_ACTIONS.find(a => a.to === to)?.label ?? 'Update';
-    Alert.alert('Confirm', `${label}?`, [
-      { text: 'Cancel', style: 'cancel' },
+    const key = STATUS_ACTIONS.find(a => a.to === to)?.labelKey;
+    const label = key ? t(key) : t('poUpdate');
+    Alert.alert(t('poConfirmTitle'), t('poConfirmBody', { action: label }), [
+      { text: t('commonCancel'), style: 'cancel' },
       {
-        text: 'Confirm',
+        text: t('poConfirmTitle'),
         onPress: async () => {
           await updateOrderStatus(orderId, user!.id, to);
           await load();
@@ -53,24 +65,17 @@ export const PurchaseOrderDetailScreen = ({ navigation, route }: any) => {
   };
 
   if (loading || !order) {
-    return <View style={styles.center}><ActivityIndicator size="large" color={Colors.primary} /></View>;
+    return <View style={styles.center}><ActivityIndicator size="large" color={color.accent} /></View>;
   }
 
   const availableActions = STATUS_ACTIONS.filter(a => a.from.includes(order.status));
   const totalReceived = order.items?.reduce((s, i) => s + (i.received_qty * i.unit_cost), 0) ?? 0;
 
   const StatusBadge = ({ status }: { status: string }) => {
-    const colors: Record<string, { bg: string; fg: string }> = {
-      draft:     { bg: '#374151', fg: '#D1D5DB' },
-      sent:      { bg: '#1E3A8A', fg: '#93C5FD' },
-      partial:   { bg: '#7C2D12', fg: '#FDBA74' },
-      received:  { bg: '#064E3B', fg: '#6EE7B7' },
-      cancelled: { bg: '#7F1D1D', fg: '#FCA5A5' },
-    };
-    const c = colors[status] ?? colors.draft;
+    const tone = STATUS_TONE[status] ?? color.textMuted;
     return (
-      <View style={[styles.badge, { backgroundColor: c.bg }]}>
-        <Text style={[styles.badgeText, { color: c.fg }]}>{status.toUpperCase()}</Text>
+      <View style={[styles.badge, { borderColor: tone }]}>
+        <Text style={[styles.badgeText, { color: tone }]}>{statusLabel(t, status)}</Text>
       </View>
     );
   };
@@ -78,44 +83,50 @@ export const PurchaseOrderDetailScreen = ({ navigation, route }: any) => {
   return (
     <SafeAreaView style={styles.safe}>
       <View style={styles.header}>
-        <TouchableOpacity onPress={() => navigation.goBack()} style={styles.backBtn}>
-          <Text style={styles.backArrow}>←</Text>
+        <TouchableOpacity onPress={() => navigation.goBack()} style={styles.backBtn} accessibilityRole="button" accessibilityLabel={t('commonBack')}>
+          <Icon name="chevron-left" size={iconSize.lg} tint={color.textPrimary} />
         </TouchableOpacity>
-        <View>
-          <Text style={styles.headerTitle}>PO-{String(order.po_number).padStart(4, '0')}</Text>
-          <Text style={styles.headerSub}>{order.supplier_name}</Text>
+        <View style={styles.headerText}>
+          <Text style={styles.headerTitle} numberOfLines={1}>PO-{String(order.po_number).padStart(4, '0')}</Text>
+          <Text style={styles.headerSub} numberOfLines={1}>{order.supplier_name}</Text>
         </View>
         <StatusBadge status={order.status} />
       </View>
 
-      <ScrollView contentContainerStyle={{ paddingBottom: 135 }}>
+      <ScrollView contentContainerStyle={styles.scroll}>
         {/* Meta */}
         <View style={styles.metaCard}>
           <View style={styles.metaRow}>
             <View style={styles.metaCol}>
-              <Text style={styles.metaLabel}>Order Date</Text>
+              <Text style={styles.metaLabel}>{t('poOrderDate')}</Text>
               <Text style={styles.metaVal}>{order.order_date}</Text>
             </View>
             {order.expected_date && (
               <View style={styles.metaCol}>
-                <Text style={styles.metaLabel}>Expected Date</Text>
+                <Text style={styles.metaLabel}>{t('poExpectedDateLabel')}</Text>
                 <Text style={styles.metaVal}>{order.expected_date}</Text>
               </View>
             )}
-            <View style={styles.metaCol}>
-              <Text style={styles.metaLabel}>Total Value</Text>
-              <Text style={[styles.metaVal, { color: Colors.primaryLight, fontWeight: '800' }]}>{formatCurrency(order.total)}</Text>
+            <View style={styles.metaColEnd}>
+              <Text style={styles.metaLabel}>{t('poTotalValue')}</Text>
+              <AmountText currency={order.currency} paisa={order.total} />
             </View>
           </View>
-          {order.notes && <Text style={styles.notesText}>📝 {order.notes}</Text>}
+          {order.notes && (
+            <View style={styles.notesRow}>
+              <Icon name="file-text" size={iconSize.sm} tint={color.textSecondary} />
+              <Text style={styles.notesText}>{order.notes}</Text>
+            </View>
+          )}
         </View>
 
         {/* Progress Bar */}
         {(order.status === 'partial' || order.status === 'received') && (
           <View style={styles.progressCard}>
-            <Text style={styles.progressLabel}>
-              Received: {formatCurrency(totalReceived)} / {formatCurrency(order.total)}
-            </Text>
+            <View style={styles.progressLabelRow}>
+              <Text style={styles.progressLabel}>{t('poReceived')}</Text>
+              <Text style={styles.progressLabel}>{formatCurrency(totalReceived, order.currency)} / {formatCurrency(order.total, order.currency)}</Text>
+            </View>
             <View style={styles.progressBar}>
               <View style={[styles.progressFill, { width: `${Math.min(100, (totalReceived / order.total) * 100)}%` }]} />
             </View>
@@ -124,21 +135,26 @@ export const PurchaseOrderDetailScreen = ({ navigation, route }: any) => {
 
         {/* Items */}
         <View style={styles.itemsCard}>
-          <Text style={styles.cardTitle}>Order Items</Text>
+          <Text style={styles.cardTitle}>{t('poOrderItems')}</Text>
           {(order.items ?? []).map((item: PurchaseOrderItem) => {
             const receivedPct = item.quantity > 0 ? (item.received_qty / item.quantity) * 100 : 0;
+            const done = receivedPct >= 100;
             return (
               <View key={item.id} style={styles.itemRow}>
-                <View style={{ flex: 1 }}>
+                <View style={styles.itemInfo}>
                   <Text style={styles.itemName}>{item.item_name}</Text>
                   <Text style={styles.itemDetail}>
-                    Ordered: {item.quantity} × {formatCurrency(item.unit_cost)} = {formatCurrency(item.line_total)}
+                    Ordered: {item.quantity} × {formatCurrency(item.unit_cost, order.currency)} = {formatCurrency(item.line_total, order.currency)}
                   </Text>
-                  <Text style={[styles.itemReceived, { color: receivedPct >= 100 ? Colors.success : Colors.warning }]}>
+                  <Text style={[styles.itemReceived, !done && styles.itemReceivedPending]}>
                     Received: {item.received_qty} / {item.quantity}
                   </Text>
                 </View>
-                <View style={[styles.itemStatusDot, { backgroundColor: receivedPct >= 100 ? Colors.success : receivedPct > 0 ? Colors.warning : Colors.border }]} />
+                <Icon
+                  name={done ? 'check-circle' : receivedPct > 0 ? 'clock' : 'circle'}
+                  size={iconSize.md}
+                  tint={done ? color.textSecondary : receivedPct > 0 ? color.attention : color.textMuted}
+                />
               </View>
             );
           })}
@@ -147,31 +163,36 @@ export const PurchaseOrderDetailScreen = ({ navigation, route }: any) => {
         {/* Action Buttons */}
         {availableActions.length > 0 && (
           <View style={styles.actionsCard}>
-            <Text style={styles.cardTitle}>Actions</Text>
+            <Text style={styles.cardTitle}>{t('poActions')}</Text>
             {availableActions.map(action => (
-              <TouchableOpacity
+              <Button
                 key={action.to}
-                style={[styles.actionBtn, { borderColor: action.color, backgroundColor: Colors.bgInput }]}
+                label={t(action.labelKey)}
+                icon={action.icon}
+                variant="secondary"
+                fullWidth
                 onPress={() => handleStatusChange(action.to)}
-              >
-                <Text style={[styles.actionBtnText, { color: action.color }]}>{action.label}</Text>
-              </TouchableOpacity>
+                style={styles.actionBtn}
+              />
             ))}
             {(order.status === 'sent' || order.status === 'partial') && (
-              <TouchableOpacity
-                style={[styles.actionBtn, { borderColor: Colors.success, backgroundColor: Colors.bgInput }]}
-                onPress={() => navigation.navigate('ReceiveGoods', { orderId: order.id, items: order.items })}
-              >
-                <Text style={[styles.actionBtnText, { color: Colors.success }]}>📦 Receive Goods</Text>
-              </TouchableOpacity>
+              <Button
+                label={t('poReceiveGoods')}
+                icon="package"
+                variant="secondary"
+                fullWidth
+                onPress={() => navigation.navigate('ReceiveGoods', { orderId: order.id, items: order.items, currency: order.currency })}
+                style={styles.actionBtn}
+              />
             )}
             {order.status !== 'cancelled' && (
-              <TouchableOpacity
-                style={[styles.actionBtn, { borderColor: Colors.primaryLight, backgroundColor: Colors.bgInput }]}
+              <Button
+                label={t('poCreateInvoiceFromOrder')}
+                icon="file-text"
+                fullWidth
                 onPress={handleCreateInvoice}
-              >
-                <Text style={[styles.actionBtnText, { color: Colors.primaryLight }]}>🧾 Create Invoice from PO</Text>
-              </TouchableOpacity>
+                style={styles.actionBtn}
+              />
             )}
           </View>
         )}
@@ -181,38 +202,41 @@ export const PurchaseOrderDetailScreen = ({ navigation, route }: any) => {
 };
 
 const styles = StyleSheet.create({
-  safe: { flex: 1, backgroundColor: Colors.bgPrimary },
-  center: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: Colors.bgPrimary },
+  safe: { flex: 1, backgroundColor: color.surface },
+  center: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: color.surface },
   header: {
-    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
-    backgroundColor: Colors.bgCard, paddingHorizontal: 16, paddingVertical: 14,
-    borderBottomWidth: 1, borderBottomColor: Colors.border,
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: space.sm,
+    backgroundColor: color.surface, paddingHorizontal: space.md, minHeight: 56, paddingVertical: space.sm,
+    borderBottomWidth: hairline, borderBottomColor: color.border,
   },
-  backBtn: { width: 36 },
-  backArrow: { fontSize: 22, color: Colors.textWhite, fontWeight: '700' },
-  headerTitle: { fontSize: 18, fontWeight: '700', color: Colors.textWhite },
-  headerSub: { fontSize: 11, color: Colors.textGray },
-  badge: { paddingHorizontal: 10, paddingVertical: 4, borderRadius: 10 },
-  badgeText: { fontSize: 11, fontWeight: '800' },
-  metaCard: { backgroundColor: Colors.bgCard, margin: 16, borderRadius: 14, padding: 16, borderWidth: 1, borderColor: Colors.border, shadowColor: '#000', shadowOpacity: 0.2, elevation: 2 },
-  metaRow: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 8 },
+  backBtn: { width: touchTarget, height: touchTarget, alignItems: 'center', justifyContent: 'center' },
+  headerText: { flex: 1 },
+  headerTitle: { ...typeScale.heading, fontSize: 18, color: color.textPrimary },
+  headerSub: { ...typeScale.caption, color: color.textSecondary },
+  badge: { paddingHorizontal: space.sm, paddingVertical: 2, borderRadius: radius.pill, borderWidth: hairline },
+  badgeText: { ...typeScale.caption },
+  scroll: { paddingBottom: 135 },
+  metaCard: { backgroundColor: color.surface, margin: space.lg, borderRadius: radius.lg, padding: space.lg, borderWidth: hairline, borderColor: color.border },
+  metaRow: { flexDirection: 'row', justifyContent: 'space-between', gap: space.md },
   metaCol: { flex: 1 },
-  metaLabel: { fontSize: 10, color: Colors.textGray, fontWeight: '600', marginBottom: 2 },
-  metaVal: { fontSize: 14, fontWeight: '700', color: Colors.textWhite },
-  notesText: { fontSize: 13, color: Colors.textGray, marginTop: 8, fontStyle: 'italic' },
-  progressCard: { backgroundColor: Colors.bgCard, marginHorizontal: 16, marginBottom: 12, borderRadius: 14, padding: 14, borderWidth: 1, borderColor: Colors.border, shadowColor: '#000', shadowOpacity: 0.2, elevation: 2 },
-  progressLabel: { fontSize: 12, color: Colors.textGray, fontWeight: '600', marginBottom: 8 },
-  progressBar: { height: 8, backgroundColor: Colors.bgInput, borderRadius: 4, overflow: 'hidden' },
-  progressFill: { height: '100%', backgroundColor: Colors.success, borderRadius: 4 },
-  itemsCard: { backgroundColor: Colors.bgCard, marginHorizontal: 16, marginBottom: 12, borderRadius: 14, padding: 16, borderWidth: 1, borderColor: Colors.border, shadowColor: '#000', shadowOpacity: 0.2, elevation: 2 },
-  cardTitle: { fontSize: 13, fontWeight: '700', color: Colors.textWhite, marginBottom: 12 },
-  itemRow: { flexDirection: 'row', alignItems: 'center', paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: Colors.border },
-  itemName: { fontSize: 14, fontWeight: '700', color: Colors.textWhite },
-  itemDetail: { fontSize: 12, color: Colors.textGray, marginTop: 2 },
-  itemReceived: { fontSize: 12, fontWeight: '600', marginTop: 2 },
-  itemStatusDot: { width: 12, height: 12, borderRadius: 6, marginLeft: 12 },
-  actionsCard: { backgroundColor: Colors.bgCard, marginHorizontal: 16, marginBottom: 12, borderRadius: 14, padding: 16, borderWidth: 1, borderColor: Colors.border, shadowColor: '#000', shadowOpacity: 0.2, elevation: 2 },
-  actionBtn: { borderWidth: 1.5, borderRadius: 12, paddingVertical: 13, alignItems: 'center', marginBottom: 10 },
-  actionBtnText: { fontSize: 14, fontWeight: '700' },
+  metaColEnd: { alignItems: 'flex-end', flexShrink: 0 },
+  metaLabel: { ...typeScale.caption, color: color.textSecondary, marginBottom: 2 },
+  metaVal: { ...typeScale.bodyMedium, color: color.textPrimary },
+  notesRow: { flexDirection: 'row', gap: space.sm, alignItems: 'flex-start', marginTop: space.md },
+  notesText: { ...typeScale.label, flex: 1, color: color.textSecondary },
+  progressCard: { backgroundColor: color.surface, marginHorizontal: space.lg, marginBottom: space.md, borderRadius: radius.lg, padding: space.lg, borderWidth: hairline, borderColor: color.border },
+  progressLabelRow: { flexDirection: 'row', justifyContent: 'space-between', gap: space.md, marginBottom: space.sm },
+  progressLabel: { ...typeScale.label, color: color.textSecondary },
+  progressBar: { height: 8, backgroundColor: color.surfaceRaised, borderRadius: radius.pill, overflow: 'hidden' },
+  progressFill: { height: '100%', backgroundColor: color.accent, borderRadius: radius.pill },
+  itemsCard: { backgroundColor: color.surface, marginHorizontal: space.lg, marginBottom: space.md, borderRadius: radius.lg, padding: space.lg, borderWidth: hairline, borderColor: color.border },
+  cardTitle: { ...typeScale.bodyMedium, color: color.textPrimary, marginBottom: space.md },
+  itemRow: { flexDirection: 'row', alignItems: 'center', gap: space.md, paddingVertical: space.md, borderBottomWidth: hairline, borderBottomColor: color.border },
+  itemInfo: { flex: 1 },
+  itemName: { ...typeScale.bodyMedium, color: color.textPrimary },
+  itemDetail: { ...typeScale.caption, color: color.textSecondary, marginTop: 2 },
+  itemReceived: { ...typeScale.caption, color: color.textSecondary, marginTop: 2 },
+  itemReceivedPending: { color: color.attention },
+  actionsCard: { backgroundColor: color.surface, marginHorizontal: space.lg, marginBottom: space.md, borderRadius: radius.lg, padding: space.lg, borderWidth: hairline, borderColor: color.border },
+  actionBtn: { marginBottom: space.sm },
 });
-

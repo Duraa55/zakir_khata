@@ -25,7 +25,10 @@ check('English/Urdu key parity, nonempty values and matching named placeholders'
  for(const k of Object.keys(en)){
   assert.ok(en[k].trim()&&ur[k].trim(),k+' is empty');
   assert.deepEqual(placeholders(en[k]),placeholders(ur[k]),k+' placeholders differ');
-  assert.ok(!/Rs\.|\p{Nd}+/u.test(ur[k]),k+' contains currency or digits');
+  // No "Rs." and no Arabic-Indic digits: money and dates are rendered by formatCurrency and
+  // the date helpers, in English, so a localized digit in a label would mismatch the figure
+  // beside it. Plain ASCII digits inside an example ("e.g. 0300 1234567") are fine.
+  assert.ok(!/Rs\.|[٠-٩۰-۹]/.test(ur[k]),k+' contains currency or localized digits');
  }
  assert.ok(read('src/i18n/en.ts').includes('as const'));
  assert.ok(read('src/i18n/ur.ts').includes('Record<TKey, string>'));
@@ -38,7 +41,15 @@ check('Every literal t() key in source exists in both dictionaries',()=>{
   const sf=ts.createSourceFile(file,fs.readFileSync(file,'utf8'),ts.ScriptTarget.Latest,true);
   const visit=n=>{
    if(ts.isCallExpression(n)&&(/^(t|.*\.t)$/.test(n.expression.getText(sf)))){
-    const arg=n.arguments[0];if(arg&&ts.isStringLiteral(arg))assert.ok(arg.text in en&&arg.text in ur,file+': missing '+arg.text);
+    // Both t('literal') AND t(cond ? 'a' : 'b'). The conditional form used to be skipped
+   // entirely, and a missing key is not a blank label: translate() calls .replace() on
+   // the looked-up value, so an absent key is a TypeError the moment the screen renders.
+   const arg=n.arguments[0];
+   const literals=!arg?[]
+    :ts.isStringLiteral(arg)?[arg]
+    :ts.isConditionalExpression(arg)?[arg.whenTrue,arg.whenFalse].filter(ts.isStringLiteral)
+    :[];
+   for(const lit of literals)assert.ok(lit.text in en&&lit.text in ur,file+': missing '+lit.text);
    }ts.forEachChild(n,visit);
   };visit(sf);
  }
@@ -70,18 +81,40 @@ check('Boot restores language before DB/session and gates rendering; Login does 
  assert.ok(boot.indexOf('if (!isLoaded)')<boot.indexOf("t('loading')"));
  assert.ok(!/loadLanguage/.test(login));
 });
-check('Currency is byte-identical and ASCII under English and Urdu; dates remain en-PK',async()=>{
+check('Currency is byte-identical and ASCII under English and Urdu, in EVERY currency; dates remain en-PK',async()=>{
  const r=runtime(),store=r.load('src/store/useLanguageStore.ts').useLanguageStore;
  const {formatCurrency}=r.load('src/utils/calculations.ts'),{formatDisplayDate}=r.load('src/utils/dates.ts');
+ const {CURRENCIES,CURRENCY_CODES,resolveCurrency,DEFAULT_CURRENCY}=r.load('src/utils/currency.ts');
  const values=[0,1,99,100,9999,123456,-123456,999999999];
- await store.getState().setLanguage('en');const before=values.map(formatCurrency),date=formatDisplayDate('2026-09-13');
- await store.getState().setLanguage('ur');const after=values.map(formatCurrency);
- for(let i=0;i<before.length;i++){
-  assert.ok(Buffer.from(before[i]).equals(Buffer.from(after[i])));
-  assert.ok(/^[\x00-\x7F]+$/.test(after[i]));
+ // The language must not reach a figure in ANY currency, not just the default.
+ for(const code of CURRENCY_CODES){
+  await store.getState().setLanguage('en');const before=values.map(v=>formatCurrency(v,code));
+  const date=formatDisplayDate('2026-09-13');
+  await store.getState().setLanguage('ur');const after=values.map(v=>formatCurrency(v,code));
+  for(let i=0;i<before.length;i++){
+   assert.ok(Buffer.from(before[i]).equals(Buffer.from(after[i])),code+' moved with the language');
+   assert.ok(/^[\x00-\x7F]+$/.test(after[i]),code+' formatted a figure with a non-ASCII character: '+after[i]);
+  }
+  assert.equal(formatDisplayDate('2026-09-13'),date);
  }
- assert.equal(before[5],'Rs. 1,234.56');assert.equal(formatDisplayDate('2026-09-13'),date);
- assert.ok(read('src/utils/calculations.ts').includes("toLocaleString('en-PK'"));
+ assert.equal(formatCurrency(123456),'Rs. 1,234.56','the default output is unchanged');
+ assert.equal(formatCurrency(123456,'AED'),'AED 1,234.56');
+ // Unknown, missing and stray arguments are PKR — never a throw and never "undefined"
+ // beside a figure. Mapping the formatter over an array passes the array INDEX as the
+ // second argument, which is exactly this case and is why the resolver must be total.
+ for(const junk of [undefined,null,'','pkr','KWD','XXX',0,3,{},NaN])
+  assert.equal(formatCurrency(123456,junk),'Rs. 1,234.56','not a currency code: '+String(junk));
+ assert.deepEqual(values.map(formatCurrency),values.map(v=>formatCurrency(v,DEFAULT_CURRENCY)));
+ // The money layer divides by 100 everywhere, so a 1000-minor-unit currency cannot be
+ // added to the table without changing the converters. See CLAUDE.md.
+ for(const code of CURRENCY_CODES){
+  assert.equal(CURRENCIES[code].minorUnits,100,code+' breaks the integer-minor-unit assumption');
+  assert.ok(/^[\x00-\x7F]+$/.test(CURRENCIES[code].prefix),code+' has a non-ASCII prefix');
+  assert.equal(resolveCurrency(code).code,code);
+ }
+ assert.deepEqual([...CURRENCY_CODES].sort(),['AED','CNY','PKR','USD'],'the currency list is closed');
+ assert.equal(CURRENCIES.PKR.locale,'en-PK','rupees stay pinned to en-PK');
+ assert.ok(!/useLanguageStore/.test(read('src/utils/calculations.ts')),'the formatter reads the language');
  assert.ok(read('src/utils/dates.ts').includes("toLocaleDateString('en-PK'"));
 });
 check('No forced RTL anywhere; translated shared components do not mix figures with labels',()=>{
@@ -110,6 +143,10 @@ const CONVERTED=[
  'src/components/CountryCodePicker.tsx','src/components/TranslateToUrdu.tsx','src/components/ui/CustomerAvatar.tsx',
  'src/components/ui/DateField.tsx','src/components/ui/DateRangeFilter.tsx','src/components/ui/EntryHistory.tsx',
  'src/components/reports/DateFilterPicker.tsx','src/components/Download/DownloadOptionsModal.tsx','src/navigation/AppNavigator.tsx',
+ // The three book heroes carried hardcoded English behind a green suite until
+ // 2026-10-06 ("Total expense — ", "Total sale … bills", "Today balance").
+ 'src/screens/ExpenseBook/ExpenseBookScreen.tsx','src/screens/BillBook/BillBookScreen.tsx',
+ 'src/screens/CashBook/CashBookScreen.tsx',
 ];
 const ALLOWED_LITERALS=new Set(['PDF','CSV','.pdf','.csv','application/pdf','text/csv','U','?','✓','✕','×','▼','📅','🔔','Rs.']);
 const USER_FACING_PROPS=new Set(['placeholder','title','message','accessibilityLabel','label','headerTitle','tabBarLabel','dialogTitle']);
@@ -132,6 +169,13 @@ function hardcodedStrings(file){
    if(ts.isStringLiteral(i))flag(i,i.text);
    else if(ts.isJsxExpression(i)&&i.expression&&(ts.isStringLiteral(i.expression)||ts.isNoSubstitutionTemplateLiteral(i.expression)))flag(i,i.expression.text);
    else if(ts.isJsxExpression(i)&&i.expression&&ts.isTemplateExpression(i.expression)&&!insideT(i.expression))flag(i,i.expression.head.text);
+   // label={cond ? 'Today balance' : 'Day balance'} — each branch is a hardcoded label in
+   // its own right. The generic conditional case below skips attribute initializers, so
+   // without this the Cash Book shipped exactly that past a green suite.
+   else if(ts.isJsxExpression(i)&&i.expression&&ts.isConditionalExpression(i.expression)){
+    for(const b of [i.expression.whenTrue,i.expression.whenFalse])
+     if(ts.isStringLiteral(b)||ts.isNoSubstitutionTemplateLiteral(b))flag(b,b.text);
+   }
   }
   else if(ts.isCallExpression(n)&&/Alert\.alert$/.test(n.expression.getText(sf))){
    for(const a of n.arguments.slice(0,2))if(ts.isStringLiteral(a)||ts.isNoSubstitutionTemplateLiteral(a))flag(a,a.text);
@@ -148,7 +192,7 @@ check('Converted screens and components contain no hardcoded user-facing strings
  // The scanner itself must catch what it claims to: a fixture with every pattern.
  const fixture=path.join(root,'tests','.i18n-fixture.tsx');
  const BT=String.fromCharCode(96);
- fs.writeFileSync(fixture,"const A=()=><T>Hello there<T placeholder=\"Type here\">{'Literal'}{ok?'Yes':'No'}{"+BT+"Photo of ${x}"+BT+"}</T>{Alert.alert('Oops','Failed')}{[{text:'Cancel'}]}</T>;");
- try{const hits=hardcodedStrings(path.relative(root,fixture));assert.equal(hits.length,9,'scanner missed patterns: '+hits.join(' | '));}finally{fs.unlinkSync(fixture);}
+ fs.writeFileSync(fixture,"const A=()=><T>Hello there<T placeholder=\"Type here\" label={ok?'Paid':'Unpaid'}>{'Literal'}{ok?'Yes':'No'}{"+BT+"Photo of ${x}"+BT+"}</T>{Alert.alert('Oops','Failed')}{[{text:'Cancel'}]}</T>;");
+ try{const hits=hardcodedStrings(path.relative(root,fixture));assert.equal(hits.length,11,'scanner missed patterns: '+hits.join(' | '));}finally{fs.unlinkSync(fixture);}
 });
 (async()=>{let passed=0;for(const c of checks){try{await c.fn();passed++;console.info('PASS '+c.name);}catch(e){console.error('FAIL '+c.name+'\n'+e.stack);}}console.info(`TOTAL ${checks.length}: ${passed} PASS, ${checks.length-passed} FAIL`);process.exitCode=passed===checks.length?0:1;})();

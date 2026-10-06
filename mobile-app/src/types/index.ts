@@ -1,3 +1,4 @@
+import type { CurrencyCode } from '../utils/currency';
 export type UserRole = 'admin' | 'staff';
 
 export interface User {
@@ -11,6 +12,8 @@ export interface User {
   area?: string;
   pictureUrl?: string;
   parentId?: string;
+  /** Currency this account's new entries default to. Suggested from the login phone. */
+  defaultCurrency?: CurrencyCode;
   createdAt: string;
 }
 

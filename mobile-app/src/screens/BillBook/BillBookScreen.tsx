@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
+import { useLanguageStore } from '../../store/useLanguageStore';
 import {
   View, Text, TouchableOpacity, StyleSheet, SectionList, ScrollView,
   Animated, ActivityIndicator, Dimensions, Alert, Keyboard, Platform
@@ -10,60 +11,47 @@ import { Bill } from '../../types/bill.types';
 import { formatCurrency } from '../../utils/calculations';
 import { DateRangeFilter, DateRange, describeRange } from '../../components/ui/DateRangeFilter';
 import { toDateValue, formatDisplayDate } from '../../utils/dates';
-import { themeColors } from '../../theme/theme';
 import { TopHeaderWithBooks } from '../../components/TopHeaderWithBooks';
-
-const ORANGE = '#FF6B35';
-const GREEN = '#4CAF50';
-const RED = '#EF4444';
-const GRAY = '#9CA3AF';
-const BLUE = '#3B82F6';
-
-const getStatusColor = (item: Bill) => {
-  if (item.is_draft) return { bg: '#E5E7EB', text: '#4B5563', label: 'DRAFT' };
-  if (item.is_hold) return { bg: '#FEF3C7', text: '#D97706', label: 'ON HOLD' };
-  if (item.status === 'paid') return { bg: '#DCFCE7', text: '#15803D', label: 'PAID' };
-  if (item.status === 'unpaid') return { bg: '#FEE2E2', text: '#DC2626', label: 'UNPAID' };
-  return { bg: '#FFEDD5', text: '#C2410C', label: 'PARTIAL' }; // partial
-};
+import { ReadOnlyBanner } from '../../components/ui/ReadOnlyBanner';
+import { SummaryBar, SummaryFigure, AmountText, AmountStack } from '../../components/ui/primitives';
+import { PdfReportButton } from '../../components/ui/PdfReportButton';
+import { color, space, radius, hairline, touchTarget, chrome, type as typeScale } from '../../theme/tokens';
 
 const BillItemView = React.memo(({ item, onPress }: { item: Bill, onPress: (item: Bill) => void }) => {
-  const statusTheme = getStatusColor(item);
+  const { t } = useLanguageStore();
   return (
     <TouchableOpacity 
       style={styles.itemRow}
       onPress={() => onPress(item)}
     >
       <View style={styles.itemHeader}>
-        <Text style={styles.billNumber}>Bill #{item.bill_no}</Text>
-        <View style={[styles.statusBadge, { backgroundColor: statusTheme.bg }]}>
-          <Text style={[styles.statusText, { color: statusTheme.text }]}>
-            {statusTheme.label}
-          </Text>
-        </View>
+        <Text style={styles.billNumber}>{t('billNumberPrefix')} {item.bill_no}</Text>
+        {/* Part paid: what is still owed, beside the total. An unpaid bill shows its
+            total once — the two figures would be the same number. */}
+        {item.paid > 0 && item.due > 0 && <AmountText paisa={item.due} tone="out" size="label" currency={item.currency} />}
       </View>
 
       <View style={styles.itemFooter}>
-        <Text style={styles.partyName}>{item.party_name}</Text>
-        <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-          <Text style={styles.billTotal}>{formatCurrency(item.total)}</Text>
-          <Text style={{ color: GRAY, fontSize: 16, marginLeft: 8 }}>{'>'}</Text>
+        <Text style={styles.partyName} numberOfLines={1}>{item.party_name}</Text>
+        <View style={styles.totalWrap}>
+          <Text style={styles.billTotal}>{formatCurrency(item.total, item.currency)}</Text>
+          <Text style={styles.chevron}>›</Text>
         </View>
       </View>
     </TouchableOpacity>
   );
 });
 
-export const BillBookScreen = ({ navigation }: any) => {
+export const BillBookScreen = ({ navigation, route }: any) => {
+  // Staff Book → staff → Entries → Bill: that person's bills, read-only.
+  const viewAs: { userId: string; name: string } | undefined = route?.params?.viewAs;
   const insets = useSafeAreaInsets();
   const { user } = useAuthStore();
+  const { t } = useLanguageStore();
   const { bills, loading, loadingMore, dayTotals, summary, fetchBills, loadMoreBills, filter, setFilter } = useBillStore();
 
-  const filterTab = filter.status ?? 'posted';
   const range: DateRange = { startDate: filter.startDate, endDate: filter.endDate };
-  const apply = (next: Partial<typeof filter>) => { if (user) setFilter(user.id, { ...filter, ...next }); };
-  const setRange = (next: DateRange) => apply(next);
-  const setFilterTab = (status: 'posted' | 'drafts' | 'holds') => apply({ status });
+  const setRange = (next: DateRange) => { if (user) setFilter(user.id, { ...filter, ...next }, viewAs?.userId); };
   const pulseAnim = useRef(new Animated.Value(0)).current;
 
   useEffect(() => {
@@ -76,7 +64,7 @@ export const BillBookScreen = ({ navigation }: any) => {
   }, [pulseAnim]);
 
   const loadData = () => {
-    if (user) fetchBills(user.id);
+    if (user) fetchBills(user.id, undefined, viewAs?.userId);
   };
 
   useEffect(() => {
@@ -109,18 +97,9 @@ export const BillBookScreen = ({ navigation }: any) => {
   }, []);
 
   const handleBillPress = React.useCallback((item: Bill) => {
-    if (item.is_draft || item.is_hold) {
-      Alert.alert('Resume Bill', 'Do you want to resume this bill?', [
-        { text: 'Cancel', style: 'cancel' },
-        { text: 'Resume POS', onPress: () => navigation.navigate('CreateNewBillModal', { billId: item.id }) }
-      ]);
-    } else {
-      navigation.navigate('BillDetailScreen', { billId: item.id });
-    }
+    navigation.navigate('BillDetailScreen', { billId: item.id });
   }, [navigation]);
 
-  // Status is part of the SQL predicate now, so the list the user sees and the
-  // headline totals below always describe the same set of bills.
   const filteredBills = bills;
 
   const rangeLabel = describeRange(range);
@@ -143,87 +122,75 @@ export const BillBookScreen = ({ navigation }: any) => {
 
   // Day header: how many bills, what was billed and what was actually received that day.
   const renderSectionHeader = React.useCallback(({ section }: { section: { day: string } }) => {
-    const t = dayTotals[section.day];
+    const day = dayTotals[section.day];
     return (
       <View style={styles.dayHeader}>
         <View style={{ flex: 1 }}>
           <Text style={styles.dayTitle}>{formatDisplayDate(section.day)}</Text>
-          {t && <Text style={styles.dayCount}>{t.billCount} {t.billCount === 1 ? 'bill' : 'bills'}</Text>}
+          {day && <Text style={styles.dayCount}>{day.billCount} {t(day.billCount === 1 ? 'billSingular' : 'billPlural')}</Text>}
         </View>
-        {t && (
+        {day && (
           <View style={styles.dayRight}>
             <View style={styles.dayCols}>
-              <Text style={[styles.dayColLabel, { color: themeColors.textSecondary }]}>Billed</Text>
-              <Text style={[styles.dayColLabel, { color: themeColors.success }]}>Paid</Text>
+              <Text style={styles.dayColLabel}>{t('billBilled')}</Text>
+              <Text style={styles.dayColLabel}>{t('billPaid')}</Text>
             </View>
             <View style={styles.dayCols}>
-              <Text style={[styles.dayColVal, { color: '#fff' }]}>{formatCurrency(t.totalBilled)}</Text>
-              <Text style={[styles.dayColVal, { color: themeColors.success }]}>{formatCurrency(t.totalPaid)}</Text>
+              <AmountStack totals={day.totalBilled} size="label" textStyle={styles.dayColVal} />
+              <AmountStack totals={day.totalPaid} tone="in" size="label" textStyle={styles.dayColVal} />
             </View>
           </View>
         )}
       </View>
     );
-  }, [dayTotals]);
+  }, [dayTotals, t]);
 
   const loadMore = React.useCallback(() => { if (user) loadMoreBills(user.id); }, [user, loadMoreBills]);
 
   return (
-    <View style={[styles.container, { paddingBottom: insets.bottom }]}>
+    <View style={styles.container}>
       
       {/* Top Header with Profile & Books Bar */}
-      <TopHeaderWithBooks navigation={navigation} activeBook="BillBook" />
+      {viewAs
+        ? <ReadOnlyBanner name={viewAs.name} book="Bill" onBack={() => navigation.goBack()} />
+        : <TopHeaderWithBooks navigation={navigation} activeBook="BillBook" />}
 
-      {/* Sub Header */}
-      <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingHorizontal: 16, paddingTop: 10 }}>
-        <Text style={{ fontSize: 18, fontWeight: '800', color: '#fff' }}>Bill Book</Text>
-        <TouchableOpacity 
-          style={{ padding: 6 }} 
-          onPress={() => navigation.navigate('DownloadOptionsModal', { reportType: 'bill' })}
-        >
-          <Text style={{ fontSize: 14, fontWeight: '800', color: '#1dd1a1' }}>⬇ PDF Report</Text>
-        </TouchableOpacity>
-      </View>
+
 
       {/* Summary Card */}
-      <View style={styles.summaryCard}>
-        <Text style={styles.summaryTitle}>Total sale {rangeLabel} · {summary.billCount} bill{summary.billCount === 1 ? '' : 's'}</Text>
-        <Text style={styles.summaryAmount}>{formatCurrency(summary.totalBilled)}</Text>
-      </View>
+      <SummaryBar>
+        {/* One bill or many is two dictionary entries, not an English "s" glued on:
+            Urdu does not pluralise this way. Same shape as dashEntryEdited/dashEntriesEdited. */}
+        <SummaryFigure label={t(summary.billCount === 1 ? 'billHeroSaleOne' : 'billHeroSaleMany',
+          { range: rangeLabel, count: summary.billCount })}>
+          <AmountStack totals={summary.totalBilled} size="title" fit textStyle={styles.summaryAmount} />
+        </SummaryFigure>
+      </SummaryBar>
 
-      {/* Date Range Filter — real, in the same slot the fake boxes occupied */}
-      <View style={styles.dateFilterContainer}>
+      {/* Date Range Filter — sits above the list, sized by its own content. It used to
+          be wrapped in a flex: 1 View, which inside this auto-height box resolved to
+          zero height: the box collapsed to a sliver and the list drew over the fields. */}
+      {/* One compact line: the active range, and the export beside it. */}
+      <View style={styles.toolbar}>
+        <View style={styles.toolbarFilter}>
         <DateRangeFilter value={range} onChange={setRange}
           fieldStyle={styles.dateBox} textStyle={styles.dateLabel} />
-      </View>
-
-      {/* Status Filters */}
-      <View style={{ flexDirection: 'row', marginHorizontal: 12, marginTop: 12, gap: 8 }}>
-        {(['posted', 'drafts', 'holds'] as const).map(tab => (
-          <TouchableOpacity
-            key={tab}
-            style={[styles.filterChip, filterTab === tab && styles.filterChipActive]}
-            onPress={() => setFilterTab(tab)}
-          >
-            <Text style={[styles.filterChipText, filterTab === tab && styles.filterChipTextActive]}>
-              {tab.toUpperCase()}
-            </Text>
-          </TouchableOpacity>
-        ))}
+        </View>
+        {!viewAs && <PdfReportButton onPress={() => navigation.navigate('DownloadOptionsModal', { reportType: 'bill' })} />}
       </View>
 
       {/* Content */}
       {loading ? (
         <View style={styles.center}>
-          <ActivityIndicator size="large" color={ORANGE} />
+          <ActivityIndicator size="large" color={color.accent} />
         </View>
       ) : filteredBills.length === 0 ? (
-        <ScrollView contentContainerStyle={{ flexGrow: 1, paddingBottom: 140, justifyContent: 'center', alignItems: 'center', paddingHorizontal: 20 }}>
+        <ScrollView contentContainerStyle={{ flexGrow: 1, paddingBottom: chrome.listBottom, justifyContent: 'center', alignItems: 'center', paddingHorizontal: space.xl }}>
           <View style={styles.emptyState}>
-            <View style={{ alignItems: 'center' }}>
-              <Text style={styles.instructionText}>1- Create bills</Text>
-              <Text style={styles.instructionText}>2- Share with customers</Text>
-              <Text style={styles.instructionText}>3- Get paid 3X faster</Text>
+            <View style={{ alignItems: 'center', gap: space.sm }}>
+              <Text style={styles.instructionText}>{t('billStep1')}</Text>
+              <Text style={styles.instructionText}>{t('billStep2')}</Text>
+              <Text style={styles.instructionText}>{t('billStep3')}</Text>
             </View>
           </View>
         </ScrollView>
@@ -234,11 +201,11 @@ export const BillBookScreen = ({ navigation }: any) => {
           renderItem={renderItem}
           renderSectionHeader={renderSectionHeader}
           stickySectionHeadersEnabled
-          contentContainerStyle={{ padding: 12, paddingBottom: 140 }}
-          SectionSeparatorComponent={() => <View style={{ height: 8 }} />}
+          contentContainerStyle={{ paddingHorizontal: space.lg, paddingTop: chrome.rowGap, paddingBottom: chrome.listBottom }}
+          SectionSeparatorComponent={() => <View style={{ height: space.sm }} />}
           onEndReached={loadMore}
           onEndReachedThreshold={0.5}
-          ListFooterComponent={loadingMore ? <ActivityIndicator style={{ margin: 16 }} color={ORANGE} /> : null}
+          ListFooterComponent={loadingMore ? <ActivityIndicator style={{ margin: space.lg }} color={color.accent} /> : null}
           initialNumToRender={10}
           maxToRenderPerBatch={10}
           windowSize={5}
@@ -247,10 +214,15 @@ export const BillBookScreen = ({ navigation }: any) => {
       )}
 
       {/* Add Item Button */}
-      {!isKeyboardVisible && (
-        <View style={[styles.addBtnContainer, { bottom: 85 + Math.max(insets.bottom, 8) }]}>
-          <TouchableOpacity style={styles.addBtn} onPress={() => navigation.navigate('CreateNewBillModal')}>
-            <Text style={styles.addBtnText}>+ CREATE NEW BILL</Text>
+      {!isKeyboardVisible && !viewAs && (
+        <View style={[styles.addBtnContainer, { bottom: 0 }]}>
+          <TouchableOpacity
+            style={styles.addBtn}
+            onPress={() => navigation.navigate('CreateNewBillModal')}
+            activeOpacity={0.85}
+            accessibilityRole="button"
+          >
+            <Text style={styles.addBtnText} numberOfLines={1}>{t('billCreateNew')}</Text>
           </TouchableOpacity>
         </View>
       )}
@@ -259,97 +231,63 @@ export const BillBookScreen = ({ navigation }: any) => {
 };
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: themeColors.background },
+  container: { flex: 1, backgroundColor: color.surface },
 
-  header: {
-    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
-    backgroundColor: themeColors.cardBg, paddingHorizontal: 16, height: 56,
-    borderBottomWidth: 1, borderBottomColor: themeColors.border,
-  },
-  backBtn: { width: 36, justifyContent: 'center' },
-  backArrow: { fontSize: 28, color: '#fff', fontWeight: '300' },
-  headerTitle: { fontSize: 18, fontWeight: '700', color: '#fff' },
 
-  settingsBtn: { padding: 4 },
-  settingsIcon: { fontSize: 18, color: themeColors.textSecondary },
-
-  summaryCard: {
-    flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center',
-    backgroundColor: themeColors.cardBg, marginHorizontal: 12, marginTop: 12,
-    borderRadius: 14, padding: 16, borderWidth: 1, borderColor: themeColors.border,
-    shadowColor: '#000', shadowOffset: { width: 0, height: 3 }, shadowOpacity: 0.25, elevation: 3
-  },
   // Day header — the Cash Book day-header banner with Billed / Paid columns.
   dayHeader: {
     flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center',
-    backgroundColor: themeColors.cardBg, borderRadius: 12, paddingVertical: 12, paddingHorizontal: 14,
-    borderWidth: 1, borderColor: themeColors.border, marginBottom: 8,
+    backgroundColor: color.surface, borderRadius: radius.md,
+    paddingVertical: chrome.dayPadY, paddingHorizontal: space.md,
+    borderWidth: hairline, borderColor: color.border, marginBottom: space.sm,
   },
-  dayTitle: { fontSize: 13, fontWeight: '800', color: '#fff', letterSpacing: 0.5 },
-  dayCount: { fontSize: 12, color: themeColors.textSecondary, marginTop: 2 },
-  dayRight: { alignItems: 'flex-end' },
-  dayCols: { flexDirection: 'row', gap: 16 },
-  dayColLabel: { fontSize: 12, fontWeight: '700', minWidth: 60, textAlign: 'right', marginBottom: 2 },
-  dayColVal: { fontSize: 13, fontWeight: '800', minWidth: 60, textAlign: 'right', flexShrink: 0 },
+  dayTitle: { ...typeScale.caption, color: color.textSecondary },
+  dayCount: { ...typeScale.caption, color: color.textSecondary, marginTop: 2 },
+  dayRight: { alignItems: 'flex-end', flexShrink: 0, marginLeft: space.md },
+  dayCols: { flexDirection: 'row', gap: space.lg },
+  dayColLabel: { ...typeScale.caption, color: color.textSecondary, minWidth: 60, textAlign: 'right', marginBottom: 2 },
+  dayColVal: { ...typeScale.label, fontWeight: '500', minWidth: 60, textAlign: 'right', flexShrink: 0 },
 
-  summaryTitle: { fontSize: 13, color: themeColors.textSecondary, fontWeight: '600', flex: 1, marginRight: 12 },
-  summaryAmount: { fontSize: 17, fontWeight: '800', color: '#fff', flexShrink: 0, textAlign: 'right' },
+  summaryAmount: { color: color.onBrand },
 
-  dateFilterContainer: {
-    backgroundColor: themeColors.cardBg, marginHorizontal: 12, marginTop: 12,
-    borderRadius: 14, paddingHorizontal: 12, paddingBottom: 12,
-    borderWidth: 1, borderColor: themeColors.border,
-    shadowColor: '#000', shadowOffset: { width: 0, height: 3 }, shadowOpacity: 0.2, elevation: 3
+  toolbar: {
+    flexDirection: 'row', alignItems: 'center', gap: space.sm,
+    marginHorizontal: space.lg, marginBottom: chrome.rowGap,
   },
-  dateBox: { flexDirection: 'row', alignItems: 'center', minHeight: 36 },
-  dateIcon: { fontSize: 20, color: themeColors.primaryTeal, marginRight: 8 },
-  dateLabel: { fontSize: 11, color: themeColors.textSecondary },
-  dateValue: { fontSize: 13, color: '#fff', fontWeight: '600' },
-  dateDivider: { width: 1, height: 36, backgroundColor: themeColors.border, marginHorizontal: 12 },
+  // A visible bordered box, so each date reads as a control you can tap.
+  dateBox: {
+    flexDirection: 'row', alignItems: 'center', minHeight: touchTarget, marginTop: space.xs,
+    paddingHorizontal: space.md, borderRadius: radius.sm,
+    backgroundColor: color.surface, borderWidth: hairline, borderColor: color.borderStrong,
+  },
+  dateLabel: { ...typeScale.caption, color: color.textSecondary },
 
-  filterChip: { paddingHorizontal: 16, paddingVertical: 8, borderRadius: 20, backgroundColor: themeColors.inputBg, borderWidth: 1, borderColor: themeColors.borderLight },
-  filterChipActive: { backgroundColor: themeColors.primary, borderColor: '#1dd1a1' },
-  filterChipText: { fontSize: 13, fontWeight: '600', color: themeColors.textSecondary },
-  filterChipTextActive: { color: '#fff', fontWeight: '800' },
-
+  toolbarFilter: { flex: 1 },
   itemRow: {
-    backgroundColor: themeColors.cardBg, borderRadius: 14, padding: 14, marginBottom: 10,
-    borderWidth: 1, borderColor: themeColors.border,
-    shadowColor: '#000', shadowOffset: { width: 0, height: 3 }, shadowOpacity: 0.2, elevation: 3
+    backgroundColor: color.surface, borderRadius: radius.md,
+    paddingVertical: chrome.rowPadY, paddingHorizontal: space.md, marginBottom: chrome.rowGap,
+    borderWidth: hairline, borderColor: color.border, minHeight: touchTarget,
   },
-  itemHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 },
-  billNumber: { fontSize: 15, fontWeight: '700', color: '#fff' },
-  statusBadge: { paddingHorizontal: 8, paddingVertical: 4, borderRadius: 6 },
-  statusText: { fontSize: 11, fontWeight: '700' },
-  itemFooter: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
-  partyName: { fontSize: 13, color: themeColors.textSecondary },
-  billTotal: { fontSize: 15, fontWeight: '800', color: '#fff' },
+  itemHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 2, gap: space.sm },
+  billNumber: { ...typeScale.bodyMedium, color: color.textPrimary, flex: 1 },
+  itemFooter: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', gap: space.sm },
+  // flex: 1 so a long (or Urdu) customer name gives way before the amount does.
+  partyName: { ...typeScale.label, color: color.textSecondary, flex: 1 },
+  totalWrap: { flexDirection: 'row', alignItems: 'center', gap: space.xs, flexShrink: 0 },
+  billTotal: { ...typeScale.bodyMedium, color: color.textPrimary },
+  chevron: { ...typeScale.heading, color: color.textMuted },
 
   center: { flex: 1, justifyContent: 'center', alignItems: 'center' },
   emptyState: { flex: 1, justifyContent: 'center', alignItems: 'center' },
-  emptyIcons: { position: 'relative', width: 140, height: 140, alignItems: 'center', justifyContent: 'center' },
-  shieldWrap: { position: 'absolute', top: -10, left: -10, backgroundColor: themeColors.cardBg, borderRadius: 40 },
-  instructionText: { fontSize: 14, color: themeColors.textSecondary, marginBottom: 8 },
-  arrowWrap: { marginTop: 24 },
-  arrowIcon: { fontSize: 36, color: '#1dd1a1', fontWeight: '800' },
+  instructionText: { ...typeScale.label, color: color.textSecondary },
 
   addBtnContainer: {
-    position: 'absolute', bottom: 75, left: 0, right: 0, alignItems: 'center'
+    position: 'absolute', right: space.lg,
+    borderTopWidth: hairline, borderTopColor: color.border,
   },
   addBtn: {
-    backgroundColor: themeColors.primary, width: '80%', height: 50, borderRadius: 25,
-    justifyContent: 'center', alignItems: 'center',
-    shadowColor: '#1dd1a1', shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.5, shadowRadius: 8, elevation: 6
+    backgroundColor: color.accent, minHeight: chrome.fab, paddingHorizontal: space.lg,
+    borderRadius: radius.pill, flexDirection: 'row', justifyContent: 'center', alignItems: 'center', gap: space.sm,
   },
-  addBtnText: { color: '#fff', fontSize: 15, fontWeight: '800', letterSpacing: 0.5 },
-
-  tabBar: {
-    backgroundColor: themeColors.cardBg, borderTopWidth: 1, borderTopColor: themeColors.border, height: 60, flexDirection: 'row'
-  },
-  tabItem: { width: Dimensions.get('window').width / 5, alignItems: 'center', justifyContent: 'center', paddingVertical: 6 },
-  tabItemActive: {},
-  tabIcon: { fontSize: 18, marginBottom: 2 },
-  tabLabel: { fontSize: 11, fontWeight: '600', color: themeColors.textSecondary },
-  tabLabelActive: { color: '#1dd1a1' },
-  tabIndicator: { position: 'absolute', bottom: 2, width: 24, height: 3, backgroundColor: '#1dd1a1', borderRadius: 2 },
+  addBtnText: { ...typeScale.bodyMedium, color: color.textInverse },
 });

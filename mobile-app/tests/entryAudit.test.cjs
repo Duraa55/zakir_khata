@@ -50,6 +50,14 @@ function load(relative) {
     };
     if (id.endsWith('/firebaseConfig')) return { getFirestoreDB: () => ({}), IS_FIREBASE_CONFIGURED: true };
     if (id === 'expo-sqlite') return { openDatabaseAsync: async () => adapter };
+    // Native boundary, like expo-sqlite above: migration v39 repairs attachments through
+    // the file system. No fixture here has an attachment, so nothing is ever copied.
+    if (id === 'expo-file-system') return {
+      documentDirectory: 'test://',
+      getInfoAsync: async () => ({ exists: false }),
+      makeDirectoryAsync: async () => {},
+      copyAsync: async () => {},
+    };
     if (id.endsWith('/authStore')) return { useAuthStore: { getState: () => session } };
     if (id.endsWith('/useSyncStore')) return { useSyncStore: { getState: () => syncState } };
     if (id.startsWith('.')) return load(path.relative(root, path.resolve(path.dirname(file), id + '.ts')));
@@ -78,12 +86,20 @@ async function check(name, test) { await test(); passed++; console.info('PASS ' 
       isDeleted INTEGER DEFAULT 0, deletedAt TEXT, createdAt TEXT, updatedAt TEXT,
       synced INTEGER DEFAULT 0, created_at TEXT, updated_at TEXT, firestore_path TEXT,
       is_deleted INTEGER DEFAULT 0, deleted_at TEXT);
+    -- Two levels: admin -> staff. subA and subB were sub-staff before that level was
+    -- retired; they are ordinary staff under the same owner now, keeping their old ids.
     INSERT INTO users VALUES ('owner','Owner','admin',NULL,0),('staffA','Ahmed','staff','owner',0),
-      ('staffB','Bilal','staff','owner',0),('subA','Sub A','staff','staffA',0),('subB','Sub B','staff','staffB',0),
+      ('staffB','Bilal','staff','owner',0),('subA','Sub A','staff','owner',0),('subB','Sub B','staff','owner',0),
       ('otherOwner','Other Owner','admin',NULL,0),('otherStaff','Other Staff','staff','otherOwner',0);
     INSERT INTO transactions (id,userId,partyName,amount_paisa,type,notes,date,createdAt,updatedAt)
       VALUES ('legacy','subA','Customer',50000,'lena','Original','2026-09-08','2026-09-08','2026-09-08');`);
-  const before = JSON.stringify(all('SELECT * FROM transactions'));
+  // The point of this snapshot is that no EXISTING value is lost or rewritten by the
+  // migration chain. A later migration may ADD a column (v42 adds transactions.customer_id
+  // and backfills the link), which is additive and must not fail this check — so the
+  // comparison is projected onto the columns that existed before the chain ran.
+  const legacyCols = all('PRAGMA table_info(transactions)').map(c => c.name);
+  const project = rows => JSON.stringify(rows.map(r => Object.fromEntries(legacyCols.map(c => [c, r[c]]))));
+  const before = project(all('SELECT * FROM transactions'));
   const database = load('src/services/database/db.ts');
   await database.getDatabase();
   const audit = load('src/services/database/entryAuditDb.ts');
@@ -91,36 +107,47 @@ async function check(name, test) { await test(); passed++; console.info('PASS ' 
   const writer = load('src/services/database/syncHelpers.ts');
   await check('v30 to latest preserves every legacy row and value', async () => {
     assert.equal(one('PRAGMA user_version').user_version, latest);
-    assert.equal(JSON.stringify(all('SELECT * FROM transactions')), before);
+    assert.equal(project(all('SELECT * FROM transactions')), before);
     assert.equal(auditCount(), 0);
     // Reopen through actual initialization with a fresh module cache: gate does not rerun.
     cache.delete(path.resolve(root, 'src/services/database/db.ts'));
     await load('src/services/database/db.ts').getDatabase();
-    assert.equal(JSON.stringify(all('SELECT * FROM transactions')), before);
+    assert.equal(project(all('SELECT * FROM transactions')), before);
     const sql = load('src/services/database/entryAuditMigration.ts').ENTRY_AUDIT_V31_SQL;
     await adapter.withTransactionAsync(() => adapter.execAsync(sql));
     assert.equal(auditCount(), 0);
   });
-  await check('sub-staff creation keeps integer paisa', async () => {
+  await check('an entry by another account keeps integer paisa', async () => {
     const created = await tx.createTransaction('subA', 'New customer', 123456, 'dena', 'new', '2026-09-08');
     assert.equal((await tx.getTransactionById(created.id)).amount_paisa, 123456);
   });
-  await check('parent edit logs two fields, stored actor name, and owner-scoped sync', async () => {
+  await check('nobody but the author may edit or delete an entry; nothing is logged', async () => {
+    // The owner is above subA, so they can SEE the entry — and are still refused the edit.
+    login('owner');
+    await assert.rejects(tx.updateTransaction('legacy', 'owner', { notes: 'Parent edit' }),/Only the person who created it/);
+    await assert.rejects(tx.deleteTransaction('legacy', 'owner'),/Only the person who created it/);
+    // A peer staff member cannot even reach it: refused before authorship is considered.
     login('staffA');
+    await assert.rejects(tx.updateTransaction('legacy', 'staffA', { notes: 'Peer edit' }),/do not have permission/);
+    await assert.rejects(tx.deleteTransaction('legacy', 'staffA'),/do not have permission/);
+    assert.equal(auditCount(), 0);
+  });
+  await check('author edit logs two fields, stored actor name, and owner-scoped sync', async () => {
+    login('subA');
     await tx.updateTransaction('legacy', 'otherOwner', { amount_paisa: 30000, notes: 'Parent edit' });
     const h = await audit.getEntryHistory('transactions','legacy');
     assert.equal(h.rows.length,2);
     assert.equal(h.rows[0].change_group_id,h.rows[1].change_group_id);
-    assert.equal(h.rows[0].actor_id,'staffA'); assert.equal(h.rows[0].actor_name,'Ahmed');
+    assert.equal(h.rows[0].actor_id,'subA'); assert.equal(h.rows[0].actor_name,'Sub A');
     const money = h.rows.find(r=>r.field_name==='amount_paisa');
     assert.equal(money.value_kind,'money_paisa'); assert.equal(money.old_value_json,'50000'); assert.equal(money.new_value_json,'30000');
     const queue = all('SELECT * FROM sync_queue WHERE record_id = ?', 'legacy');
     assert.equal(queue.at(-1).firestore_path,'users/subA/transactions/legacy');
     assert.equal(auditCount(),2);
   });
-  await check('sub-staff and owner both see parent edits; sibling and other owner cannot', async () => {
+  await check('the author and the owner above them (read-only) see the edits; a peer and another owner cannot', async () => {
     for (const id of ['subA','owner']) { login(id); assert.equal((await audit.getEntryHistory('transactions','legacy')).rows.length,2); assert.equal((await audit.getVisibleEntryAudit()).length,2); }
-    for (const id of ['staffB','subB','otherOwner']) { login(id); await assert.rejects(audit.getEntryHistory('transactions','legacy'),/permission/); assert.equal((await audit.getVisibleEntryAudit()).length,0); }
+    for (const id of ['staffA','staffB','subB','otherOwner']) { login(id); await assert.rejects(audit.getEntryHistory('transactions','legacy'),/permission/); assert.equal((await audit.getVisibleEntryAudit()).length,0); }
   });
   await check('sideways and upward changes rejected in data layer, including generic writer', async () => {
     for (const actor of ['staffB','subB','otherOwner']) {
@@ -136,8 +163,9 @@ async function check(name, test) { await test(); passed++; console.info('PASS ' 
     assert.equal(auditCount(),2);
   });
   await check('second edit retains full chain; unchanged saves add nothing', async () => {
-    login('owner'); await tx.updateTransaction('legacy','owner',{amount_paisa:123456});
-    login('subA'); const h = await audit.getEntryHistory('transactions','legacy');
+    login('subA'); await tx.updateTransaction('legacy','subA',{amount_paisa:123456});
+    login('owner'); const h = await audit.getEntryHistory('transactions','legacy');
+    login('subA');
     assert.equal(h.rows.length,3); assert.equal(h.rows[2].old_value_json,'30000'); assert.equal(h.rows[2].new_value_json,'123456');
     assert.notEqual(h.rows[2].change_group_id,h.rows[0].change_group_id);
     await tx.updateTransaction('legacy','subA',{amount_paisa:123456}); assert.equal(auditCount(),3);
@@ -162,19 +190,21 @@ async function check(name, test) { await test(); passed++; console.info('PASS ' 
   await check('removed owner entries remain accessible; removed actor rejected', async () => {
     sqlite.exec("UPDATE users SET is_deleted=1 WHERE id='subA'");
     await assert.rejects(tx.updateTransaction('legacy','subA',{notes:'removed'}),/no longer/);
-    login('staffA'); await tx.updateTransaction('legacy','staffA',{notes:'kept owner'});
+    // A removed person's entries stay VIEWABLE by the owner above them, but nobody may edit them.
+    login('owner'); await assert.rejects(tx.updateTransaction('legacy','owner',{notes:'kept owner'}),/Only the person who created it/);
+    login('staffA'); await assert.rejects(tx.updateTransaction('legacy','staffA',{notes:'peer'}),/do not have permission/);
     login('owner'); assert.ok((await audit.getEntryHistory('transactions','legacy')).rows.length);
     sqlite.exec("UPDATE users SET is_deleted=0 WHERE id='subA'");
   });
   await check('soft delete preserves row; normal query hides it; ActivityLog history still opens', async () => {
-    login('staffA'); await tx.deleteTransaction('legacy','staffA');
+    login('subA'); await tx.deleteTransaction('legacy','subA');
     assert.equal(await tx.getTransactionById('legacy'),null);
     const row=one("SELECT * FROM transactions WHERE id='legacy'"); assert.equal(row.isDeleted,1); assert.equal(row.is_deleted,1); assert.equal(row.amount_paisa,123456);
-    for (const id of ['subA','staffA','owner']) {
+    for (const id of ['subA','owner']) {
       login(id); const h=await audit.getEntryHistory('transactions','legacy');
       assert.equal(h.rows.at(-1).action,'deleted'); assert.ok((await audit.getVisibleEntryAudit()).some(r=>r.entry_id==='legacy'));
     }
-    await assert.rejects(tx.updateTransaction('legacy','owner',{notes:'resurrect'}),/deleted/);
+    login('subA'); await assert.rejects(tx.updateTransaction('legacy','subA',{notes:'resurrect'}),/deleted/);
   });
   await check('audit UPDATE, DELETE, REPLACE and shared-writer mutations rejected', async () => {
     assert.throws(()=>sqlite.exec("UPDATE entry_audit SET actor_name='Forged'"),/cannot be changed/);

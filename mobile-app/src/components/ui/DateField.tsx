@@ -6,7 +6,8 @@ import {
 } from 'react-native';
 import DateTimePicker, { DateTimePickerEvent } from '@react-native-community/datetimepicker';
 import { localDate, parseDateValue, formatDisplayDate } from '../../utils/dates';
-import { Colors } from '../../theme';
+import { Icon } from './primitives';
+import { color, space, iconSize, touchTarget, type as typeScale } from '../../theme/tokens';
 
 /**
  * Shared date field — replaces the hand-typed "YYYY-MM-DD" TextInputs.
@@ -14,7 +15,7 @@ import { Colors } from '../../theme';
  * It deliberately has NO box styling of its own: the host screen passes the very
  * `styles.input` its other fields use, so the field keeps the same box, border,
  * height and position in the form. Only the contents change, to the calendar glyph
- * the Bill Book already used plus the formatted date.
+ * calendar icon plus the formatted date.
  *
  * value / onChange speak YYYY-MM-DD, so call sites keep their existing state and
  * defaults. An invalid date is unreachable — the picker only emits real dates.
@@ -59,7 +60,7 @@ export const DateField: React.FC<Props> = ({
         accessibilityRole="button"
         accessibilityLabel={value ? t('dateAccessible', { date: formatDisplayDate(value) }) : prompt}
       >
-        <Text style={styles.glyph}>📅</Text>
+        <Icon name="calendar" size={iconSize.sm} tint={color.accent} />
         <Text style={[styles.text, !value && styles.placeholder, textStyle]} numberOfLines={1}>
           {value ? formatDisplayDate(value) : prompt}
         </Text>
@@ -100,12 +101,11 @@ export const DateField: React.FC<Props> = ({
 };
 
 const styles = StyleSheet.create({
-  row: { flexDirection: 'row', alignItems: 'center' },
-  glyph: { fontSize: 16, color: Colors.primaryLight, marginRight: 8 },
-  text: { flex: 1, fontSize: 15, color: Colors.textWhite },
-  placeholder: { color: Colors.textGray },
-  modalBg: { flex: 1, backgroundColor: 'rgba(0,0,0,0.5)', justifyContent: 'flex-end' },
-  sheet: { backgroundColor: Colors.bgCard, paddingBottom: 24 },
-  doneBtn: { padding: 16, alignItems: 'center' },
-  doneText: { color: Colors.primaryLight, fontWeight: '700', fontSize: 15 },
+  row: { flexDirection: 'row', alignItems: 'center', gap: space.sm },
+  text: { ...typeScale.body, flex: 1, color: color.textPrimary },
+  placeholder: { color: color.textMuted },
+  modalBg: { flex: 1, backgroundColor: color.scrim, justifyContent: 'flex-end' },
+  sheet: { backgroundColor: color.surface, paddingBottom: space.xxl },
+  doneBtn: { minHeight: touchTarget, padding: space.lg, alignItems: 'center', justifyContent: 'center' },
+  doneText: { ...typeScale.bodyMedium, color: color.accent },
 });

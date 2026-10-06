@@ -43,6 +43,33 @@ export const addStaffSalaryTransaction = async (
   return { ...data, synced: 0 } as StaffSalaryTransaction;
 };
 
+export interface SalaryTotals {
+  /** integer paisa given to the staff member (salary paid / cash out) */
+  totalCashOut: number;
+  /** integer paisa received back from them */
+  totalCashIn: number;
+  count: number;
+}
+
+/**
+ * Salary totals as SQL aggregates over the WHOLE filtered set — never summed from the
+ * rows a screen happens to have loaded, so the figures stay right whatever the list
+ * does. `month` is 'YYYY-MM'; omit it (or pass 'ALL') for all time.
+ */
+export const getSalaryTotals = async (staffId: string, month?: string): Promise<SalaryTotals> => {
+  const db = await getDatabase();
+  const byMonth = !!month && month !== 'ALL';
+  const row = await db.getFirstAsync<{ out_paisa: number; in_paisa: number; n: number }>(
+    `SELECT COALESCE(SUM(CASE WHEN type = 'cash_out' THEN amount ELSE 0 END), 0) AS out_paisa,
+            COALESCE(SUM(CASE WHEN type = 'cash_in'  THEN amount ELSE 0 END), 0) AS in_paisa,
+            COUNT(*) AS n
+       FROM staff_salary_transactions
+      WHERE staff_id = ? AND is_deleted = 0${byMonth ? ' AND (month = ? OR date LIKE ?)' : ''}`,
+    byMonth ? [staffId, month as string, `${month}%`] : [staffId]
+  );
+  return { totalCashOut: row?.out_paisa ?? 0, totalCashIn: row?.in_paisa ?? 0, count: row?.n ?? 0 };
+};
+
 export const getSalaryTransactionsByStaffId = async (
   staffId: string
 ): Promise<StaffSalaryTransaction[]> => {

@@ -1,4 +1,5 @@
 import React, { useCallback, useState } from 'react';
+import { useLanguageStore } from '../../store/useLanguageStore';
 import { useFocusEffect } from '@react-navigation/native';
 import { EntryAuditRow, getVisibleEntryAudit } from '../../services/database/entryAuditDb';
 import { EntryHistoryModal, AuditFields, groupAuditRows } from '../../components/ui/EntryHistory';
@@ -7,12 +8,12 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { useAuthStore } from '../../store/authStore';
 import { useActivityStore } from '../../store/useActivityStore';
 import { ActivityLog } from '../../types/activity.types';
-import { formatCurrency } from '../../utils/calculations';
-
-const ORANGE = '#FF6B35';
+import { Icon, AmountText, IconName } from '../../components/ui/primitives';
+import { color, space, radius, hairline, touchTarget, iconSize, type as typeScale } from '../../theme/tokens';
 
 export const ActivityLogScreen = ({ navigation }: any) => {
   const { user } = useAuthStore();
+  const { t } = useLanguageStore();
   const { activities, loading, loadingMore, cursor, fetchActivities, loadMoreActivities } = useActivityStore();
 
   const [auditRows, setAuditRows] = useState<EntryAuditRow[]>([]);
@@ -44,69 +45,52 @@ export const ActivityLogScreen = ({ navigation }: any) => {
       .filter(item => !oldestLoaded || item.timestamp >= oldestLoaded),
   ].sort((a, b) => b.timestamp.localeCompare(a.timestamp));
 
-  const getEntityIcon = (type: string) => {
-    switch (type) {
-      case 'cash': return { icon: '💰', color: '#10B981' }; // Green
-      case 'stock': return { icon: '📦', color: '#F59E0B' }; // Orange
-      case 'bill': return { icon: '📃', color: '#3B82F6' }; // Blue
-      case 'staff': return { icon: '👥', color: '#8B5CF6' }; // Purple
-      case 'expense': return { icon: '💸', color: '#EF4444' }; // Red
-      case 'auth': return { icon: '🔑', color: '#6B7280' }; // Gray
-      default: return { icon: '📋', color: '#9CA3AF' };
-    }
+  const ENTITY_ICON: Record<string, IconName> = {
+    cash: 'dollar-sign', stock: 'package', bill: 'file-text', staff: 'users', expense: 'credit-card', auth: 'key', supplier: 'truck',
   };
 
-  const renderItem = ({ item }: { item: ActivityLog }) => {
-    const { icon, color } = getEntityIcon(item.entity_type);
-    
-    return (
-      <View style={styles.logCard}>
-        <View style={[styles.iconWrap, { backgroundColor: color + '20' }]}>
-          <Text style={{ fontSize: 20 }}>{icon}</Text>
-        </View>
-        <View style={styles.logContent}>
-          <Text style={styles.logText}>
-            <Text style={{ fontWeight: '700', color: '#111827' }}>{item.user_name}</Text> {item.description}
+  const renderItem = ({ item }: { item: ActivityLog }) => (
+    <View style={styles.logCard}>
+      <View style={styles.iconWrap}>
+        <Icon name={ENTITY_ICON[item.entity_type] || 'activity'} size={iconSize.md} tint={color.textSecondary} />
+      </View>
+      <View style={styles.logContent}>
+        <Text style={styles.logText}>
+          <Text style={styles.actor}>{item.user_name}</Text> {item.description}
+        </Text>
+        <View style={styles.logBottomRow}>
+          {item.amount ? <AmountText paisa={item.amount} size="label" tone={item.entity_type === 'expense' ? 'out' : 'neutral'} /> : <View />}
+          <Text style={styles.timestamp}>
+            {new Date(item.timestamp).toLocaleString('en-PK', { dateStyle: 'medium', timeStyle: 'short' })}
           </Text>
-          <View style={styles.logBottomRow}>
-            {item.amount ? (
-              <Text style={{ color: color, fontWeight: '600', fontSize: 12 }}>
-                {formatCurrency(item.amount)}
-              </Text>
-            ) : <View />}
-            <Text style={styles.timestamp}>
-              {new Date(item.timestamp).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' })}
-            </Text>
-          </View>
         </View>
       </View>
-    );
-  };
+    </View>
+  );
 
   return (
     <SafeAreaView style={styles.safe}>
-      {/* Header */}
       <View style={styles.header}>
-        <TouchableOpacity onPress={() => navigation.goBack()} style={styles.backBtn}>
-          <Text style={styles.backArrow}>{'<'}</Text>
+        <TouchableOpacity onPress={() => navigation.goBack()} style={styles.backBtn} accessibilityRole="button" accessibilityLabel={t('commonBack')}>
+          <Icon name="chevron-left" size={iconSize.lg} tint={color.textPrimary} />
         </TouchableOpacity>
-        <Text style={styles.headerTitle}>Activity Log</Text>
-        <View style={{ width: 40 }} />
+        <Text style={styles.headerTitle} numberOfLines={1}>{t('alTitle')}</Text>
+        <View style={styles.backBtn} />
       </View>
 
-      {/* Filters Placeholder */}
       <View style={styles.filterBar}>
-        <Text style={{ color: '#4B5563', fontSize: 13, fontWeight: '500' }}>Showing Recent Activities</Text>
+        <Text style={styles.filterText}>{t('alSubtitle')}</Text>
       </View>
 
-      {!!auditError && <Text style={{ padding: 12, color: '#EF4444' }}>{auditError}</Text>}
+      {!!auditError && <Text style={styles.error}>{auditError}</Text>}
       {loading || auditLoading ? (
         <View style={styles.center}>
-          <ActivityIndicator size="large" color={ORANGE} />
+          <ActivityIndicator size="large" color={color.accent} />
         </View>
       ) : feed.length === 0 ? (
         <View style={styles.center}>
-          <Text style={{ color: '#9CA3AF', fontSize: 16 }}>No activity yet.</Text>
+          <Icon name="activity" size={40} tint={color.textMuted} />
+          <Text style={styles.emptyText}>{t('alEmpty')}</Text>
         </View>
       ) : (
         <FlatList
@@ -114,18 +98,24 @@ export const ActivityLogScreen = ({ navigation }: any) => {
           keyExtractor={item => item.id}
           renderItem={({ item }) => item.audit ? (
             <TouchableOpacity style={styles.logCard} onPress={() => setSelected(item.audit![0])}>
+              <View style={styles.iconWrap}>
+                <Icon name="edit-3" size={iconSize.md} tint={color.attention} />
+              </View>
               <View style={styles.logContent}>
-                <Text style={styles.logText}><Text style={{ fontWeight: '700', color: '#111827' }}>{item.audit[0].actor_name}</Text> {item.audit[0].action} a Khata entry</Text>
+                <Text style={styles.logText}><Text style={styles.actor}>{item.audit[0].actor_name}</Text> {item.audit[0].action} a Khata entry</Text>
                 <AuditFields rows={item.audit} />
-                <Text style={styles.timestamp}>{new Date(item.timestamp).toLocaleString()}</Text>
-                <Text style={{ color: ORANGE, fontWeight: '600', marginTop: 4 }}>View entry and full history</Text>
+                <Text style={styles.timestamp}>{new Date(item.timestamp).toLocaleString('en-PK', { dateStyle: 'medium', timeStyle: 'short' })}</Text>
+                <View style={styles.linkRow}>
+                  <Text style={styles.link}>{t('alViewEntry')}</Text>
+                  <Icon name="chevron-right" size={iconSize.sm} tint={color.accent} />
+                </View>
               </View>
             </TouchableOpacity>
           ) : renderItem({ item: item.activity! })}
-          contentContainerStyle={{ padding: 12 }}
+          contentContainerStyle={styles.listContent}
           onEndReached={() => { if (user) loadMoreActivities(user.id); }}
           onEndReachedThreshold={0.5}
-          ListFooterComponent={loadingMore ? <ActivityIndicator style={{ margin: 16 }} color={ORANGE} /> : null}
+          ListFooterComponent={loadingMore ? <ActivityIndicator style={styles.footerSpinner} color={color.accent} /> : null}
         />
       )}
       {selected && <EntryHistoryModal table={selected.book_table} entryId={selected.entry_id} visible={true} onClose={() => setSelected(null)} />}
@@ -134,28 +124,33 @@ export const ActivityLogScreen = ({ navigation }: any) => {
 };
 
 const styles = StyleSheet.create({
-  safe: { flex: 1, backgroundColor: '#F3F4F6' },
+  safe: { flex: 1, backgroundColor: color.surface },
   header: {
     flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
-    backgroundColor: ORANGE, paddingHorizontal: 16, height: 60,
+    paddingHorizontal: space.md, minHeight: 56, borderBottomWidth: hairline, borderBottomColor: color.border,
   },
-  backBtn: { width: 40, justifyContent: 'center' },
-  backArrow: { fontSize: 24, color: '#fff', fontWeight: '400' },
-  headerTitle: { fontSize: 16, fontWeight: '700', color: '#fff' },
-
-  filterBar: {
-    backgroundColor: '#fff', padding: 12, borderBottomWidth: 1, borderBottomColor: '#E5E7EB'
-  },
-
-  center: { flex: 1, justifyContent: 'center', alignItems: 'center' },
-
+  backBtn: { width: touchTarget, height: touchTarget, alignItems: 'center', justifyContent: 'center' },
+  headerTitle: { ...typeScale.heading, fontSize: 18, color: color.textPrimary, flex: 1, textAlign: 'center' },
+  filterBar: { backgroundColor: color.surfaceRaised, paddingHorizontal: space.lg, paddingVertical: space.md, borderBottomWidth: hairline, borderBottomColor: color.border },
+  filterText: { ...typeScale.label, color: color.textSecondary },
+  error: { ...typeScale.body, padding: space.md, color: color.attention },
+  center: { flex: 1, justifyContent: 'center', alignItems: 'center', gap: space.md },
+  emptyText: { ...typeScale.body, color: color.textSecondary },
+  listContent: { padding: space.md },
+  footerSpinner: { margin: space.lg },
   logCard: {
-    flexDirection: 'row', backgroundColor: '#fff', padding: 12, borderRadius: 8,
-    marginBottom: 8, shadowColor: '#000', shadowOffset: { width: 0, height: 1 }, shadowOpacity: 0.05, elevation: 1
+    flexDirection: 'row', gap: space.md, backgroundColor: color.surface, padding: space.md, borderRadius: radius.md,
+    marginBottom: space.sm, borderWidth: hairline, borderColor: color.border,
   },
-  iconWrap: { width: 40, height: 40, borderRadius: 20, justifyContent: 'center', alignItems: 'center', marginRight: 12 },
-  logContent: { flex: 1 },
-  logText: { fontSize: 14, color: '#374151', lineHeight: 20 },
-  logBottomRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginTop: 4 },
-  timestamp: { fontSize: 12, color: '#9CA3AF' }
+  iconWrap: {
+    width: 40, height: 40, borderRadius: radius.pill, justifyContent: 'center', alignItems: 'center',
+    backgroundColor: color.surfaceRaised,
+  },
+  logContent: { flex: 1, gap: space.xs },
+  logText: { ...typeScale.body, fontSize: 14, lineHeight: 20, color: color.textSecondary },
+  actor: { ...typeScale.bodyMedium, fontSize: 14, color: color.textPrimary },
+  logBottomRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', gap: space.md },
+  timestamp: { ...typeScale.caption, color: color.textMuted },
+  linkRow: { flexDirection: 'row', alignItems: 'center', gap: 2, minHeight: touchTarget },
+  link: { ...typeScale.bodyMedium, fontSize: 14, color: color.accent },
 });

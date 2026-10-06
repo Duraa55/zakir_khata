@@ -1,7 +1,6 @@
 import React from 'react';
 import { ScrollView, View, KeyboardAvoidingView, Platform, StyleProp, ViewStyle } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { useBottomTabBarHeight } from '@react-navigation/bottom-tabs';
 
 interface ScreenContainerProps {
   children: React.ReactNode;
@@ -11,7 +10,7 @@ interface ScreenContainerProps {
   contentContainerStyle?: StyleProp<ViewStyle>;
 }
 
-// Inner component that calls useBottomTabBarHeight unconditionally (Rules of Hooks)
+// Inner component: renders the scrolling (or static) body with the given clearance.
 const ScreenContainerInner = ({
   children,
   scrollable,
@@ -50,44 +49,6 @@ const ScreenContainerInner = ({
   );
 };
 
-// Wrapper that safely reads tab bar height when hasTabBar=true
-const WithTabBar = ({
-  children,
-  scrollable,
-  style,
-  contentContainerStyle,
-  insetBottom,
-}: {
-  children: React.ReactNode;
-  scrollable: boolean;
-  style?: StyleProp<ViewStyle>;
-  contentContainerStyle?: StyleProp<ViewStyle>;
-  insetBottom: number;
-}) => {
-  let tabBarHeight = 0;
-  try {
-    // This hook is only valid inside a Bottom Tab navigator.
-    // We wrap it here so it is called unconditionally within this component.
-    tabBarHeight = useBottomTabBarHeight(); // eslint-disable-line react-hooks/rules-of-hooks
-  } catch (_) {
-    tabBarHeight = 0;
-  }
-
-  const effectiveTabBarHeight = Math.max(tabBarHeight, 80) + 16;
-  const bottomPadding = Math.max(insetBottom, 16) + effectiveTabBarHeight + 35;
-
-  return (
-    <ScreenContainerInner
-      scrollable={scrollable}
-      style={style}
-      contentContainerStyle={contentContainerStyle}
-      bottomPadding={bottomPadding}
-    >
-      {children}
-    </ScreenContainerInner>
-  );
-};
-
 export const ScreenContainer = ({
   children,
   scrollable = true,
@@ -97,20 +58,16 @@ export const ScreenContainer = ({
 }: ScreenContainerProps) => {
   const insets = useSafeAreaInsets();
 
-  if (hasTabBar) {
-    return (
-      <WithTabBar
-        scrollable={scrollable}
-        style={style}
-        contentContainerStyle={contentContainerStyle}
-        insetBottom={insets.bottom}
-      >
-        {children}
-      </WithTabBar>
-    );
-  }
-
-  const bottomPadding = Math.max(insets.bottom, 16) + 35;
+  /**
+   * With a flush tab bar the navigator has already shrunk this screen's viewport by
+   * the bar's height, and the bar itself absorbs the safe-area inset — so a tab
+   * screen needs no compensation at all, only ordinary breathing room. Adding the
+   * bar height back (as this used to) left ~147px of dead space under every
+   * scrollable tab screen.
+   *
+   * A screen with no tab bar underneath still has to clear the home indicator.
+   */
+  const bottomPadding = hasTabBar ? 16 : Math.max(insets.bottom, 16) + 35;
 
   return (
     <ScreenContainerInner

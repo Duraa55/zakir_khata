@@ -1,17 +1,30 @@
 import React, { useState, useEffect } from 'react';
-import { View, Text, TouchableOpacity, ScrollView, RefreshControl, Alert, Linking, Platform } from 'react-native';
+import { useLanguageStore } from '../../store/useLanguageStore';
+import { View, Text, TouchableOpacity, ScrollView, RefreshControl, Alert, Linking, Platform, StyleSheet } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import { StackScreenProps } from '@react-navigation/stack';
 import { useAuthStore } from '../../store/authStore';
 import { Reminder, getReminders, updateReminderStatus, deleteReminder } from '../../services/database/reminderDb';
-import { getBillsByUserId } from '../../services/database/billDb';
+import { getUnpaidBills } from '../../services/database/billDb';
 import { formatCurrency } from '../../utils/calculations';
+import { internationalPhone } from '../../utils/phone';
 import { format, isPast, isToday } from 'date-fns';
+import { Icon, IconName } from '../../components/ui/primitives';
+import { color, space, radius, hairline, touchTarget, iconSize, type as typeScale } from '../../theme/tokens';
 
 type Props = StackScreenProps<any, any>;
 
+const TYPE_ICON: Record<string, IconName> = {
+  payment: 'dollar-sign', rent: 'home', utility: 'zap', low_stock: 'package', invoice: 'file-text', backup: 'hard-drive',
+};
+
+/** A reminder shown for an unpaid bill — read-only, derived from the bill itself. */
+type BillReminder = Reminder & { phone?: string | null };
+
 export const RemindersCenterScreen: React.FC<Props> = ({ navigation }) => {
   const user = useAuthStore(state => state.user);
-  const [reminders, setReminders] = useState<Reminder[]>([]);
+  const { t } = useLanguageStore();
+  const [reminders, setReminders] = useState<BillReminder[]>([]);
   const [loading, setLoading] = useState(true);
   const [activeTab, setActiveTab] = useState<'pending' | 'completed'>('pending');
 
@@ -20,31 +33,29 @@ export const RemindersCenterScreen: React.FC<Props> = ({ navigation }) => {
     setLoading(true);
     try {
       const data = await getReminders(user.id, activeTab);
-      
-      const bills = await getBillsByUserId(user.id);
-      const filteredBills = activeTab === 'pending' ? bills.filter(b => b.due > 0) : bills.filter(b => b.due === 0);
-      
-      const mappedBills: Reminder[] = filteredBills.map(b => ({
+      // Unpaid posted bills appear as invoice reminders under Pending only — a paid bill
+      // is not a reminder. (This used to load EVERY bill with all its lines and filter in
+      // JavaScript, drafts and holds included.)
+      const bills = activeTab === 'pending' ? await getUnpaidBills(user.id) : [];
+      const mappedBills: BillReminder[] = bills.map(b => ({
         id: `bill_ref_${b.id}`,
         user_id: b.user_id,
         title: b.party_name || 'Customer',
-        description: `Bill #${b.bill_no}\nTotal: ${formatCurrency(b.total)} • Due: ${formatCurrency(b.due)}`,
+        description: `Bill #${b.bill_no} · total ${formatCurrency(b.total)} · due ${formatCurrency(b.due)}`,
         type: 'invoice',
         due_date: b.bill_date,
-        status: activeTab,
+        status: 'pending',
         synced: 1,
         is_deleted: 0,
         deleted_at: null,
-        created_at: b.created_at || new Date().toISOString(),
-        updated_at: b.updated_at || b.created_at || new Date().toISOString()
-      }));
-
-      // Sort combined by due date
+        created_at: b.created_at || b.bill_date,
+        updated_at: b.created_at || b.bill_date,
+        phone: b.party_phone,
+      } as BillReminder));
       const combined = [...data, ...mappedBills].sort((a, b) => new Date(a.due_date).getTime() - new Date(b.due_date).getTime());
-      
       setReminders(combined);
     } catch (err) {
-      console.error(err);
+      if (__DEV__) console.error(err);
     } finally {
       setLoading(false);
     }
@@ -52,6 +63,7 @@ export const RemindersCenterScreen: React.FC<Props> = ({ navigation }) => {
 
   useEffect(() => {
     const unsubscribe = navigation.addListener('focus', loadReminders);
+    loadReminders();
     return unsubscribe;
   }, [navigation, activeTab, user]);
 
@@ -62,119 +74,82 @@ export const RemindersCenterScreen: React.FC<Props> = ({ navigation }) => {
       await updateReminderStatus(reminder.id, user.id, newStatus);
       loadReminders();
     } catch (err) {
-      Alert.alert('Error', 'Could not update reminder status');
+      Alert.alert(t('commonError'), t('rcUpdateFailed'));
     }
   };
 
   const handleDelete = (id: string) => {
-    Alert.alert('Delete Reminder', 'Are you sure you want to delete this reminder?', [
-      { text: 'Cancel', style: 'cancel' },
-      { 
-        text: 'Delete', 
-        style: 'destructive',
+    Alert.alert(t('rcDelete'), t('rcDeleteConfirm'), [
+      { text: t('commonCancel'), style: 'cancel' },
+      {
+        text: 'Delete', style: 'destructive',
         onPress: async () => {
           if (!user) return;
           try {
             await deleteReminder(id, user.id);
             loadReminders();
           } catch (err) {
-            Alert.alert('Error', 'Could not delete reminder');
+            Alert.alert(t('commonError'), t('rcDeleteFailed'));
           }
         }
       }
     ]);
   };
 
-  const handleSendReminder = (reminder: Reminder) => {
-    Alert.alert(
-      'Send Reminder',
-      'How would you like to send this reminder?',
-      [
-        {
-          text: 'WhatsApp',
-          onPress: () => {
-            const msg = `Reminder: ${reminder.title}\nDue: ${format(new Date(reminder.due_date), 'dd MMM yyyy')}\n${reminder.description || ''}`;
-            Linking.openURL(`whatsapp://send?text=${encodeURIComponent(msg)}`);
-          }
-        },
-        {
-          text: 'SMS',
-          onPress: () => {
-            const msg = `Reminder: ${reminder.title}\nDue: ${format(new Date(reminder.due_date), 'dd MMM yyyy')}\n${reminder.description || ''}`;
-            const url = Platform.OS === 'ios' ? `sms:&body=${encodeURIComponent(msg)}` : `sms:?body=${encodeURIComponent(msg)}`;
-            Linking.openURL(url);
-          }
-        },
-        { text: 'Cancel', style: 'cancel' }
-      ]
-    );
+  const safeDate = (d: string) => { try { return format(new Date(d), 'dd MMM yyyy'); } catch { return d; } };
+
+  const handleSendReminder = (reminder: BillReminder) => {
+    const msg = `Reminder: ${reminder.title}\nDue: ${safeDate(reminder.due_date)}\n${reminder.description || ''}`;
+    // Address the customer directly when the bill has their number (international form).
+    const intl = internationalPhone(reminder.phone);
+    Alert.alert(t('rcSendTitle'), t('rcSendHow'), [
+      { text: t('supWhatsApp'), onPress: () => Linking.openURL(`whatsapp://send?${intl ? `phone=${intl}&` : ''}text=${encodeURIComponent(msg)}`).catch(() => Alert.alert(t('remNoWhatsAppTitle'), 'WhatsApp is not installed on this phone.')) },
+      { text: t('remSms'), onPress: () => Linking.openURL(`sms:${intl ? '+' + intl : ''}${Platform.OS === 'ios' ? '&' : '?'}body=${encodeURIComponent(msg)}`) },
+      { text: t('commonCancel'), style: 'cancel' },
+    ]);
   };
 
-  const getIconForType = (type: string) => {
-    switch(type) {
-      case 'payment': return '💰';
-      case 'rent': return '🏠';
-      case 'utility': return '⚡';
-      case 'low_stock': return '📦';
-      case 'invoice': return '🧾';
-      case 'backup': return '💾';
-      default: return '🔔';
-    }
-  };
-
-  const renderReminder = (reminder: Reminder) => {
-    const isOverdue = isPast(new Date(reminder.due_date)) && !isToday(new Date(reminder.due_date));
-    const isDueToday = isToday(new Date(reminder.due_date));
-    
-    let dateColor = 'text-gray-500';
-    if (reminder.status === 'pending') {
-      if (isOverdue) dateColor = 'text-red-600 font-bold';
-      else if (isDueToday) dateColor = 'text-amber-600 font-bold';
-    }
+  const renderReminder = (reminder: BillReminder) => {
+    const due = new Date(reminder.due_date);
+    const isOverdue = isPast(due) && !isToday(due);
+    const isDueToday = isToday(due);
+    const pending = reminder.status === 'pending';
+    // Overdue / due today need attention: amber, never red (red means money).
+    const flag = pending && (isOverdue || isDueToday);
+    const fromBill = reminder.id.startsWith('bill_ref_');
 
     return (
-      <View key={reminder.id} className="bg-white p-4 rounded-xl shadow-sm mb-3 border border-gray-100">
-        <View className="flex-row justify-between items-start">
-          <View className="flex-row items-center flex-1">
-            <Text className="text-2xl mr-3">{getIconForType(reminder.type)}</Text>
-            <View className="flex-1 pr-2">
-              <Text className="text-lg font-semibold text-gray-800" numberOfLines={1}>{reminder.title}</Text>
-              {reminder.description && <Text className="text-gray-500 text-sm mt-1">{reminder.description}</Text>}
-              <Text className={`text-sm mt-2 ${dateColor}`}>
-                Due: {format(new Date(reminder.due_date), 'dd MMM yyyy')}
-                {isOverdue && reminder.status === 'pending' && ' (Overdue)'}
-                {isDueToday && reminder.status === 'pending' && ' (Today)'}
-              </Text>
-            </View>
+      <View key={reminder.id} style={[styles.card, flag && styles.cardAttention]}>
+        <View style={styles.cardTop}>
+          <View style={styles.iconWrap}>
+            <Icon name={TYPE_ICON[reminder.type] || 'bell'} size={iconSize.md} tint={color.textSecondary} />
+          </View>
+          <View style={styles.cardText}>
+            <Text style={styles.title} numberOfLines={1}>{reminder.title}</Text>
+            {!!reminder.description && <Text style={styles.desc}>{reminder.description}</Text>}
+            <Text style={[styles.due, flag && styles.dueAttention]}>
+              Due {safeDate(reminder.due_date)}{pending && isOverdue ? ' · overdue' : ''}{pending && isDueToday ? ' · today' : ''}
+            </Text>
           </View>
         </View>
-        
-        <View className="flex-row mt-4 pt-3 border-t border-gray-100 justify-between items-center">
-          <View className="flex-row">
-            {!reminder.id.startsWith('bill_ref_') && (
-              <TouchableOpacity 
-                className={`px-4 py-2 rounded-lg mr-2 flex-row items-center ${reminder.status === 'completed' ? 'bg-gray-100' : 'bg-emerald-50'}`}
-                onPress={() => handleToggleStatus(reminder)}
-              >
-                <Text className={reminder.status === 'completed' ? 'text-gray-600' : 'text-emerald-700 font-medium'}>
-                  {reminder.status === 'completed' ? 'Undo' : '✓ Complete'}
-                </Text>
-              </TouchableOpacity>
-            )}
-            
-            {reminder.status === 'pending' && ['payment', 'invoice'].includes(reminder.type) && (
-              <TouchableOpacity 
-                className="px-4 py-2 rounded-lg bg-blue-50 flex-row items-center"
-                onPress={() => handleSendReminder(reminder)}
-              >
-                <Text className="text-blue-700 font-medium">📤 Send</Text>
-              </TouchableOpacity>
-            )}
-          </View>
 
-          {!reminder.id.startsWith('bill_ref_') && (
-            <TouchableOpacity onPress={() => handleDelete(reminder.id)} className="p-2">
-              <Text className="text-red-500">🗑️</Text>
+        <View style={styles.actions}>
+          {!fromBill && (
+            <TouchableOpacity style={styles.actionBtn} onPress={() => handleToggleStatus(reminder)} accessibilityRole="button">
+              <Icon name={pending ? 'check' : 'rotate-ccw'} size={iconSize.sm} tint={color.accent} />
+              <Text style={styles.actionText}>{pending ? 'Complete' : 'Undo'}</Text>
+            </TouchableOpacity>
+          )}
+          {pending && ['payment', 'invoice'].includes(reminder.type) && (
+            <TouchableOpacity style={styles.actionBtn} onPress={() => handleSendReminder(reminder)} accessibilityRole="button">
+              <Icon name="send" size={iconSize.sm} tint={color.accent} />
+              <Text style={styles.actionText}>{t('rcSend')}</Text>
+            </TouchableOpacity>
+          )}
+          <View style={styles.flex} />
+          {!fromBill && (
+            <TouchableOpacity onPress={() => handleDelete(reminder.id)} style={styles.iconBtn} accessibilityRole="button" accessibilityLabel={t('rcDelete')}>
+              <Icon name="trash-2" size={iconSize.sm} tint={color.textSecondary} />
             </TouchableOpacity>
           )}
         </View>
@@ -183,47 +158,88 @@ export const RemindersCenterScreen: React.FC<Props> = ({ navigation }) => {
   };
 
   return (
-    <View className="flex-1 bg-gray-50">
-      {/* Tabs */}
-      <View className="flex-row bg-white pt-2 px-4 shadow-sm pb-0">
-        <TouchableOpacity 
-          className={`flex-1 pb-3 items-center border-b-2 ${activeTab === 'pending' ? 'border-blue-600' : 'border-transparent'}`}
-          onPress={() => setActiveTab('pending')}
-        >
-          <Text className={`font-semibold ${activeTab === 'pending' ? 'text-blue-600' : 'text-gray-500'}`}>Pending</Text>
+    <SafeAreaView style={styles.safe} edges={['top']}>
+      <View style={styles.header}>
+        <TouchableOpacity onPress={() => navigation.goBack()} style={styles.iconBtn} accessibilityRole="button" accessibilityLabel={t('commonBack')}>
+          <Icon name="chevron-left" size={iconSize.lg} tint={color.textPrimary} />
         </TouchableOpacity>
-        <TouchableOpacity 
-          className={`flex-1 pb-3 items-center border-b-2 ${activeTab === 'completed' ? 'border-blue-600' : 'border-transparent'}`}
-          onPress={() => setActiveTab('completed')}
-        >
-          <Text className={`font-semibold ${activeTab === 'completed' ? 'text-blue-600' : 'text-gray-500'}`}>Completed</Text>
-        </TouchableOpacity>
+        <Text style={styles.headerTitle} numberOfLines={1}>{t('rcTitle')}</Text>
+        <View style={styles.iconBtn} />
       </View>
 
-      <ScrollView 
-        className="flex-1 px-4 pt-4"
-        refreshControl={<RefreshControl refreshing={loading} onRefresh={loadReminders} />}
+      <View style={styles.tabs}>
+        {(['pending', 'completed'] as const).map(t => (
+          <TouchableOpacity key={t} style={[styles.tab, activeTab === t && styles.tabActive]} onPress={() => setActiveTab(t)} accessibilityRole="tab" accessibilityState={{ selected: activeTab === t }}>
+            <Text style={[styles.tabText, activeTab === t && styles.tabTextActive]}>{t === 'pending' ? 'Pending' : 'Completed'}</Text>
+          </TouchableOpacity>
+        ))}
+      </View>
+
+      <ScrollView
+        style={styles.flex}
+        contentContainerStyle={styles.content}
+        refreshControl={<RefreshControl refreshing={loading} onRefresh={loadReminders} tintColor={color.accent} />}
       >
         {reminders.length === 0 && !loading ? (
-          <View className="items-center justify-center py-20">
-            <Text className="text-6xl mb-4">✨</Text>
-            <Text className="text-xl text-gray-400 font-medium">No {activeTab} reminders</Text>
+          <View style={styles.empty}>
+            <Icon name="bell-off" size={40} tint={color.textMuted} />
+            <Text style={styles.emptyText}>No {activeTab} reminders</Text>
           </View>
         ) : (
           reminders.map(renderReminder)
         )}
-        <View className="h-20" />
       </ScrollView>
 
-      {/* FAB */}
-      <View className="absolute bottom-6 right-6">
-        <TouchableOpacity 
-          className="bg-blue-600 w-14 h-14 rounded-full items-center justify-center shadow-lg shadow-blue-400"
-          onPress={() => navigation.navigate('AddReminder')}
-        >
-          <Text className="text-white text-3xl font-light leading-none">+</Text>
-        </TouchableOpacity>
-      </View>
-    </View>
+      <TouchableOpacity style={styles.fab} onPress={() => navigation.navigate('AddReminder')} accessibilityRole="button" accessibilityLabel={t('rcAdd')}>
+        <Icon name="plus" size={iconSize.lg} tint={color.textInverse} />
+      </TouchableOpacity>
+    </SafeAreaView>
   );
 };
+
+const styles = StyleSheet.create({
+  safe: { flex: 1, backgroundColor: color.surface },
+  flex: { flex: 1 },
+  header: {
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
+    paddingHorizontal: space.md, minHeight: 56, borderBottomWidth: hairline, borderBottomColor: color.border,
+  },
+  iconBtn: { width: touchTarget, height: touchTarget, alignItems: 'center', justifyContent: 'center' },
+  headerTitle: { ...typeScale.heading, fontSize: 18, color: color.textPrimary, flex: 1, textAlign: 'center' },
+  tabs: { flexDirection: 'row', gap: space.sm, paddingHorizontal: space.lg, paddingTop: space.md },
+  tab: {
+    flex: 1, minHeight: touchTarget, borderRadius: radius.pill, borderWidth: hairline, borderColor: color.borderStrong,
+    alignItems: 'center', justifyContent: 'center',
+  },
+  tabActive: { backgroundColor: color.accent, borderColor: color.accent },
+  tabText: { ...typeScale.label, color: color.textSecondary },
+  tabTextActive: { color: color.textInverse, fontWeight: typeScale.bodyMedium.fontWeight },
+  content: { padding: space.lg, paddingBottom: 120 },
+  card: {
+    backgroundColor: color.surface, borderRadius: radius.md, padding: space.lg, marginBottom: space.md,
+    borderWidth: hairline, borderColor: color.border,
+  },
+  cardAttention: { borderColor: color.borderAttention },
+  cardTop: { flexDirection: 'row', gap: space.md, alignItems: 'flex-start' },
+  iconWrap: {
+    width: 40, height: 40, borderRadius: radius.pill, backgroundColor: color.surfaceRaised,
+    alignItems: 'center', justifyContent: 'center',
+  },
+  cardText: { flex: 1 },
+  title: { ...typeScale.bodyMedium, fontSize: 16, color: color.textPrimary },
+  desc: { ...typeScale.label, color: color.textSecondary, marginTop: space.xs },
+  due: { ...typeScale.label, color: color.textSecondary, marginTop: space.sm },
+  dueAttention: { color: color.attention, fontWeight: typeScale.bodyMedium.fontWeight },
+  actions: {
+    flexDirection: 'row', alignItems: 'center', gap: space.sm, marginTop: space.md,
+    paddingTop: space.sm, borderTopWidth: hairline, borderTopColor: color.border,
+  },
+  actionBtn: { flexDirection: 'row', alignItems: 'center', gap: space.xs, minHeight: touchTarget, paddingHorizontal: space.sm },
+  actionText: { ...typeScale.bodyMedium, color: color.accent },
+  empty: { alignItems: 'center', paddingVertical: 80, gap: space.md },
+  emptyText: { ...typeScale.heading, color: color.textSecondary },
+  fab: {
+    position: 'absolute', bottom: space.xxl, right: space.xxl, width: 56, height: 56, borderRadius: radius.pill,
+    backgroundColor: color.accent, alignItems: 'center', justifyContent: 'center',
+  },
+});

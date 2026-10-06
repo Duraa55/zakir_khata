@@ -9,8 +9,8 @@ import { ReportOptions } from '../../types/download.types';
 import { todayDate, formatDisplayDate } from '../../utils/dates';
 import { DateRangeFilter, DateRange } from '../ui/DateRangeFilter';
 import { REPORT_PRESETS, ReportPreset, presetPeriod, periodSlug, initialPeriod } from './reportPeriod';
-
-const ORANGE = '#FF6B35';
+import { Icon } from '../ui/primitives';
+import { color, space, radius, hairline, touchTarget, iconSize, type as typeScale } from '../../theme/tokens';
 
 export const DownloadOptionsModal = ({ route, navigation }: any) => {
   const { t } = useLanguageStore();
@@ -18,8 +18,8 @@ export const DownloadOptionsModal = ({ route, navigation }: any) => {
   // sheet — the Cash Book's Day Book — so "daily cash in/out" is the default and the
   // preset pills / From–To still reach a week, a month or any custom span.
   // `period` is the range a report screen (Stock IN/OUT) is already showing.
-  const { reportType, date: viewedDay, period: shownPeriod } = route.params as
-    { reportType: ReportOptions['reportType']; date?: string; period?: { startDate?: string; endDate?: string } };
+  const { reportType, date: viewedDay, period: shownPeriod, itemId } = route.params as
+    { reportType: ReportOptions['reportType']; date?: string; period?: { startDate?: string; endDate?: string }; itemId?: string };
   const { user } = useAuthStore();
   const { isGenerating, generateFile } = useDownloadStore();
 
@@ -54,6 +54,7 @@ export const DownloadOptionsModal = ({ route, navigation }: any) => {
     try {
       const fileUri = await generateFile({
         reportType,
+        itemId,
         userId: user.id,
         startDate: period.startDate,
         endDate: period.endDate,
@@ -63,7 +64,25 @@ export const DownloadOptionsModal = ({ route, navigation }: any) => {
       // Same save/share path as the working per-bill PDF (BillDetailScreen).
       if (Platform.OS === 'android') {
         const permissions = await FileSystem.StorageAccessFramework.requestDirectoryPermissionsAsync();
-        if (!permissions.granted) return; // folder picker cancelled — stay open so they can retry
+        if (!permissions.granted) {
+          // Cancelling the folder picker used to leave the sheet sitting there with
+          // no feedback at all — indistinguishable from the button doing nothing.
+          Alert.alert(
+            t('cannotSave'),
+            t('folderHelp'),
+            [
+              { text: t('cancel'), style: 'cancel' },
+              {
+                text: t('shareInstead'),
+                onPress: async () => {
+                  await Sharing.shareAsync(fileUri, { mimeType, dialogTitle: t('shareReport') });
+                  navigation.goBack();
+                },
+              },
+            ]
+          );
+          return;
+        }
 
         try {
           const base64 = await FileSystem.readAsStringAsync(fileUri, { encoding: FileSystem.EncodingType.Base64 });
@@ -115,15 +134,15 @@ export const DownloadOptionsModal = ({ route, navigation }: any) => {
       <View style={styles.container}>
         <View style={styles.header}>
           <Text style={styles.title}>{t('downloadReport')}</Text>
-          <TouchableOpacity onPress={() => navigation.goBack()} disabled={isGenerating}>
-            <Text style={styles.close}>✕</Text>
+          <TouchableOpacity onPress={() => navigation.goBack()} disabled={isGenerating} style={styles.close} accessibilityRole="button" accessibilityLabel={t('close')}>
+            <Icon name="x" size={iconSize.md} tint={color.textSecondary} />
           </TouchableOpacity>
         </View>
 
         {isRoster ? (
           <>
             <Text style={styles.label}>{t('period')}</Text>
-            <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 4 }}>
+            <View style={styles.rosterLine}>
               <Text style={styles.dateText}>{t('rosterAsOf')}</Text>
               <Text style={styles.dateText}>{formatDisplayDate(todayDate())}</Text>
             </View>
@@ -132,7 +151,12 @@ export const DownloadOptionsModal = ({ route, navigation }: any) => {
         ) : (
           <>
             <Text style={styles.label}>{t('period')}</Text>
-            <View style={styles.formatRow}>
+            {/* NOT the two-up format row: four equal flex: 1 pills left "This month"
+                about 56dp of text room on a 360dp phone, so it rendered as "Thi…" — the
+                one preset whose meaning dies with its words. The pills are sized to
+                their own label here and wrap when they must, which also leaves Urdu
+                (~40% longer) somewhere to grow. */}
+            <View style={styles.presetRow}>
               {REPORT_PRESETS.map(p => (
                 <TouchableOpacity
                   key={p.key}
@@ -172,9 +196,12 @@ export const DownloadOptionsModal = ({ route, navigation }: any) => {
           disabled={isGenerating}
         >
           {isGenerating ? (
-            <ActivityIndicator color="#fff" />
+            <ActivityIndicator color={color.textInverse} />
           ) : (
-            <Text style={styles.downloadBtnText}>{t('savePhone')}</Text>
+            <>
+              <Icon name="download" size={iconSize.sm} tint={color.textInverse} />
+              <Text style={styles.downloadBtnText}>{t('savePhone')}</Text>
+            </>
           )}
         </TouchableOpacity>
       </View>
@@ -183,25 +210,40 @@ export const DownloadOptionsModal = ({ route, navigation }: any) => {
 };
 
 const styles = StyleSheet.create({
-  modalBg: { flex: 1, backgroundColor: 'rgba(0,0,0,0.5)', justifyContent: 'flex-end' },
-  container: { backgroundColor: '#fff', borderTopLeftRadius: 16, borderTopRightRadius: 16, padding: 20 },
-  header: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 20 },
-  title: { fontSize: 18, fontWeight: '700', color: '#111827' },
-  close: { fontSize: 20, color: '#6B7280' },
-  
-  label: { fontSize: 14, color: '#4B5563', marginBottom: 8, marginTop: 12 },
-  dateText: { fontSize: 16, color: '#111827', fontWeight: '500' },
-  hint: { fontSize: 12, color: '#6B7280', marginTop: 4 },
-  presetBtn: { paddingHorizontal: 6, paddingVertical: 10 },
-  dateBox: { padding: 10, borderRadius: 8, borderWidth: 1, borderColor: '#D1D5DB' },
-  dateLabel: { fontSize: 13, color: '#4B5563' },
-  
-  formatRow: { flexDirection: 'row', gap: 12 },
-  formatBtn: { flex: 1, padding: 12, borderRadius: 8, borderWidth: 1, borderColor: '#D1D5DB', alignItems: 'center' },
-  formatBtnActive: { borderColor: ORANGE, backgroundColor: '#FFF7ED' },
-  formatText: { color: '#4B5563', fontWeight: '600' },
-  formatTextActive: { color: ORANGE, fontWeight: '600' },
+  modalBg: { flex: 1, backgroundColor: color.scrim, justifyContent: 'flex-end' },
+  container: {
+    backgroundColor: color.surface, borderTopLeftRadius: radius.lg, borderTopRightRadius: radius.lg,
+    padding: space.xl, paddingBottom: space.xxl,
+  },
+  header: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: space.md },
+  title: { ...typeScale.title, fontSize: 18, color: color.textPrimary, flex: 1 },
+  close: { width: touchTarget, height: touchTarget, alignItems: 'center', justifyContent: 'center', marginRight: -space.md },
 
-  downloadBtn: { backgroundColor: ORANGE, padding: 16, borderRadius: 25, alignItems: 'center', marginTop: 30 },
-  downloadBtnText: { color: '#fff', fontSize: 16, fontWeight: '700' }
+  label: { ...typeScale.label, color: color.textSecondary, marginBottom: space.sm, marginTop: space.md },
+  rosterLine: { flexDirection: 'row', flexWrap: 'wrap', gap: space.xs },
+  dateText: { ...typeScale.bodyMedium, fontSize: 16, color: color.textPrimary },
+  hint: { ...typeScale.caption, color: color.textSecondary, marginTop: space.xs },
+  presetRow: { flexDirection: 'row', flexWrap: 'wrap', gap: space.sm },
+  // flex: 0 beats formatBtn's flex: 1 — a preset pill is as wide as its own label.
+  presetBtn: { flex: 0, paddingHorizontal: space.md },
+  dateBox: {
+    minHeight: touchTarget, paddingHorizontal: space.md, borderRadius: radius.md,
+    borderWidth: hairline, borderColor: color.border, backgroundColor: color.surfaceRaised, marginTop: space.sm,
+  },
+  dateLabel: { ...typeScale.label, color: color.textPrimary },
+
+  formatRow: { flexDirection: 'row', gap: space.sm },
+  formatBtn: {
+    flex: 1, minHeight: touchTarget, borderRadius: radius.pill, borderWidth: hairline, borderColor: color.borderStrong,
+    alignItems: 'center', justifyContent: 'center', backgroundColor: color.surface,
+  },
+  formatBtnActive: { borderColor: color.accent, backgroundColor: color.accent },
+  formatText: { ...typeScale.label, color: color.textSecondary },
+  formatTextActive: { ...typeScale.label, fontWeight: typeScale.bodyMedium.fontWeight, color: color.textInverse },
+
+  downloadBtn: {
+    flexDirection: 'row', gap: space.sm, backgroundColor: color.accent, minHeight: 52, borderRadius: radius.md,
+    alignItems: 'center', justifyContent: 'center', marginTop: space.xxl,
+  },
+  downloadBtnText: { ...typeScale.bodyMedium, fontSize: 16, color: color.textInverse },
 });

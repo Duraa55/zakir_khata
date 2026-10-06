@@ -1,43 +1,54 @@
 import React, { useEffect, useCallback, useState } from 'react';
+import { statusLabel } from '../../i18n/categoryLabel';
 import {
   View, Text, TouchableOpacity, StyleSheet, SectionList,
   ActivityIndicator, RefreshControl, Keyboard, Platform
 } from 'react-native';
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
+import { useLanguageStore } from '../../store/useLanguageStore';
 import { useAuthStore } from '../../store/authStore';
 import { usePurchaseStore } from '../../store/usePurchaseStore';
 import { PurchaseOrder, PurchaseInvoice } from '../../types/purchase.types';
-import { formatCurrency } from '../../utils/calculations';
-import { Colors } from '../../theme';
+import { Icon, AmountText, AmountStack } from '../../components/ui/primitives';
+import { color, space, radius, hairline, touchTarget, iconSize, type as typeScale, chrome } from '../../theme/tokens';
 import { TopHeaderWithBooks } from '../../components/TopHeaderWithBooks';
+import { ReadOnlyBanner } from '../../components/ui/ReadOnlyBanner';
 import { DateRangeFilter, DateRange, describeRange } from '../../components/ui/DateRangeFilter';
 import { toDateValue, formatDisplayDate } from '../../utils/dates';
 
-const STATUS_COLORS: Record<string, { bg: string; text: string }> = {
-  draft:     { bg: '#374151', text: '#D1D5DB' },
-  sent:      { bg: '#1E3A8A', text: '#93C5FD' },
-  partial:   { bg: '#7C2D12', text: '#FDBA74' },
-  received:  { bg: '#064E3B', text: '#6EE7B7' },
-  cancelled: { bg: '#7F1D1D', text: '#FCA5A5' },
-  unpaid:    { bg: '#7F1D1D', text: '#FCA5A5' },
-  paid:      { bg: '#064E3B', text: '#6EE7B7' },
+// Status carries meaning only: waiting on something (sent, partial, unpaid) is amber;
+// settled (received, paid) is ink; inactive (draft, cancelled) is muted.
+const STATUS_TONE: Record<string, string> = {
+  draft: color.textMuted,
+  sent: color.attention,
+  partial: color.attention,
+  received: color.textPrimary,
+  cancelled: color.textMuted,
+  unpaid: color.attention,
+  paid: color.textPrimary,
+};
+const StatusPill = ({ status }: { status: string }) => {
+  const { t } = useLanguageStore();
+  const tone = STATUS_TONE[status] ?? color.textMuted;
+  return (
+    <View style={[styles.statusBadge, { borderColor: tone }]}>
+      <Text style={[styles.statusText, { color: tone }]}>{statusLabel(t, status)}</Text>
+    </View>
+  );
 };
 
 const OrderCard = React.memo(({ item, onPress }: { item: PurchaseOrder; onPress: () => void }) => {
-  const sc = STATUS_COLORS[item.status] ?? STATUS_COLORS.draft;
   return (
     <TouchableOpacity style={styles.card} onPress={onPress} activeOpacity={0.85}>
       <View style={styles.cardRow}>
-        <View>
+        <View style={styles.cardLeft}>
           <Text style={styles.poNumber}>PO-{String(item.po_number).padStart(4, '0')}</Text>
           <Text style={styles.cardSub}>{item.supplier_name}</Text>
           <Text style={styles.cardDate}>{item.order_date}</Text>
         </View>
         <View style={styles.cardRight}>
-          <View style={[styles.statusBadge, { backgroundColor: sc.bg }]}>
-            <Text style={[styles.statusText, { color: sc.text }]}>{item.status.toUpperCase()}</Text>
-          </View>
-          <Text style={styles.cardTotal}>{formatCurrency(item.total)}</Text>
+          <StatusPill status={item.status} />
+          <AmountText paisa={item.total} currency={item.currency} />
         </View>
       </View>
     </TouchableOpacity>
@@ -45,22 +56,22 @@ const OrderCard = React.memo(({ item, onPress }: { item: PurchaseOrder; onPress:
 });
 
 const InvoiceCard = React.memo(({ item, onPress }: { item: PurchaseInvoice; onPress: () => void }) => {
-  const sc = STATUS_COLORS[item.status] ?? STATUS_COLORS.unpaid;
   return (
     <TouchableOpacity style={styles.card} onPress={onPress} activeOpacity={0.85}>
       <View style={styles.cardRow}>
-        <View>
+        <View style={styles.cardLeft}>
           <Text style={styles.poNumber}>#{item.invoice_number}</Text>
           <Text style={styles.cardSub}>{item.supplier_name}</Text>
           <Text style={styles.cardDate}>{item.invoice_date}</Text>
         </View>
         <View style={styles.cardRight}>
-          <View style={[styles.statusBadge, { backgroundColor: sc.bg }]}>
-            <Text style={[styles.statusText, { color: sc.text }]}>{item.status.toUpperCase()}</Text>
-          </View>
-          <Text style={styles.cardTotal}>{formatCurrency(item.total)}</Text>
+          <StatusPill status={item.status} />
+          <AmountText paisa={item.total} currency={item.currency} />
           {item.balance_due > 0 && (
-            <Text style={styles.balDue}>Due: {formatCurrency(item.balance_due)}</Text>
+            <View style={styles.balDueRow}>
+              <Text style={styles.balDueLabel}>Due</Text>
+              <AmountText paisa={item.balance_due} tone="out" size="label" currency={item.currency} />
+            </View>
           )}
         </View>
       </View>
@@ -68,9 +79,12 @@ const InvoiceCard = React.memo(({ item, onPress }: { item: PurchaseInvoice; onPr
   );
 });
 
-export const PurchaseBookScreen = ({ navigation }: any) => {
+export const PurchaseBookScreen = ({ navigation, route }: any) => {
+  // Staff Book → staff → Entries → Purchase: that person's purchases, read-only.
+  const viewAs: { userId: string; name: string } | undefined = route?.params?.viewAs;
   const insets = useSafeAreaInsets();
   const { user } = useAuthStore();
+  const { t } = useLanguageStore();
   const { summary, loading, loadSummary, filter, setFilter, orderList, invoiceList, loadLists, loadMore } = usePurchaseStore();
   const range: DateRange = { startDate: filter.startDate, endDate: filter.endDate };
   const setRange = (next: DateRange) => { if (user) setFilter(user.id, { ...filter, ...next }); };
@@ -98,7 +112,7 @@ export const PurchaseBookScreen = ({ navigation }: any) => {
 
   const load = useCallback(async () => {
     if (!user?.id) return;
-    await Promise.all([loadLists(user.id), loadSummary(user.id)]);
+    await Promise.all([loadLists(user.id, viewAs?.userId), loadSummary(user.id, viewAs?.userId)]);
   }, [user?.id]);
 
   const onRefresh = async () => {
@@ -124,23 +138,25 @@ export const PurchaseBookScreen = ({ navigation }: any) => {
 
   // Day header: how many, what it came to, and how much of it is settled — "Received"
   // (goods received against orders) or "Paid" (cash against invoices).
+  // `day` is never named `t`: that is the translator, and shadowing it here is what
+  // made t('billTotal') call a totals object and crash the whole list.
   const dayHeader = (totals: Record<string, any>, noun: string, settledLabel: string) => ({ section }: { section: { day: string } }) => {
-    const t = totals[section.day];
+    const day = totals[section.day];
     return (
       <View style={styles.dayHeader}>
-        <View style={{ flex: 1 }}>
+        <View style={styles.dayLeft}>
           <Text style={styles.dayTitle}>{formatDisplayDate(section.day)}</Text>
-          {t && <Text style={styles.dayCount}>{t.count} {t.count === 1 ? noun : noun + 's'}</Text>}
+          {day && <Text style={styles.dayCount}>{day.count} {day.count === 1 ? noun : noun + 's'}</Text>}
         </View>
-        {t && (
+        {day && (
           <View style={styles.dayRight}>
-            <View style={styles.dayCols}>
-              <Text style={[styles.dayColLabel, { color: Colors.textGray }]}>Total</Text>
-              <Text style={[styles.dayColLabel, { color: Colors.success }]}>{settledLabel}</Text>
+            <View style={styles.dayFigure}>
+              <Text style={styles.dayColLabel}>{t('billTotal')}</Text>
+              <AmountStack totals={day.total} size="label" />
             </View>
-            <View style={styles.dayCols}>
-              <Text style={[styles.dayColVal, { color: Colors.textWhite }]}>{formatCurrency(t.total)}</Text>
-              <Text style={[styles.dayColVal, { color: Colors.success }]}>{formatCurrency(t.settled)}</Text>
+            <View style={styles.dayFigure}>
+              <Text style={styles.dayColLabel}>{settledLabel}</Text>
+              <AmountStack totals={day.settled} size="label" />
             </View>
           </View>
         )}
@@ -149,12 +165,14 @@ export const PurchaseBookScreen = ({ navigation }: any) => {
   };
 
   return (
-    <View style={{ flex: 1, backgroundColor: Colors.bgPrimary }}>
+    <View style={styles.safe}>
       {/* Top Header with Profile & Books Bar */}
-      <TopHeaderWithBooks navigation={navigation} activeBook="PurchaseBook" />
+      {viewAs
+        ? <ReadOnlyBanner name={viewAs.name} book="Purchase" onBack={() => navigation.goBack()} />
+        : <TopHeaderWithBooks navigation={navigation} activeBook="PurchaseBook" />}
 
       {/* Range — shared control, opens on this month; both tabs follow it */}
-      <View style={{ paddingHorizontal: 12 }}>
+      <View style={styles.rangeWrap}>
         <DateRangeFilter value={range} onChange={setRange} fieldStyle={styles.rangeField} textStyle={styles.rangeText} />
       </View>
 
@@ -163,19 +181,19 @@ export const PurchaseBookScreen = ({ navigation }: any) => {
         <View style={styles.summaryRow}>
           <View style={styles.tile}>
             <Text style={styles.tileVal}>{summary.totalOrders}</Text>
-            <Text style={styles.tileLabel}>Total Orders</Text>
+            <Text style={styles.tileLabel} numberOfLines={2}>{t('purchaseTotalOrders')}</Text>
           </View>
           <View style={styles.tile}>
-            <Text style={[styles.tileVal, { color: Colors.warning }]}>{summary.pendingOrders}</Text>
-            <Text style={styles.tileLabel}>Pending</Text>
+            <Text style={[styles.tileVal, summary.pendingOrders > 0 && styles.tileValAttention]}>{summary.pendingOrders}</Text>
+            <Text style={styles.tileLabel} numberOfLines={2}>{t('purchasePending')}</Text>
           </View>
           <View style={styles.tile}>
-            <Text style={[styles.tileVal, { color: Colors.error, fontSize: 13 }]}>{formatCurrency(summary.totalOutstanding)}</Text>
-            <Text style={styles.tileLabel}>Outstanding</Text>
+            <AmountStack totals={summary.totalOutstanding} tone="out" size="label" fit />
+            <Text style={styles.tileLabel} numberOfLines={2}>{t('purchaseOutstanding')}</Text>
           </View>
           <View style={styles.tile}>
-            <Text style={[styles.tileVal, { color: Colors.success, fontSize: 13 }]}>{formatCurrency(summary.totalPaidThisMonth)}</Text>
-            <Text style={styles.tileLabel}>Paid (Month)</Text>
+            <AmountStack totals={summary.totalPaidThisMonth} size="label" fit />
+            <Text style={styles.tileLabel} numberOfLines={2}>{t('purchasePaidThisMonth')}</Text>
           </View>
         </View>
       )}
@@ -183,37 +201,43 @@ export const PurchaseBookScreen = ({ navigation }: any) => {
       {/* Tab Bar */}
       <View style={styles.tabBar}>
         <TouchableOpacity style={[styles.tab, tab === 'orders' && styles.tabActive]} onPress={() => setTab('orders')}>
-          <Text style={[styles.tabText, tab === 'orders' && styles.tabTextActive]}>📦 Orders ({orderList.summary.count})</Text>
+          <Icon name="package" size={iconSize.sm} tint={tab === 'orders' ? color.accent : color.textSecondary} />
+          <Text style={[styles.tabText, tab === 'orders' && styles.tabTextActive]} numberOfLines={1}>Orders ({orderList.summary.count})</Text>
         </TouchableOpacity>
         <TouchableOpacity style={[styles.tab, tab === 'invoices' && styles.tabActive]} onPress={() => setTab('invoices')}>
-          <Text style={[styles.tabText, tab === 'invoices' && styles.tabTextActive]}>🧾 Invoices ({invoiceList.summary.count})</Text>
+          <Icon name="file-text" size={iconSize.sm} tint={tab === 'invoices' ? color.accent : color.textSecondary} />
+          <Text style={[styles.tabText, tab === 'invoices' && styles.tabTextActive]} numberOfLines={1}>Invoices ({invoiceList.summary.count})</Text>
         </TouchableOpacity>
       </View>
 
       {loading && !refreshing ? (
-        <ActivityIndicator size="large" color={Colors.primary} style={{ flex: 1 }} />
+        <ActivityIndicator size="large" color={color.accent} style={styles.spinner} />
       ) : tab === 'orders' ? (
         <SectionList
           sections={orderSections}
           keyExtractor={i => i.id}
-          contentContainerStyle={{ padding: 14, paddingBottom: 150 }}
-          refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={Colors.textWhite} />}
+          contentContainerStyle={styles.listContent}
+          refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={color.accent} />}
           renderItem={({ item }) => (
-            <OrderCard item={item} onPress={() => navigation.navigate('PurchaseOrderDetail', { orderId: item.id })} />
+            <OrderCard item={item} onPress={() => { if (!viewAs) navigation.navigate('PurchaseOrderDetail', { orderId: item.id }); }} />
           )}
           renderSectionHeader={dayHeader(orderList.dayTotals, 'order', 'Received')}
           stickySectionHeadersEnabled
           onEndReached={() => { if (user) loadMore(user.id, 'orders'); }}
           onEndReachedThreshold={0.5}
-          ListFooterComponent={orderList.loadingMore ? <ActivityIndicator style={{ margin: 16 }} color={Colors.primary} /> : null}
-          ItemSeparatorComponent={() => <View style={{ height: 10 }} />}
-          SectionSeparatorComponent={() => <View style={{ height: 10 }} />}
+          ListFooterComponent={orderList.loadingMore ? <ActivityIndicator style={styles.footerSpinner} color={color.accent} /> : null}
+          ItemSeparatorComponent={() => <View style={styles.gap} />}
+          SectionSeparatorComponent={() => <View style={styles.gap} />}
           ListEmptyComponent={
             <View style={styles.empty}>
-              <Text style={styles.emptyTitle}>No Purchase Orders</Text>
-              <TouchableOpacity style={styles.emptyBtn} onPress={() => navigation.navigate('CreatePurchaseOrder')}>
-                <Text style={styles.emptyBtnText}>+ Create First PO</Text>
-              </TouchableOpacity>
+              <Icon name="package" size={40} tint={color.textMuted} />
+              <Text style={styles.emptyTitle}>{t('pbNoOrders')}</Text>
+              {!viewAs && (
+                <TouchableOpacity style={styles.emptyBtn} onPress={() => navigation.navigate('CreatePurchaseOrder')}>
+                  <Icon name="plus" size={iconSize.sm} tint={color.textInverse} />
+                  <Text style={styles.emptyBtnText}>{t('pbCreateFirst')}</Text>
+                </TouchableOpacity>
+              )}
             </View>
           }
         />
@@ -221,34 +245,38 @@ export const PurchaseBookScreen = ({ navigation }: any) => {
         <SectionList
           sections={invoiceSections}
           keyExtractor={i => i.id}
-          contentContainerStyle={{ padding: 14, paddingBottom: 150 }}
-          refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={Colors.textWhite} />}
+          contentContainerStyle={styles.listContent}
+          refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={color.accent} />}
           renderItem={({ item }) => (
-            <InvoiceCard item={item} onPress={() => navigation.navigate('PurchaseInvoiceDetail', { invoiceId: item.id })} />
+            <InvoiceCard item={item} onPress={() => { if (!viewAs) navigation.navigate('PurchaseInvoiceDetail', { invoiceId: item.id }); }} />
           )}
           renderSectionHeader={dayHeader(invoiceList.dayTotals, 'invoice', 'Paid')}
           stickySectionHeadersEnabled
           onEndReached={() => { if (user) loadMore(user.id, 'invoices'); }}
           onEndReachedThreshold={0.5}
-          ListFooterComponent={invoiceList.loadingMore ? <ActivityIndicator style={{ margin: 16 }} color={Colors.primary} /> : null}
-          ItemSeparatorComponent={() => <View style={{ height: 10 }} />}
-          SectionSeparatorComponent={() => <View style={{ height: 10 }} />}
+          ListFooterComponent={invoiceList.loadingMore ? <ActivityIndicator style={styles.footerSpinner} color={color.accent} /> : null}
+          ItemSeparatorComponent={() => <View style={styles.gap} />}
+          SectionSeparatorComponent={() => <View style={styles.gap} />}
           ListEmptyComponent={
             <View style={styles.empty}>
-              <Text style={styles.emptyTitle}>No Invoices Yet</Text>
-              <TouchableOpacity style={styles.emptyBtn} onPress={() => navigation.navigate('CreatePurchaseInvoice', {})}>
-                <Text style={styles.emptyBtnText}>+ Create Invoice</Text>
-              </TouchableOpacity>
+              <Icon name="file-text" size={40} tint={color.textMuted} />
+              <Text style={styles.emptyTitle}>{t('pbNoInvoices')}</Text>
+              {!viewAs && (
+                <TouchableOpacity style={styles.emptyBtn} onPress={() => navigation.navigate('CreatePurchaseInvoice', {})}>
+                  <Icon name="plus" size={iconSize.sm} tint={color.textInverse} />
+                  <Text style={styles.emptyBtnText}>{t('piCreate')}</Text>
+                </TouchableOpacity>
+              )}
             </View>
           }
         />
       )}
 
       {/* FAB */}
-      {!isKeyboardVisible && (
-        <View style={[styles.fab, { bottom: 85 + Math.max(insets.bottom, 8) }]}>
-          <TouchableOpacity style={styles.fabBtn} onPress={() => navigation.navigate(tab === 'orders' ? 'CreatePurchaseOrder' : 'CreatePurchaseInvoice', {})}>
-            <Text style={styles.fabText}>+</Text>
+      {!isKeyboardVisible && !viewAs && (
+        <View style={[styles.fab, { bottom: space.lg }]}>
+          <TouchableOpacity style={styles.fabBtn} onPress={() => navigation.navigate(tab === 'orders' ? 'CreatePurchaseOrder' : 'CreatePurchaseInvoice', {})} accessibilityRole="button" accessibilityLabel={tab === 'orders' ? 'Create purchase order' : 'Create invoice'}>
+            <Icon name="plus" size={iconSize.lg} tint={color.textInverse} />
           </TouchableOpacity>
         </View>
       )}
@@ -257,65 +285,70 @@ export const PurchaseBookScreen = ({ navigation }: any) => {
 };
 
 const styles = StyleSheet.create({
-  safe: { flex: 1, backgroundColor: Colors.bgPrimary },
-  header: {
-    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
-    backgroundColor: Colors.bgCard, paddingHorizontal: 16, paddingVertical: 14,
-    borderBottomWidth: 1, borderBottomColor: Colors.border,
+  safe: { flex: 1, backgroundColor: color.surface },
+  rangeWrap: { paddingHorizontal: space.md },
+  summaryRow: { flexDirection: 'row', padding: space.md, gap: space.sm },
+  rangeField: {
+    flexDirection: 'row', alignItems: 'center', backgroundColor: color.surfaceRaised,
+    borderWidth: hairline, borderColor: color.border, borderRadius: radius.md,
+    paddingHorizontal: space.md, minHeight: touchTarget,
   },
-  backBtn: { width: 36 },
-  backArrow: { fontSize: 22, color: Colors.textWhite, fontWeight: '700' },
-  headerTitle: { fontSize: 18, fontWeight: '700', color: Colors.textWhite },
-  headerSub: { fontSize: 11, color: Colors.textGray },
-  addBtn: { backgroundColor: 'rgba(0,166,81,0.2)', paddingHorizontal: 12, paddingVertical: 6, borderRadius: 20, borderWidth: 1, borderColor: Colors.primaryLight },
-  addBtnText: { color: Colors.primaryLight, fontWeight: '700', fontSize: 13 },
-  summaryRow: { flexDirection: 'row', padding: 12, gap: 6 },
-  rangeField: { flexDirection: 'row', alignItems: 'center', backgroundColor: Colors.bgCard, borderWidth: 1, borderColor: Colors.border, borderRadius: 12, paddingHorizontal: 12, paddingVertical: 8, minHeight: 36 },
-  rangeText: { fontSize: 11, color: Colors.textGray, fontWeight: '600' },
-  // Day header — the Cash Book day-header banner with Total / settled columns.
+  rangeText: { ...typeScale.label, color: color.textPrimary },
+  // Day header — a raised band with Total / settled figures (neutral: they are totals).
   dayHeader: {
-    flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center',
-    backgroundColor: Colors.bgCard, borderRadius: 12, paddingVertical: 12, paddingHorizontal: 14,
-    borderWidth: 1, borderColor: Colors.border, marginBottom: 10,
+    flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', gap: space.md,
+    backgroundColor: color.surfaceRaised, borderRadius: radius.md, paddingVertical: chrome.dayPadY, paddingHorizontal: space.md,
+    borderWidth: hairline, borderColor: color.border, marginBottom: chrome.cardMarginY,
   },
-  dayTitle: { fontSize: 13, fontWeight: '800', color: Colors.textWhite, letterSpacing: 0.5 },
-  dayCount: { fontSize: 12, color: Colors.textGray, marginTop: 2 },
-  dayRight: { alignItems: 'flex-end' },
-  dayCols: { flexDirection: 'row', gap: 16 },
-  dayColLabel: { fontSize: 12, fontWeight: '700', minWidth: 60, textAlign: 'right', marginBottom: 2 },
-  dayColVal: { fontSize: 13, fontWeight: '800', minWidth: 60, textAlign: 'right', flexShrink: 0 },
-  tile: { flex: 1, borderRadius: 12, padding: 10, alignItems: 'center', backgroundColor: Colors.bgCard, borderWidth: 1, borderColor: Colors.border },
-  tileVal: { fontSize: 14, fontWeight: '800', color: Colors.textWhite, marginBottom: 2 },
-  tileLabel: { fontSize: 9, color: Colors.textGray, fontWeight: '600', textAlign: 'center' },
-  tabBar: { flexDirection: 'row', backgroundColor: Colors.bgCard, borderBottomWidth: 1, borderBottomColor: Colors.border },
-  tab: { flex: 1, paddingVertical: 12, alignItems: 'center', borderBottomWidth: 2, borderBottomColor: 'transparent' },
-  tabActive: { borderBottomColor: Colors.primaryLight },
-  tabText: { fontSize: 13, fontWeight: '600', color: Colors.textGray },
-  tabTextActive: { color: Colors.primaryLight, fontWeight: '800' },
+  dayLeft: { flex: 1 },
+  dayTitle: { ...typeScale.caption, color: color.textSecondary },
+  dayCount: { ...typeScale.caption, color: color.textSecondary, marginTop: 2 },
+  dayRight: { flexDirection: 'row', gap: space.lg, flexShrink: 0 },
+  dayFigure: { alignItems: 'flex-end' },
+  dayColLabel: { ...typeScale.caption, color: color.textSecondary, marginBottom: 2 },
+  tile: {
+    flex: 1, borderRadius: radius.md, paddingVertical: chrome.cardPadY, paddingHorizontal: space.xs, alignItems: 'center', gap: 2,
+    backgroundColor: color.surfaceRaised, borderWidth: hairline, borderColor: color.border,
+  },
+  tileVal: { ...typeScale.bodyMedium, color: color.textPrimary },
+  tileValAttention: { color: color.attention },
+  tileLabel: { ...typeScale.caption, color: color.textSecondary, textAlign: 'center' },
+  tabBar: { flexDirection: 'row', backgroundColor: color.surface, borderBottomWidth: hairline, borderBottomColor: color.border },
+  tab: {
+    flex: 1, flexDirection: 'row', gap: space.xs, minHeight: touchTarget, paddingHorizontal: space.sm,
+    alignItems: 'center', justifyContent: 'center', borderBottomWidth: 2, borderBottomColor: 'transparent',
+  },
+  tabActive: { borderBottomColor: color.accent },
+  tabText: { ...typeScale.label, color: color.textSecondary, flexShrink: 1 },
+  tabTextActive: { color: color.accent, fontWeight: typeScale.bodyMedium.fontWeight },
+  spinner: { flex: 1 },
+  listContent: { padding: space.md, paddingBottom: chrome.listBottom },
+  gap: { height: space.sm },
+  footerSpinner: { margin: space.lg },
   card: {
-    backgroundColor: Colors.bgCard, borderRadius: 14, padding: 16,
-    shadowColor: '#000', shadowOpacity: 0.2, shadowRadius: 6, elevation: 3,
-    borderWidth: 1, borderColor: Colors.border,
+    backgroundColor: color.surface, borderRadius: radius.md, padding: space.lg,
+    borderWidth: hairline, borderColor: color.border,
   },
-  cardRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start' },
-  poNumber: { fontSize: 15, fontWeight: '800', color: Colors.textWhite },
-  cardSub: { fontSize: 12, color: Colors.textGray, marginTop: 2 },
-  cardDate: { fontSize: 11, color: Colors.textMuted, marginTop: 2 },
-  cardRight: { alignItems: 'flex-end' },
-  statusBadge: { paddingHorizontal: 8, paddingVertical: 3, borderRadius: 8, marginBottom: 4 },
-  statusText: { fontSize: 10, fontWeight: '800', letterSpacing: 0.5 },
-  cardTotal: { fontSize: 15, fontWeight: '800', color: Colors.textWhite },
-  balDue: { fontSize: 11, color: Colors.error, fontWeight: '600', marginTop: 2 },
-  empty: { flex: 1, alignItems: 'center', justifyContent: 'center', paddingTop: 80 },
-  emptyTitle: { fontSize: 17, fontWeight: '700', color: Colors.textGray, marginTop: 12 },
-  emptyBtn: { marginTop: 20, backgroundColor: Colors.primary, paddingHorizontal: 24, paddingVertical: 12, borderRadius: 20 },
-  emptyBtnText: { color: Colors.textWhite, fontWeight: '700' },
-  fab: { position: 'absolute', right: 20, bottom: 24 },
+  cardRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start', gap: space.md },
+  cardLeft: { flex: 1 },
+  poNumber: { ...typeScale.bodyMedium, color: color.textPrimary },
+  cardSub: { ...typeScale.label, color: color.textSecondary, marginTop: 2 },
+  cardDate: { ...typeScale.caption, color: color.textMuted, marginTop: 2 },
+  cardRight: { alignItems: 'flex-end', gap: space.xs, flexShrink: 0 },
+  statusBadge: { paddingHorizontal: space.sm, paddingVertical: 2, borderRadius: radius.pill, borderWidth: hairline },
+  statusText: { ...typeScale.caption },
+  balDueRow: { flexDirection: 'row', alignItems: 'center', gap: space.xs },
+  balDueLabel: { ...typeScale.caption, color: color.textSecondary },
+  empty: { flex: 1, alignItems: 'center', justifyContent: 'center', paddingTop: 80, gap: space.md },
+  emptyTitle: { ...typeScale.heading, color: color.textSecondary },
+  emptyBtn: {
+    flexDirection: 'row', alignItems: 'center', gap: space.sm, marginTop: space.sm,
+    backgroundColor: color.accent, paddingHorizontal: space.xxl, minHeight: touchTarget, borderRadius: radius.md,
+  },
+  emptyBtnText: { ...typeScale.bodyMedium, color: color.textInverse },
+  fab: { position: 'absolute', right: space.xl },
   fabBtn: {
-    width: 56, height: 56, borderRadius: 28, backgroundColor: Colors.primary,
+    width: 56, height: 56, borderRadius: radius.pill, backgroundColor: color.accent,
     justifyContent: 'center', alignItems: 'center',
-    shadowColor: Colors.primary, shadowOpacity: 0.5, shadowRadius: 8, elevation: 8,
   },
-  fabText: { fontSize: 28, color: Colors.textWhite, fontWeight: '300', lineHeight: 32 },
 });
-

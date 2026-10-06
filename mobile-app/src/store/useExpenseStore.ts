@@ -6,10 +6,13 @@ import {
   ExpenseDayTotal,
   ExpenseFilter,
   addExpenseRecord,
-  deleteExpenseRecord
+  deleteExpenseRecord,
+  updateExpenseRecord,
+  ExpenseUpdate
 } from '../services/database/expenseDb';
 import { todayDate, thisMonthRange } from '../utils/dates';
 import { PAGE_SIZE, PageCursor } from '../services/database/pagination';
+import type { CurrencyTotal } from '../utils/currencyTotals';
 
 interface ExpenseStore {
   /** The pages loaded so far (keyset, PAGE_SIZE at a time). */
@@ -18,16 +21,24 @@ interface ExpenseStore {
   loadingMore: boolean;
   /** Cursor for the next page; null once the last page is loaded. */
   cursor: PageCursor | null;
+  /**
+   * Whose book the loaded rows are: undefined = the viewer's own; an id = the Staff Book
+   * drill-down. Passed EXPLICITLY on every fetch (never kept in `filter`), so the own
+   * Expense Book, which refetches on focus without it, can never show someone else's rows.
+   */
+  viewingId?: string;
   /** Per-day SQL subtotals for the whole filtered set, keyed by YYYY-MM-DD. */
   dayTotals: Record<string, ExpenseDayTotal>;
   error: string | null;
   /** SQL total over the WHOLE filtered set — never a sum of the loaded page. */
-  expenseTotal: number;
+  /** One figure PER CURRENCY — never summed across them. */
+  expenseTotal: CurrencyTotal[];
   /** Kept as an alias of expenseTotal so the summary card and list can never disagree. */
-  monthlyTotal: number;
+  /** One figure PER CURRENCY — never summed across them. See currencyTotals.ts. */
+  monthlyTotal: CurrencyTotal[];
   filter: ExpenseFilter;
 
-  fetchExpenses: (userId: string, filter?: ExpenseFilter) => Promise<void>;
+  fetchExpenses: (userId: string, filter?: ExpenseFilter, viewingId?: string) => Promise<void>;
   loadMoreExpenses: (userId: string) => Promise<void>;
   loadExpenses: (userId: string) => Promise<void>;
   addExpense: (
@@ -36,8 +47,10 @@ interface ExpenseStore {
     notes?: string
   ) => Promise<void>;
   removeExpense: (id: string, userId: string) => Promise<void>;
+  /** Edit an expense in place (author only), then refresh the book and its total. */
+  updateExpense: (id: string, userId: string, updates: ExpenseUpdate) => Promise<void>;
   loadMonthlyTotal: (userId: string) => Promise<void>;
-  setFilter: (userId: string, filter: ExpenseFilter) => Promise<void>;
+  setFilter: (userId: string, filter: ExpenseFilter, viewingId?: string) => Promise<void>;
 }
 
 export const useExpenseStore = create<ExpenseStore>((set, get) => ({
@@ -47,21 +60,22 @@ export const useExpenseStore = create<ExpenseStore>((set, get) => ({
   cursor: null,
   dayTotals: {},
   error: null,
-  expenseTotal: 0,
-  monthlyTotal: 0,
+  expenseTotal: [],
+  monthlyTotal: [],
   // Opens on this month (was: all dates). Unlike the old month cursor, the range
   // control is visible and every previous month stays reachable through it.
   filter: { ...thisMonthRange() },
 
-  fetchExpenses: async (userId: string, filter?: ExpenseFilter) => {
-    set({ loading: true, error: null, cursor: null });
-    const active = filter ?? get().filter;
+  fetchExpenses: async (userId: string, filter?: ExpenseFilter, viewingId?: string) => {
+    set({ loading: true, error: null, cursor: null, viewingId });
+    const { createdBy: _ignored, ...active } = filter ?? get().filter;
+    const query: ExpenseFilter = viewingId ? { ...active, createdBy: viewingId } : active;
     try {
       // Page 1, the total and the per-day subtotals share ONE WHERE clause; the total
       // and day totals are whole-set SQL aggregates — only the rows page.
       const [{ expenses, expenseSummary, nextCursor }, days] = await Promise.all([
-        getFilteredExpenses(userId, active, PAGE_SIZE),
-        getExpenseDayTotals(userId, active),
+        getFilteredExpenses(userId, query, PAGE_SIZE),
+        getExpenseDayTotals(userId, query),
       ]);
       set({
         expenses,
@@ -80,11 +94,12 @@ export const useExpenseStore = create<ExpenseStore>((set, get) => ({
 
   // Next page only — strictly after the last loaded row. The total is NOT refetched.
   loadMoreExpenses: async (userId: string) => {
-    const { cursor, loadingMore, loading, filter } = get();
+    const { cursor, loadingMore, loading, filter, viewingId } = get();
     if (!cursor || loadingMore || loading) return;
     set({ loadingMore: true });
     try {
-      const { expenses, nextCursor } = await getFilteredExpenses(userId, filter, PAGE_SIZE, 0, cursor);
+      const query: ExpenseFilter = viewingId ? { ...filter, createdBy: viewingId } : filter;
+      const { expenses, nextCursor } = await getFilteredExpenses(userId, query, PAGE_SIZE, 0, cursor);
       set(state => ({ expenses: [...state.expenses, ...expenses], cursor: nextCursor, loadingMore: false }));
     } catch (err: any) {
       if (__DEV__) console.error('[Expense] load more failed:', err);
@@ -96,9 +111,10 @@ export const useExpenseStore = create<ExpenseStore>((set, get) => ({
     await get().fetchExpenses(userId);
   },
 
-  setFilter: async (userId: string, filter: ExpenseFilter) => {
-    set({ filter });
-    await get().fetchExpenses(userId, filter);
+  setFilter: async (userId: string, filter: ExpenseFilter, viewingId?: string) => {
+    const { createdBy: _ignored, ...clean } = filter;
+    set({ filter: clean });
+    await get().fetchExpenses(userId, clean, viewingId);
   },
 
   addExpense: async (arg1, amount_paisa, notes) => {
@@ -125,6 +141,11 @@ export const useExpenseStore = create<ExpenseStore>((set, get) => ({
       if (__DEV__) console.error(err);
       throw err;
     }
+  },
+
+  updateExpense: async (id, userId, updates) => {
+    await updateExpenseRecord(id, userId, updates);
+    await get().fetchExpenses(userId);
   },
 
   removeExpense: async (id: string, userId: string) => {

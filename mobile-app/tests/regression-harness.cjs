@@ -46,6 +46,10 @@ function harness() {
   let depth=0, cap=Infinity;
   let session={isAuthenticated:true,user:{id:'owner'}};
   const cache=new Map(), queries=[], html=[], csv=[], versions=[], files=[], logs=[];
+  // Files that exist on the simulated phone. A copied file exists at its destination;
+  // anything else exists only if a test says so — which is how a check models a
+  // picker-cache file that Android has already cleared.
+  const present=new Set();
   const wrap = (sql, fn) => {
     queries.push(sql);
     try { const r=fn(); const m=/PRAGMA user_version\s*=\s*(\d+)/i.exec(sql); if(m) versions.push(+m[1]); return r; }
@@ -77,7 +81,8 @@ function harness() {
       if(id==='expo-crypto')return {getRandomBytes:n=>crypto.randomBytes(n),CryptoDigestAlgorithm:{SHA256:'sha256'},digestStringAsync:async(algorithm,value)=>crypto.createHash(algorithm).update(value).digest('hex')};
       if(id==='expo-print')return {printToFileAsync:async({html:body})=>{html.push(body);return {uri:'test://report.pdf'};}};
       if(id==='expo-file-system')return {documentDirectory:'test://',EncodingType:{UTF8:'utf8'},writeAsStringAsync:async(uri,body)=>{csv.push(body);},
-        makeDirectoryAsync:async(dir)=>{files.push({op:'mkdir',dir});},copyAsync:async({from,to})=>{files.push({op:'copy',from,to});}};
+        makeDirectoryAsync:async(dir)=>{files.push({op:'mkdir',dir});},copyAsync:async({from,to})=>{files.push({op:'copy',from,to});present.add(to);},
+        getInfoAsync:async(uri)=>({exists:present.has(uri),uri})};
       if(id==='expo-image-picker')return {MediaTypeOptions:{Images:'Images'}};
       if(id==='react-native')return {Alert:{alert(){}}};
       if(id.endsWith('/authStore'))return {useAuthStore:{getState:()=>session}};
@@ -112,7 +117,7 @@ function harness() {
     sqlite.prepare('INSERT INTO '+table+' ('+keys.join(',')+') VALUES ('+keys.map(()=>'?').join(',')+')').run(...Object.values(data));
     return data.id;
   };
-  return {sqlite,adapter,queries,html,csv,versions,files,logs,load,all,one,insert,
+  return {sqlite,adapter,queries,html,csv,versions,files,present,logs,load,all,one,insert,
     login:id=>{session={isAuthenticated:true,user:{id}};},
     boot:async(ceiling=Infinity)=>{cap=ceiling;cache.clear();await load('src/services/database/db.ts').getDatabase();},
     dispose:()=>{sqlite.close();fs.rmSync(folder,{recursive:true,force:true});},

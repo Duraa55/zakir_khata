@@ -1,53 +1,66 @@
 import React, { useState } from 'react';
+import { categoryLabel } from '../../i18n/categoryLabel';
+import { useLanguageStore } from '../../store/useLanguageStore';
 import {
-  View, Text, TouchableOpacity, StyleSheet, Alert, ActivityIndicator
+  View, Text, TouchableOpacity, StyleSheet, Alert, ActivityIndicator, ScrollView, Image
 } from 'react-native';
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useAuthStore } from '../../store/authStore';
 import { useTransactionStore } from '../../store/transactionStore';
 import { deleteCashEntry } from '../../services/database/cashbookDb';
-import { formatCurrency } from '../../utils/calculations';
 import { CashEntry } from '../../types';
-import { Colors } from '../../theme';
+import { Icon, AmountText } from '../../components/ui/primitives';
+import { color, space, radius, hairline, touchTarget, iconSize, type as typeScale } from '../../theme/tokens';
+import { useAttachmentOpener } from '../../components/ui/AttachmentViewer';
 
 interface Props {
   navigation: any;
   route: {
     params: {
       entry: CashEntry;
+      /** Opened from a staff member's Entries: no Edit, no Delete. */
+      readOnly?: boolean;
     };
   };
 }
 
-const GREEN = '#22C55E';
-const RED = '#EF4444';
-
 export const CashEntryDetailScreen = ({ navigation, route }: Props) => {
   const insets = useSafeAreaInsets();
+  // One shared opener: images preview in-app, other files go to the phone, a missing
+  // file says so — the same behaviour in every book.
+  const { openAttachment, attachmentViewer } = useAttachmentOpener();
   const { user } = useAuthStore();
+  const { t } = useLanguageStore();
   const { loadCashBook } = useTransactionStore();
   const [deleting, setDeleting] = useState(false);
 
   const entry = route?.params?.entry;
+  // Opened from a staff member's Entries: look, never change.
+  const readOnly = !!route?.params?.readOnly;
 
   if (!entry) {
     return (
       <SafeAreaView style={styles.safe}>
         <View style={styles.header}>
-          <TouchableOpacity onPress={() => navigation?.goBack?.()} style={styles.backBtn}>
-            <Text style={styles.backArrow}>‹</Text>
+          <TouchableOpacity onPress={() => navigation?.goBack?.()} style={styles.backBtn} accessibilityRole="button" accessibilityLabel={t('commonBack')}>
+            <Icon name="chevron-left" size={iconSize.lg} tint={color.textPrimary} />
           </TouchableOpacity>
-          <Text style={styles.headerTitle}>Entry Detail</Text>
-          <View style={{ width: 40 }} />
+          <Text style={styles.headerTitle}>{t('entryDetailTitle')}</Text>
+          <View style={styles.backBtn} />
         </View>
-        <View style={[styles.container, { justifyContent: 'center', alignItems: 'center' }]}>
-          <Text style={{ color: Colors.textGray }}>No entry selected</Text>
+        <View style={[styles.container, styles.centered]}>
+          <Text style={styles.emptyText}>{t('entryNoneSelected')}</Text>
         </View>
       </SafeAreaView>
     );
   }
 
   const isIn = entry.direction === 'in';
+  const category = entry.category?.trim() || '';
+  const note = entry.note?.trim() || '';
+  // Honest about backup: this app is push-only and often runs without the cloud
+  // configured, so "backed up" is shown only when the row actually synced.
+  const isBackedUp = (entry as any).synced === 1 || entry.syncStatus === 'synced';
 
   const formatDetailDateTime = (dateStr?: string, createdAt?: string) => {
     const ts = createdAt || dateStr;
@@ -74,8 +87,8 @@ export const CashEntryDetailScreen = ({ navigation, route }: Props) => {
   };
 
   const handleDelete = () => {
-    Alert.alert('Delete Entry', 'Are you sure you want to delete this entry?', [
-      { text: 'Cancel', style: 'cancel' },
+    Alert.alert(t('entryDelete'), t('entryDeleteConfirm'), [
+      { text: t('commonCancel'), style: 'cancel' },
       {
         text: 'Delete',
         style: 'destructive',
@@ -87,7 +100,7 @@ export const CashEntryDetailScreen = ({ navigation, route }: Props) => {
             await loadCashBook(user.id);
             navigation.goBack();
           } catch (err) {
-            Alert.alert('Error', 'Failed to delete entry.');
+            Alert.alert(t('commonError'), t('entryDeleteFailed'));
           } finally {
             setDeleting(false);
           }
@@ -100,30 +113,36 @@ export const CashEntryDetailScreen = ({ navigation, route }: Props) => {
     <SafeAreaView style={styles.safe}>
       {/* Header */}
       <View style={styles.header}>
-        <TouchableOpacity onPress={() => navigation.goBack()} style={styles.backBtn}>
-          <Text style={styles.backArrow}>‹</Text>
+        <TouchableOpacity onPress={() => navigation.goBack()} style={styles.backBtn} accessibilityRole="button" accessibilityLabel={t('commonBack')}>
+          <Icon name="chevron-left" size={iconSize.lg} tint={color.textPrimary} />
         </TouchableOpacity>
-        <Text style={styles.headerTitle}>Entry Detail</Text>
-        <View style={{ width: 40 }} />
+        <Text style={styles.headerTitle}>{t('entryDetailTitle')}</Text>
+        <View style={styles.backBtn} />
       </View>
 
-      <View style={styles.container}>
-        {/* Entry Detail Top Card */}
+      <ScrollView
+        style={styles.container}
+        contentContainerStyle={[
+          styles.containerContent,
+          { paddingBottom: readOnly ? space.xxl : space.xxl + 72 },
+        ]}
+        showsVerticalScrollIndicator={true}
+      >
+        {/* Entry card — the amount is coloured by meaning: green in, red out. */}
         <View style={styles.card}>
           <View style={styles.cardHeaderRow}>
             <View style={styles.leftMeta}>
-              <View style={[styles.circleIcon, { backgroundColor: isIn ? GREEN : RED }]}>
-                <Text style={styles.circleIconText}>{isIn ? '+' : '-'}</Text>
+              <View style={[styles.circleIcon, { borderColor: isIn ? color.moneyIn : color.moneyOut }]}>
+                <Icon name={isIn ? 'arrow-down-left' : 'arrow-up-right'} size={iconSize.md} tint={isIn ? color.moneyIn : color.moneyOut} />
               </View>
-              <View style={{ flexShrink: 1 }}>
-                <Text style={styles.directionTitle}>{isIn ? 'IN' : 'OUT'}</Text>
+              {/* flex: 1 so a long date line wraps before it squeezes the amount */}
+              <View style={styles.metaText}>
+                <Text style={styles.directionTitle}>{isIn ? 'Cash in' : 'Cash out'}</Text>
                 <Text style={styles.dateSubText}>{formatDetailDateTime(entry.date, entry.createdAt)}</Text>
               </View>
             </View>
 
-            <Text style={[styles.amountText, { color: isIn ? GREEN : RED }]}>
-              {formatCurrency(entry.amount_paisa || 0)}
-            </Text>
+            <AmountText paisa={entry.amount_paisa || 0} tone={isIn ? 'in' : 'out'} size="title" />
           </View>
 
           {!!entry.description && (
@@ -132,107 +151,159 @@ export const CashEntryDetailScreen = ({ navigation, route }: Props) => {
             </View>
           )}
 
-          <View style={styles.cardDivider} />
+          {/* Category and note (columns since v30). An empty value hides its row —
+              never a label with nothing beside it. */}
+          {(!!category || !!note) && (
+            <View style={styles.fieldList}>
+              {!!category && (
+                <View style={styles.fieldRow}>
+                  <Text style={styles.fieldLabel}>{t('commonCategory')}</Text>
+                  <Text style={styles.fieldValue}>{categoryLabel(t, category)}</Text>
+                </View>
+              )}
+              {!!note && (
+                <View style={[styles.fieldRow, !!category && styles.fieldRowDivided]}>
+                  <Text style={styles.fieldLabel}>{t('commonNote')}</Text>
+                  <Text style={styles.fieldValue}>{note}</Text>
+                </View>
+              )}
+            </View>
+          )}
 
-          {/* EDIT ENTRY button */}
-          <TouchableOpacity style={styles.editBtn} onPress={handleEdit}>
-            <Text style={styles.editIcon}>✏️</Text>
-            <Text style={styles.editText}>EDIT ENTRY</Text>
+          {!!entry.attachment_url && (
+            <View style={styles.attachmentWrap}>
+              <Text style={styles.attachmentLabel}>{t('entryAttachment')}</Text>
+              <TouchableOpacity onPress={() => openAttachment(entry.attachment_url)} activeOpacity={0.85} accessibilityRole="imagebutton">
+                <Image source={{ uri: entry.attachment_url }} style={styles.attachmentImage} resizeMode="cover" />
+                <View style={styles.viewHint}>
+                  <Icon name="maximize-2" size={iconSize.sm} tint={color.textPrimary} />
+                  <Text style={styles.viewHintText}>{t('entryTapToView')}</Text>
+                </View>
+              </TouchableOpacity>
+            </View>
+          )}
+
+          {/* EDIT ENTRY button — never offered on someone else's entry (read-only drill-down) */}
+          {!readOnly && (
+          <TouchableOpacity style={styles.editBtn} onPress={handleEdit} accessibilityRole="button">
+            <Icon name="edit-2" size={iconSize.sm} tint={color.accent} />
+            <Text style={styles.editText}>{t('entryEdit')}</Text>
           </TouchableOpacity>
+          )}
         </View>
 
-        {/* Backed Up Card */}
+        {/* Where the entry lives */}
         <View style={styles.backupCard}>
-          <View style={styles.checkIconWrap}>
-            <Text style={styles.checkIcon}>✓</Text>
-          </View>
-          <Text style={styles.backupText}>Entry is backed up</Text>
+          <Icon name={isBackedUp ? 'check-circle' : 'smartphone'} size={iconSize.md} tint={color.textSecondary} />
+          <Text style={styles.backupText}>{isBackedUp ? 'Backed up' : 'Saved on this phone'}</Text>
         </View>
-      </View>
+      </ScrollView>
 
-      {/* Bottom Fixed Action: DELETE ENTRY */}
-      <View style={[styles.bottomContainer, { paddingBottom: 24 + Math.max(insets.bottom, 12), paddingHorizontal: 16 }]}>
-        <TouchableOpacity style={styles.deleteOutlineBtn} onPress={handleDelete} disabled={deleting}>
+      {/* Bottom Fixed Action: Delete — pinned to the bottom edge of the screen. */}
+      {!readOnly && (
+      <View style={[styles.bottomContainer, { marginBottom: 0 }]}>
+        <TouchableOpacity style={styles.deleteOutlineBtn} onPress={handleDelete} disabled={deleting} accessibilityRole="button">
           {deleting ? (
-            <ActivityIndicator color={RED} />
+            <ActivityIndicator color={color.moneyOut} />
           ) : (
             <>
-              <Text style={styles.deleteIcon}>🗑</Text>
-              <Text style={styles.deleteBtnText}>DELETE ENTRY</Text>
+              <Icon name="trash-2" size={iconSize.sm} tint={color.moneyOut} />
+              <Text style={styles.deleteBtnText}>{t('entryDelete')}</Text>
             </>
           )}
         </TouchableOpacity>
       </View>
+      )}
+      {attachmentViewer}
     </SafeAreaView>
   );
 };
 
 const styles = StyleSheet.create({
-  safe: { flex: 1, backgroundColor: Colors.bgPrimary },
+  safe: { flex: 1, backgroundColor: color.surface },
   header: {
     flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
-    backgroundColor: Colors.bgCard, paddingHorizontal: 16, height: 56,
-    borderBottomWidth: 1, borderBottomColor: Colors.border,
+    backgroundColor: color.surface, paddingHorizontal: space.md, height: 56,
+    borderBottomWidth: hairline, borderBottomColor: color.border,
   },
-  backBtn: { width: 40, justifyContent: 'center' },
-  backArrow: { fontSize: 32, color: Colors.textWhite, fontWeight: '300', marginTop: -4 },
-  headerTitle: { fontSize: 18, fontWeight: '700', color: Colors.textWhite },
+  backBtn: { width: touchTarget, height: touchTarget, alignItems: 'center', justifyContent: 'center' },
+  headerTitle: { ...typeScale.heading, fontSize: 18, color: color.textPrimary, flex: 1, textAlign: 'center' },
 
-  container: { flex: 1, padding: 16, gap: 16 },
+  container: { flex: 1, backgroundColor: color.surfaceRaised },
+  containerContent: { padding: space.lg, gap: space.md },
+  centered: { justifyContent: 'center', alignItems: 'center' },
+  emptyText: { ...typeScale.body, color: color.textSecondary },
 
   card: {
-    backgroundColor: Colors.bgCard, borderRadius: 16,
-    borderWidth: 1, borderColor: Colors.border,
-    padding: 16,
-    shadowColor: '#000', shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.2, elevation: 3
+    backgroundColor: color.surface, borderRadius: radius.lg,
+    borderWidth: hairline, borderColor: color.border,
+    padding: space.lg,
   },
   cardHeaderRow: {
-    flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center',
-    marginBottom: 12
+    flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', gap: space.md,
   },
-  leftMeta: { flexDirection: 'row', alignItems: 'center', gap: 12, flex: 1, marginRight: 8 },
+  leftMeta: { flexDirection: 'row', alignItems: 'center', gap: space.md, flex: 1 },
   circleIcon: {
-    width: 40, height: 40, borderRadius: 20,
-    justifyContent: 'center', alignItems: 'center'
+    width: 44, height: 44, borderRadius: radius.pill, borderWidth: hairline,
+    backgroundColor: color.surface, justifyContent: 'center', alignItems: 'center',
   },
-  circleIconText: { fontSize: 22, fontWeight: '800', color: '#fff' },
-  directionTitle: { fontSize: 16, fontWeight: '800', color: Colors.textWhite },
-  dateSubText: { fontSize: 12, color: Colors.textGray, marginTop: 2 },
-
-  amountText: { fontSize: 18, fontWeight: '800' },
+  metaText: { flex: 1 },
+  directionTitle: { ...typeScale.bodyMedium, color: color.textPrimary },
+  dateSubText: { ...typeScale.caption, color: color.textSecondary, marginTop: 2 },
 
   descWrap: {
-    backgroundColor: Colors.bgInput, padding: 10, borderRadius: 8,
-    marginBottom: 12, borderWidth: 1, borderColor: Colors.border
+    backgroundColor: color.surfaceRaised, padding: space.md, borderRadius: radius.sm,
+    marginTop: space.lg, borderWidth: hairline, borderColor: color.border,
   },
-  descText: { fontSize: 13, color: Colors.textWhite },
+  descText: { ...typeScale.body, color: color.textPrimary },
 
-  cardDivider: { height: 1, backgroundColor: Colors.border, marginVertical: 12 },
+  fieldList: {
+    marginTop: space.lg, borderRadius: radius.sm,
+    borderWidth: hairline, borderColor: color.border, paddingHorizontal: space.md,
+  },
+  fieldRow: { flexDirection: 'row', alignItems: 'flex-start', gap: space.md, paddingVertical: space.md },
+  fieldRowDivided: { borderTopWidth: hairline, borderTopColor: color.border },
+  fieldLabel: { ...typeScale.label, color: color.textSecondary, flexShrink: 0, minWidth: 72 },
+  fieldValue: { ...typeScale.body, color: color.textPrimary, flex: 1, textAlign: 'right' },
+
+  attachmentWrap: { marginTop: space.lg },
+  attachmentLabel: { ...typeScale.label, color: color.textSecondary, marginBottom: space.sm },
+  attachmentImage: {
+    width: '100%', height: 220, borderRadius: radius.md,
+    backgroundColor: color.surfaceRaised, borderWidth: hairline, borderColor: color.border,
+  },
+  viewHint: {
+    position: 'absolute', right: space.sm, bottom: space.sm,
+    flexDirection: 'row', alignItems: 'center', gap: space.xs,
+    paddingHorizontal: space.sm, paddingVertical: space.xs, borderRadius: radius.pill,
+    backgroundColor: color.surface, borderWidth: hairline, borderColor: color.border,
+  },
+  viewHintText: { ...typeScale.caption, color: color.textPrimary },
 
   editBtn: {
-    flexDirection: 'row', justifyContent: 'center', alignItems: 'center',
-    paddingVertical: 8, gap: 8
+    flexDirection: 'row', justifyContent: 'center', alignItems: 'center', gap: space.sm,
+    minHeight: touchTarget, marginTop: space.lg,
+    borderTopWidth: hairline, borderTopColor: color.border, paddingTop: space.md,
   },
-  editIcon: { fontSize: 16 },
-  editText: { fontSize: 14, fontWeight: '800', color: Colors.primaryLight, letterSpacing: 0.5 },
+  editText: { ...typeScale.bodyMedium, color: color.accent },
 
   backupCard: {
-    flexDirection: 'row', alignItems: 'center', gap: 12,
-    backgroundColor: Colors.bgCard, borderRadius: 16,
-    borderWidth: 1, borderColor: Colors.border,
-    padding: 16,
-    shadowColor: '#000', shadowOffset: { width: 0, height: 1 }, shadowOpacity: 0.15, elevation: 2
+    flexDirection: 'row', alignItems: 'center', gap: space.md,
+    backgroundColor: color.surface, borderRadius: radius.lg,
+    borderWidth: hairline, borderColor: color.border,
+    padding: space.lg,
   },
-  checkIconWrap: { width: 24, height: 24, borderRadius: 12, justifyContent: 'center', alignItems: 'center' },
-  checkIcon: { fontSize: 16, color: RED, fontWeight: '800' },
-  backupText: { fontSize: 14, fontWeight: '600', color: Colors.textGray },
+  backupText: { ...typeScale.body, color: color.textSecondary, flex: 1 },
 
-  bottomContainer: { paddingHorizontal: 16, backgroundColor: Colors.bgPrimary },
-  deleteOutlineBtn: {
-    flexDirection: 'row', justifyContent: 'center', alignItems: 'center', gap: 8,
-    height: 52, borderRadius: 26, borderWidth: 1.5, borderColor: RED,
-    backgroundColor: 'transparent'
+  bottomContainer: {
+    position: 'absolute', bottom: 0, left: 0, right: 0,
+    paddingHorizontal: space.lg, paddingVertical: space.md,
+    backgroundColor: color.surface, borderTopWidth: hairline, borderTopColor: color.border,
   },
-  deleteIcon: { fontSize: 16 },
-  deleteBtnText: { fontSize: 15, fontWeight: '800', color: RED, letterSpacing: 0.5 }
+  deleteOutlineBtn: {
+    flexDirection: 'row', justifyContent: 'center', alignItems: 'center', gap: space.sm,
+    minHeight: touchTarget + 4, borderRadius: radius.md, borderWidth: hairline, borderColor: color.moneyOut,
+    backgroundColor: color.surface,
+  },
+  deleteBtnText: { ...typeScale.bodyMedium, color: color.moneyOut },
 });

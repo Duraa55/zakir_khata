@@ -1,4 +1,5 @@
 import React, { useEffect, useState, useCallback } from 'react';
+import { useLanguageStore } from '../../store/useLanguageStore';
 import {
   View, Text, TouchableOpacity, StyleSheet, ScrollView,
   ActivityIndicator, Alert
@@ -9,18 +10,21 @@ import { usePurchaseStore } from '../../store/usePurchaseStore';
 import { useSupplierStore } from '../../store/useSupplierStore';
 import { formatCurrency } from '../../utils/calculations';
 import { PurchaseInvoiceItem } from '../../types/purchase.types';
-import { Colors } from '../../theme';
+import { Icon, AmountText, Button } from '../../components/ui/primitives';
+import { color, space, radius, hairline, touchTarget, iconSize, type as typeScale } from '../../theme/tokens';
 
-const STATUS_STYLE: Record<string, { bg: string; fg: string; label: string }> = {
-  unpaid:  { bg: '#7F1D1D', fg: '#FCA5A5', label: 'UNPAID' },
-  partial: { bg: '#7C2D12', fg: '#FDBA74', label: 'PARTIAL' },
-  paid:    { bg: '#064E3B', fg: '#6EE7B7', label: 'PAID' },
+// Status carries meaning only: anything still owed is amber, settled is ink.
+const STATUS_STYLE: Record<string, { tone: string; label: string }> = {
+  unpaid:  { tone: color.attention, label: 'Unpaid' },
+  partial: { tone: color.attention, label: 'Partial' },
+  paid:    { tone: color.textPrimary, label: 'Paid' },
 };
 
 export const PurchaseInvoiceScreen = ({ navigation, route }: any) => {
   const insets = useSafeAreaInsets();
   const { invoiceId } = route.params;
   const { user } = useAuthStore();
+  const { t } = useLanguageStore();
   const { selectedInvoice: invoice, loading, loadInvoiceById } = usePurchaseStore();
 
   const load = useCallback(() => loadInvoiceById(invoiceId), [invoiceId]);
@@ -31,7 +35,7 @@ export const PurchaseInvoiceScreen = ({ navigation, route }: any) => {
   }, [navigation, load]);
 
   if (loading || !invoice) {
-    return <View style={styles.center}><ActivityIndicator size="large" color={Colors.primary} /></View>;
+    return <View style={styles.center}><ActivityIndicator size="large" color={color.accent} /></View>;
   }
 
   const ss = STATUS_STYLE[invoice.status] ?? STATUS_STYLE.unpaid;
@@ -39,80 +43,95 @@ export const PurchaseInvoiceScreen = ({ navigation, route }: any) => {
   return (
     <SafeAreaView style={styles.safe}>
       <View style={styles.header}>
-        <TouchableOpacity onPress={() => navigation.goBack()} style={styles.backBtn}>
-          <Text style={styles.backArrow}>←</Text>
+        <TouchableOpacity onPress={() => navigation.goBack()} style={styles.backBtn} accessibilityRole="button" accessibilityLabel={t('commonBack')}>
+          <Icon name="chevron-left" size={iconSize.lg} tint={color.textPrimary} />
         </TouchableOpacity>
-        <View>
-          <Text style={styles.headerTitle}>#{invoice.invoice_number}</Text>
-          <Text style={styles.headerSub}>{invoice.supplier_name}</Text>
+        <View style={styles.headerText}>
+          <Text style={styles.headerTitle} numberOfLines={1}>#{invoice.invoice_number}</Text>
+          <Text style={styles.headerSub} numberOfLines={1}>{invoice.supplier_name}</Text>
         </View>
-        <View style={[styles.statusBadge, { backgroundColor: ss.bg }]}>
-          <Text style={[styles.statusText, { color: ss.fg }]}>{ss.label}</Text>
+        <View style={[styles.statusBadge, { borderColor: ss.tone }]}>
+          <Text style={[styles.statusText, { color: ss.tone }]}>{ss.label}</Text>
         </View>
       </View>
 
-      <ScrollView contentContainerStyle={{ paddingBottom: 180 }}>
+      <ScrollView contentContainerStyle={styles.scroll}>
         {/* Summary Card */}
         <View style={styles.summaryCard}>
           <View style={styles.summaryRow}>
             <View style={styles.summaryCol}>
-              <Text style={styles.summaryLabel}>Invoice Date</Text>
+              <Text style={styles.summaryLabel}>{t('piInvoiceDate')}</Text>
               <Text style={styles.summaryVal}>{invoice.invoice_date}</Text>
             </View>
             {invoice.due_date && (
               <View style={styles.summaryCol}>
-                <Text style={styles.summaryLabel}>Due Date</Text>
-                <Text style={[styles.summaryVal, { color: Colors.error }]}>{invoice.due_date}</Text>
+                <Text style={styles.summaryLabel}>{t('piDueDate')}</Text>
+                <Text style={[styles.summaryVal, styles.dueDate]}>{invoice.due_date}</Text>
               </View>
             )}
             {invoice.po_id && (
               <View style={styles.summaryCol}>
-                <Text style={styles.summaryLabel}>Linked PO</Text>
-                <TouchableOpacity onPress={() => navigation.navigate('PurchaseOrderDetail', { orderId: invoice.po_id })}>
-                  <Text style={[styles.summaryVal, { color: Colors.primaryLight }]}>View PO →</Text>
+                <Text style={styles.summaryLabel}>{t('piLinkedOrder')}</Text>
+                <TouchableOpacity style={styles.linkBtn} onPress={() => navigation.navigate('PurchaseOrderDetail', { orderId: invoice.po_id })}>
+                  <Text style={styles.linkText}>{t('piViewOrder')}</Text>
+                  <Icon name="chevron-right" size={iconSize.sm} tint={color.accent} />
                 </TouchableOpacity>
               </View>
             )}
           </View>
-          {invoice.notes && <Text style={styles.notes}>📝 {invoice.notes}</Text>}
+          {invoice.notes && (
+            <View style={styles.notesRow}>
+              <Icon name="file-text" size={iconSize.sm} tint={color.textSecondary} />
+              <Text style={styles.notes}>{invoice.notes}</Text>
+            </View>
+          )}
         </View>
 
         {/* Line Items */}
         <View style={styles.card}>
-          <Text style={styles.cardTitle}>Items</Text>
+          <Text style={styles.cardTitle}>{t('piItems')}</Text>
           {(invoice.items ?? []).map((item: PurchaseInvoiceItem) => (
             <View key={item.id} style={styles.lineRow}>
-              <View style={{ flex: 1 }}>
+              <View style={styles.lineInfo}>
                 <Text style={styles.lineName}>{item.item_name}</Text>
-                <Text style={styles.lineDetail}>{item.quantity} × {formatCurrency(item.unit_cost)}</Text>
+                <Text style={styles.lineDetail}>{item.quantity} × {formatCurrency(item.unit_cost, invoice.currency)}</Text>
               </View>
-              <Text style={styles.lineTotal}>{formatCurrency(item.line_total)}</Text>
+              <AmountText currency={invoice.currency} paisa={item.line_total} />
             </View>
           ))}
 
           <View style={styles.divider} />
-          <View style={styles.totalRow}><Text style={styles.totalLabel}>Subtotal</Text><Text style={styles.totalVal}>{formatCurrency(invoice.subtotal)}</Text></View>
-          {invoice.discount_amount > 0 && <View style={styles.totalRow}><Text style={[styles.totalLabel, { color: Colors.success }]}>Discount</Text><Text style={[styles.totalVal, { color: Colors.success }]}>-{formatCurrency(invoice.discount_amount)}</Text></View>}
-          {invoice.tax_amount > 0 && <View style={styles.totalRow}><Text style={styles.totalLabel}>Tax</Text><Text style={styles.totalVal}>{formatCurrency(invoice.tax_amount)}</Text></View>}
+          <View style={styles.totalRow}><Text style={styles.totalLabel}>{t('piSubtotal')}</Text><AmountText currency={invoice.currency} paisa={invoice.subtotal} size="label" /></View>
+          {invoice.discount_amount > 0 && (
+            <View style={styles.totalRow}>
+              <Text style={styles.totalLabel}>{t('piDiscount')}</Text>
+              <Text style={styles.totalVal}>−{formatCurrency(invoice.discount_amount, invoice.currency)}</Text>
+            </View>
+          )}
+          {invoice.tax_amount > 0 && <View style={styles.totalRow}><Text style={styles.totalLabel}>Tax</Text><AmountText currency={invoice.currency} paisa={invoice.tax_amount} size="label" /></View>}
           <View style={[styles.totalRow, styles.grandRow]}>
-            <Text style={styles.grandLabel}>Total</Text>
-            <Text style={styles.grandVal}>{formatCurrency(invoice.total)}</Text>
+            <Text style={styles.grandLabel}>{t('billTotal')}</Text>
+            <AmountText currency={invoice.currency} paisa={invoice.total} size="title" />
           </View>
-          <View style={styles.totalRow}><Text style={[styles.totalLabel, { color: Colors.success }]}>Amount Paid</Text><Text style={[styles.totalVal, { color: Colors.success }]}>{formatCurrency(invoice.amount_paid)}</Text></View>
+          <View style={styles.totalRow}><Text style={styles.totalLabel}>{t('piAmountPaid')}</Text><AmountText currency={invoice.currency} paisa={invoice.amount_paid} size="label" /></View>
           {invoice.balance_due > 0 && (
-            <View style={[styles.totalRow, { backgroundColor: 'rgba(239,68,68,0.15)', borderRadius: 8, padding: 8, marginTop: 4 }]}>
-              <Text style={[styles.grandLabel, { color: Colors.error }]}>Balance Due</Text>
-              <Text style={[styles.grandVal, { color: Colors.error }]}>{formatCurrency(invoice.balance_due)}</Text>
+            <View style={[styles.totalRow, styles.dueRow]}>
+              <Text style={styles.grandLabel}>{t('billBalanceDue')}</Text>
+              <AmountText currency={invoice.currency} paisa={invoice.balance_due} tone="out" />
             </View>
           )}
         </View>
 
         {/* Actions */}
         <View style={styles.card}>
-          <Text style={styles.cardTitle}>Actions</Text>
+          <Text style={styles.cardTitle}>{t('poActions')}</Text>
           {invoice.status !== 'paid' && (
-            <TouchableOpacity
-              style={[styles.actionBtn, { backgroundColor: Colors.bgInput, borderColor: Colors.success }]}
+            <Button
+              label={t('piRecordPayment')}
+              icon="credit-card"
+              variant="secondary"
+              fullWidth
+              style={styles.actionBtn}
               onPress={() => navigation.navigate('AddSupplierPayment', {
                 supplierId: invoice.supplier_id,
                 supplierName: invoice.supplier_name,
@@ -120,33 +139,35 @@ export const PurchaseInvoiceScreen = ({ navigation, route }: any) => {
                 invoiceNumber: invoice.invoice_number,
                 maxAmount: invoice.balance_due,
               })}
-            >
-              <Text style={[styles.actionBtnText, { color: Colors.success }]}>💳 Record Payment</Text>
-            </TouchableOpacity>
+            />
           )}
-          <TouchableOpacity
-            style={[styles.actionBtn, { backgroundColor: Colors.bgInput, borderColor: Colors.warning }]}
+          <Button
+            label={t('piPurchaseReturn')}
+            icon="corner-up-left"
+            variant="secondary"
+            fullWidth
+            style={styles.actionBtn}
             onPress={() => navigation.navigate('PurchaseReturn', {
               invoiceId: invoice.id,
               supplierId: invoice.supplier_id,
               supplierName: invoice.supplier_name,
               items: invoice.items,
+              currency: invoice.currency,
             })}
-          >
-            <Text style={[styles.actionBtnText, { color: Colors.warning }]}>↩️ Purchase Return</Text>
-          </TouchableOpacity>
+          />
         </View>
       </ScrollView>
 
       {/* Sticky Pay Button */}
       {invoice.status !== 'paid' && (
-        <View style={[styles.stickyBar, { bottom: 85 + Math.max(insets.bottom, 8) }]}>
-          <View style={{ flex: 1 }}>
-            <Text style={styles.stickyLabel}>Balance Due</Text>
-            <Text style={styles.stickyAmt}>{formatCurrency(invoice.balance_due)}</Text>
+        <View style={[styles.stickyBar, { bottom: 0 }]}>
+          <View style={styles.stickyInfo}>
+            <Text style={styles.stickyLabel}>{t('billBalanceDue')}</Text>
+            <AmountText currency={invoice.currency} paisa={invoice.balance_due} tone="out" size="title" fit />
           </View>
-          <TouchableOpacity
-            style={styles.payBtn}
+          <Button
+            label={t('supPayNow')}
+            icon="arrow-right"
             onPress={() => navigation.navigate('AddSupplierPayment', {
               supplierId: invoice.supplier_id,
               supplierName: invoice.supplier_name,
@@ -154,9 +175,7 @@ export const PurchaseInvoiceScreen = ({ navigation, route }: any) => {
               invoiceNumber: invoice.invoice_number,
               maxAmount: invoice.balance_due,
             })}
-          >
-            <Text style={styles.payBtnText}>Pay Now →</Text>
-          </TouchableOpacity>
+          />
         </View>
       )}
     </SafeAreaView>
@@ -164,44 +183,48 @@ export const PurchaseInvoiceScreen = ({ navigation, route }: any) => {
 };
 
 const styles = StyleSheet.create({
-  safe: { flex: 1, backgroundColor: Colors.bgPrimary },
-  center: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: Colors.bgPrimary },
+  safe: { flex: 1, backgroundColor: color.surface },
+  center: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: color.surface },
   header: {
-    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
-    backgroundColor: Colors.bgCard, paddingHorizontal: 16, paddingVertical: 14,
-    borderBottomWidth: 1, borderBottomColor: Colors.border,
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: space.sm,
+    backgroundColor: color.surface, paddingHorizontal: space.md, minHeight: 56, paddingVertical: space.sm,
+    borderBottomWidth: hairline, borderBottomColor: color.border,
   },
-  backBtn: { width: 36 },
-  backArrow: { fontSize: 22, color: Colors.textWhite, fontWeight: '700' },
-  headerTitle: { fontSize: 18, fontWeight: '700', color: Colors.textWhite },
-  headerSub: { fontSize: 11, color: Colors.textGray },
-  statusBadge: { paddingHorizontal: 10, paddingVertical: 4, borderRadius: 10 },
-  statusText: { fontSize: 11, fontWeight: '800' },
-  summaryCard: { backgroundColor: Colors.bgCard, margin: 16, borderRadius: 14, padding: 16, borderWidth: 1, borderColor: Colors.border, shadowColor: '#000', shadowOpacity: 0.2, elevation: 2 },
-  summaryRow: { flexDirection: 'row', gap: 16, marginBottom: 4 },
+  backBtn: { width: touchTarget, height: touchTarget, alignItems: 'center', justifyContent: 'center' },
+  headerText: { flex: 1 },
+  headerTitle: { ...typeScale.heading, fontSize: 18, color: color.textPrimary },
+  headerSub: { ...typeScale.caption, color: color.textSecondary },
+  statusBadge: { paddingHorizontal: space.sm, paddingVertical: 2, borderRadius: radius.pill, borderWidth: hairline },
+  statusText: { ...typeScale.caption },
+  scroll: { paddingBottom: 180 },
+  summaryCard: { backgroundColor: color.surface, margin: space.lg, borderRadius: radius.lg, padding: space.lg, borderWidth: hairline, borderColor: color.border },
+  summaryRow: { flexDirection: 'row', gap: space.lg },
   summaryCol: { flex: 1 },
-  summaryLabel: { fontSize: 10, color: Colors.textGray, fontWeight: '600', marginBottom: 2 },
-  summaryVal: { fontSize: 13, fontWeight: '700', color: Colors.textWhite },
-  notes: { fontSize: 13, color: Colors.textGray, marginTop: 8, fontStyle: 'italic' },
-  card: { backgroundColor: Colors.bgCard, marginHorizontal: 16, marginBottom: 12, borderRadius: 14, padding: 16, borderWidth: 1, borderColor: Colors.border, shadowColor: '#000', shadowOpacity: 0.2, elevation: 2 },
-  cardTitle: { fontSize: 13, fontWeight: '700', color: Colors.textWhite, marginBottom: 12 },
-  lineRow: { flexDirection: 'row', justifyContent: 'space-between', paddingVertical: 8, borderBottomWidth: 1, borderBottomColor: Colors.border },
-  lineName: { fontSize: 13, fontWeight: '600', color: Colors.textWhite },
-  lineDetail: { fontSize: 11, color: Colors.textGray, marginTop: 2 },
-  lineTotal: { fontSize: 14, fontWeight: '700', color: Colors.textWhite },
-  divider: { height: 1, backgroundColor: Colors.border, marginVertical: 10 },
-  totalRow: { flexDirection: 'row', justifyContent: 'space-between', paddingVertical: 4 },
-  totalLabel: { fontSize: 13, color: Colors.textGray, fontWeight: '600' },
-  totalVal: { fontSize: 13, fontWeight: '700', color: Colors.textWhite },
-  grandRow: { paddingTop: 10, marginTop: 4 },
-  grandLabel: { fontSize: 15, fontWeight: '800', color: Colors.textWhite },
-  grandVal: { fontSize: 17, fontWeight: '800', color: Colors.primaryLight },
-  actionBtn: { borderWidth: 1.5, borderRadius: 12, paddingVertical: 13, alignItems: 'center', marginBottom: 10, backgroundColor: Colors.bgInput },
-  actionBtnText: { fontSize: 14, fontWeight: '700' },
-  stickyBar: { position: 'absolute', bottom: 0, left: 0, right: 0, flexDirection: 'row', alignItems: 'center', backgroundColor: Colors.bgCard, borderTopWidth: 1, borderTopColor: Colors.border, padding: 16 },
-  stickyLabel: { fontSize: 11, color: Colors.textGray, fontWeight: '600' },
-  stickyAmt: { fontSize: 18, fontWeight: '800', color: Colors.error },
-  payBtn: { backgroundColor: Colors.primary, paddingHorizontal: 24, paddingVertical: 12, borderRadius: 20 },
-  payBtnText: { color: Colors.textWhite, fontWeight: '800', fontSize: 14 },
+  summaryLabel: { ...typeScale.caption, color: color.textSecondary, marginBottom: 2 },
+  summaryVal: { ...typeScale.bodyMedium, color: color.textPrimary },
+  dueDate: { color: color.attention },
+  linkBtn: { flexDirection: 'row', alignItems: 'center', gap: 2, minHeight: touchTarget },
+  linkText: { ...typeScale.bodyMedium, color: color.accent },
+  notesRow: { flexDirection: 'row', gap: space.sm, alignItems: 'flex-start', marginTop: space.md },
+  notes: { ...typeScale.label, flex: 1, color: color.textSecondary },
+  card: { backgroundColor: color.surface, marginHorizontal: space.lg, marginBottom: space.md, borderRadius: radius.lg, padding: space.lg, borderWidth: hairline, borderColor: color.border },
+  cardTitle: { ...typeScale.bodyMedium, color: color.textPrimary, marginBottom: space.md },
+  lineRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', gap: space.md, paddingVertical: space.sm, borderBottomWidth: hairline, borderBottomColor: color.border },
+  lineInfo: { flex: 1 },
+  lineName: { ...typeScale.bodyMedium, color: color.textPrimary },
+  lineDetail: { ...typeScale.caption, color: color.textSecondary, marginTop: 2 },
+  divider: { height: hairline, backgroundColor: color.border, marginVertical: space.md },
+  totalRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', gap: space.md, paddingVertical: space.xs },
+  totalLabel: { ...typeScale.label, color: color.textSecondary, flex: 1 },
+  totalVal: { ...typeScale.label, color: color.textPrimary, flexShrink: 0 },
+  grandRow: { paddingTop: space.md, marginTop: space.xs, borderTopWidth: hairline, borderTopColor: color.border },
+  grandLabel: { ...typeScale.bodyMedium, color: color.textPrimary, flex: 1 },
+  dueRow: { marginTop: space.xs, paddingVertical: space.sm },
+  actionBtn: { marginBottom: space.sm },
+  stickyBar: {
+    position: 'absolute', bottom: 0, left: 0, right: 0, flexDirection: 'row', alignItems: 'center', gap: space.md,
+    backgroundColor: color.surface, borderTopWidth: hairline, borderTopColor: color.border, padding: space.lg,
+  },
+  stickyInfo: { flex: 1 },
+  stickyLabel: { ...typeScale.caption, color: color.textSecondary },
 });
-

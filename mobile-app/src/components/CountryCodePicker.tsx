@@ -2,27 +2,34 @@ import type { TKey } from '../i18n/en';
 import { useLanguageStore } from '../store/useLanguageStore';
 import React, { useState } from 'react';
 import { View, Text, TouchableOpacity, Modal, FlatList, StyleSheet, Platform } from 'react-native';
+import { Icon } from './ui/primitives';
+import { color, space, radius, hairline, touchTarget, iconSize, type as typeScale } from '../theme/tokens';
 
 export type CountryInfo = {
   name: string;
   labelKey: TKey;
   code: string;
-  flag: string;
+  /** ISO short code shown instead of a flag emoji (emoji render differently on every phone). */
+  iso: string;
 };
 
 export const ASIAN_COUNTRIES: CountryInfo[] = [
-  { name: 'Pakistan', labelKey: 'country0', code: '+92', flag: '🇵🇰' },
-  { name: 'India', labelKey: 'country1', code: '+91', flag: '🇮🇳' },
-  { name: 'Bangladesh', labelKey: 'country2', code: '+880', flag: '🇧🇩' },
-  { name: 'Afghanistan', labelKey: 'country3', code: '+93', flag: '🇦🇫' },
-  { name: 'Saudi Arabia', labelKey: 'country4', code: '+966', flag: '🇸🇦' },
-  { name: 'United Arab Emirates', labelKey: 'country5', code: '+971', flag: '🇦🇪' },
-  { name: 'Qatar', labelKey: 'country6', code: '+974', flag: '🇶🇦' },
-  { name: 'Oman', labelKey: 'country7', code: '+968', flag: '🇴🇲' },
-  { name: 'Kuwait', labelKey: 'country8', code: '+965', flag: '🇰🇼' },
-  { name: 'Bahrain', labelKey: 'country9', code: '+973', flag: '🇧🇭' },
-  { name: 'Malaysia', labelKey: 'country10', code: '+60', flag: '🇲🇾' },
-  { name: 'Indonesia', labelKey: 'country11', code: '+62', flag: '🇮🇩' },
+  { name: 'Pakistan', labelKey: 'country0', code: '+92', iso: 'PK' },
+  { name: 'India', labelKey: 'country1', code: '+91', iso: 'IN' },
+  { name: 'Bangladesh', labelKey: 'country2', code: '+880', iso: 'BD' },
+  { name: 'Afghanistan', labelKey: 'country3', code: '+93', iso: 'AF' },
+  { name: 'Saudi Arabia', labelKey: 'country4', code: '+966', iso: 'SA' },
+  { name: 'United Arab Emirates', labelKey: 'country5', code: '+971', iso: 'AE' },
+  { name: 'Qatar', labelKey: 'country6', code: '+974', iso: 'QA' },
+  { name: 'Oman', labelKey: 'country7', code: '+968', iso: 'OM' },
+  { name: 'Kuwait', labelKey: 'country8', code: '+965', iso: 'KW' },
+  { name: 'Bahrain', labelKey: 'country9', code: '+973', iso: 'BH' },
+  { name: 'Malaysia', labelKey: 'country10', code: '+60', iso: 'MY' },
+  { name: 'Indonesia', labelKey: 'country11', code: '+62', iso: 'ID' },
+  // Added 2026-10-03: USD and CNY are supported currencies, and the account default is
+  // suggested from this code — without these two the suggestion could never reach them.
+  { name: 'United States', labelKey: 'country12', code: '+1', iso: 'US' },
+  { name: 'China', labelKey: 'country13', code: '+86', iso: 'CN' },
 ];
 
 interface CountryCodePickerProps {
@@ -38,13 +45,15 @@ export const CountryCodePicker = ({ selectedCode, onSelect }: CountryCodePickerP
 
   return (
     <>
-      <TouchableOpacity 
-        style={styles.container} 
+      <TouchableOpacity
+        style={styles.container}
         onPress={() => setModalVisible(true)}
+        accessibilityRole="button"
+        accessibilityLabel={t('selectCountry')}
       >
-        <Text style={styles.text}>
-          {selectedCountry.flag} {selectedCountry.code}
-        </Text>
+        <Text style={styles.iso}>{selectedCountry.iso}</Text>
+        <Text style={styles.text}>{selectedCountry.code}</Text>
+        <Icon name="chevron-down" size={iconSize.sm} tint={color.textSecondary} />
       </TouchableOpacity>
 
       <Modal
@@ -53,35 +62,41 @@ export const CountryCodePicker = ({ selectedCode, onSelect }: CountryCodePickerP
         transparent={true}
         onRequestClose={() => setModalVisible(false)}
       >
-        <TouchableOpacity 
-          style={styles.modalOverlay} 
-          activeOpacity={1} 
+        <TouchableOpacity
+          style={styles.modalOverlay}
+          activeOpacity={1}
           onPress={() => setModalVisible(false)}
         >
           <View style={styles.modalContent}>
             <View style={styles.modalHeader}>
               <Text style={styles.modalTitle}>{t('selectCountry')}</Text>
-              <TouchableOpacity onPress={() => setModalVisible(false)}>
-                <Text style={styles.closeBtn}>{t('close')}</Text>
+              <TouchableOpacity onPress={() => setModalVisible(false)} style={styles.closeBtn} accessibilityRole="button">
+                <Text style={styles.closeText}>{t('close')}</Text>
               </TouchableOpacity>
             </View>
-            
+
             <FlatList
               data={ASIAN_COUNTRIES}
               keyExtractor={item => item.code}
-              renderItem={({ item }) => (
-                <TouchableOpacity 
-                  style={styles.item}
-                  onPress={() => {
-                    onSelect(item.code);
-                    setModalVisible(false);
-                  }}
-                >
-                  <Text style={styles.itemFlag}>{item.flag}</Text>
-                  <Text style={styles.itemName}>{t(item.labelKey)}</Text>
-                  <Text style={styles.itemCode}>{item.code}</Text>
-                </TouchableOpacity>
-              )}
+              renderItem={({ item }) => {
+                const active = item.code === selectedCode;
+                return (
+                  <TouchableOpacity
+                    style={styles.item}
+                    onPress={() => {
+                      onSelect(item.code);
+                      setModalVisible(false);
+                    }}
+                    accessibilityRole="radio"
+                    accessibilityState={{ selected: active }}
+                  >
+                    <Text style={styles.itemIso}>{item.iso}</Text>
+                    <Text style={styles.itemName}>{t(item.labelKey)}</Text>
+                    <Text style={styles.itemCode}>{item.code}</Text>
+                    {active && <Icon name="check" size={iconSize.sm} tint={color.accent} />}
+                  </TouchableOpacity>
+                );
+              }}
             />
           </View>
         </TouchableOpacity>
@@ -92,71 +107,30 @@ export const CountryCodePicker = ({ selectedCode, onSelect }: CountryCodePickerP
 
 const styles = StyleSheet.create({
   container: {
-    backgroundColor: '#fff',
-    borderWidth: 1.5,
-    borderColor: '#E5E7EB',
-    borderRadius: 12,
-    paddingHorizontal: 12,
-    paddingVertical: 13,
-    justifyContent: 'center',
-    alignItems: 'center',
-    marginRight: 8,
+    flexDirection: 'row', alignItems: 'center', gap: space.xs,
+    backgroundColor: color.surfaceRaised, borderWidth: hairline, borderColor: color.border,
+    borderRadius: radius.md, paddingHorizontal: space.md, minHeight: 48, marginRight: space.sm,
   },
-  text: {
-    fontSize: 15,
-    color: '#374151',
-    fontWeight: '600',
-  },
-  modalOverlay: {
-    flex: 1,
-    backgroundColor: 'rgba(0,0,0,0.5)',
-    justifyContent: 'flex-end',
-  },
+  iso: { ...typeScale.caption, color: color.textSecondary },
+  text: { ...typeScale.bodyMedium, color: color.textPrimary },
+  modalOverlay: { flex: 1, backgroundColor: color.scrim, justifyContent: 'flex-end' },
   modalContent: {
-    backgroundColor: '#fff',
-    borderTopLeftRadius: 24,
-    borderTopRightRadius: 24,
-    maxHeight: '70%',
-    paddingBottom: Platform.OS === 'ios' ? 40 : 20,
+    backgroundColor: color.surface, borderTopLeftRadius: radius.lg, borderTopRightRadius: radius.lg,
+    maxHeight: '70%', paddingBottom: Platform.OS === 'ios' ? space.xxxl : space.xl,
   },
   modalHeader: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    padding: 20,
-    borderBottomWidth: 1,
-    borderBottomColor: '#F3F4F6',
+    flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', gap: space.md,
+    paddingLeft: space.xl, paddingRight: space.sm, minHeight: 56,
+    borderBottomWidth: hairline, borderBottomColor: color.border,
   },
-  modalTitle: {
-    fontSize: 18,
-    fontWeight: '700',
-    color: '#111827',
-  },
-  closeBtn: {
-    fontSize: 16,
-    color: '#FF6B35',
-    fontWeight: '600',
-  },
+  modalTitle: { ...typeScale.heading, fontSize: 18, color: color.textPrimary, flex: 1 },
+  closeBtn: { minHeight: touchTarget, paddingHorizontal: space.md, justifyContent: 'center' },
+  closeText: { ...typeScale.bodyMedium, color: color.accent },
   item: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingVertical: 16,
-    paddingHorizontal: 20,
-    borderBottomWidth: 1,
-    borderBottomColor: '#F3F4F6',
+    flexDirection: 'row', alignItems: 'center', gap: space.md, minHeight: 52,
+    paddingHorizontal: space.xl, borderBottomWidth: hairline, borderBottomColor: color.border,
   },
-  itemFlag: {
-    fontSize: 24,
-    marginRight: 12,
-  },
-  itemName: {
-    flex: 1,
-    fontSize: 16,
-    color: '#374151',
-  },
-  itemCode: {
-    fontSize: 16,
-    fontWeight: '600',
-    color: '#111827',
-  },
+  itemIso: { ...typeScale.caption, color: color.textSecondary, width: 28 },
+  itemName: { ...typeScale.body, color: color.textPrimary, flex: 1 },
+  itemCode: { ...typeScale.bodyMedium, color: color.textPrimary },
 });

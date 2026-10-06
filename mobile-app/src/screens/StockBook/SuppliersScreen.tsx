@@ -1,4 +1,5 @@
 import React, { useEffect, useState, useCallback } from 'react';
+import { useLanguageStore } from '../../store/useLanguageStore';
 import {
   View, Text, TextInput, TouchableOpacity, StyleSheet,
   FlatList, ActivityIndicator, Linking
@@ -7,51 +8,53 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { useAuthStore } from '../../store/authStore';
 import { useSupplierStore } from '../../store/useSupplierStore';
 import { Supplier } from '../../types/supplier.types';
-import { formatCurrency } from '../../utils/calculations';
+import { internationalPhone } from '../../utils/phone';
 import { ScreenContainer } from '../../components/ui/ScreenContainer';
-import { Colors } from '../../theme';
+import { color, space, radius, type as typeScale, hairline, iconSize, touchTarget } from '../../theme/tokens';
+import { Icon, AmountText } from '../../components/ui/primitives';
 
 const SupplierCard = React.memo(({ item, onPress, onCall, onWhatsApp }: {
   item: Supplier;
   onPress: () => void;
   onCall: () => void;
   onWhatsApp: () => void;
-}) => (
-  <TouchableOpacity style={styles.card} onPress={onPress} activeOpacity={0.85}>
+}) => {
+  const { t } = useLanguageStore();
+  return (
+  <TouchableOpacity style={styles.card} onPress={onPress} activeOpacity={0.85} accessibilityRole="button">
     <View style={styles.cardLeft}>
       <View style={styles.avatar}>
         <Text style={styles.avatarText}>{item.name.charAt(0).toUpperCase()}</Text>
       </View>
       <View style={styles.cardInfo}>
         <Text style={styles.supplierName} numberOfLines={1}>{item.name}</Text>
-        {item.business_name ? <Text style={styles.businessName} numberOfLines={1}>🏢 {item.business_name}</Text> : null}
-        {item.phone ? <Text style={styles.phone}>📞 {item.phone}</Text> : null}
+        {!!item.business_name && <Text style={styles.meta} numberOfLines={1}>{item.business_name}</Text>}
+        {!!item.phone && <Text style={styles.meta}>{item.phone}</Text>}
         {(item.outstanding_balance ?? 0) > 0 && (
-          <View style={styles.outstandingBadge}>
-            <Text style={styles.outstandingText}>
-              Payable: {formatCurrency((item.outstanding_balance ?? 0))}
-            </Text>
+          <View style={styles.outstandingLine}>
+            <Text style={styles.outstandingLabel}>{t('supPayable')}</Text>
+            <AmountText paisa={item.outstanding_balance ?? 0} size="label" tone="out" />
           </View>
         )}
       </View>
     </View>
-    <View style={styles.cardActions}>
-      {item.phone ? (
-        <>
-          <TouchableOpacity style={styles.actionBtn} onPress={onCall}>
-            <Text style={styles.actionIcon}>📞</Text>
-          </TouchableOpacity>
-          <TouchableOpacity style={[styles.actionBtn, { backgroundColor: 'rgba(37, 211, 102, 0.15)' }]} onPress={onWhatsApp}>
-            <Text style={styles.actionIcon}>💬</Text>
-          </TouchableOpacity>
-        </>
-      ) : null}
-    </View>
+    {!!item.phone && (
+      <View style={styles.cardActions}>
+        <TouchableOpacity style={styles.actionBtn} onPress={onCall} accessibilityRole="button" accessibilityLabel={t('supCall')}>
+          <Icon name="phone" size={iconSize.sm} tint={color.accent} />
+        </TouchableOpacity>
+        <TouchableOpacity style={styles.actionBtn} onPress={onWhatsApp} accessibilityRole="button" accessibilityLabel={t('supWhatsApp')}>
+          <Icon name="message-circle" size={iconSize.sm} tint={color.accent} />
+        </TouchableOpacity>
+      </View>
+    )}
   </TouchableOpacity>
-));
+  );
+});
 
 export const SuppliersScreen = ({ navigation }: any) => {
   const { user } = useAuthStore();
+  const { t } = useLanguageStore();
   const { suppliers, loading, loadSuppliers } = useSupplierStore();
   const [search, setSearch] = useState('');
 
@@ -72,61 +75,62 @@ export const SuppliersScreen = ({ navigation }: any) => {
     : suppliers;
 
   const handleCall = (phone: string) => Linking.openURL(`tel:${phone}`);
+  // Country-aware: a Dubai supplier's number is not rewritten as a Pakistani one.
   const handleWhatsApp = (phone: string) => {
-    const clean = phone.replace(/\D/g, '');
-    Linking.openURL(`whatsapp://send?phone=92${clean.replace(/^0/, '')}`);
+    const intl = internationalPhone(phone);
+    if (intl) Linking.openURL(`whatsapp://send?phone=${intl}`);
   };
 
+  // The supplier list is not paged, and each row's balance is an SQL aggregate.
   const totalOutstanding = suppliers.reduce((s, sup) => s + (sup.outstanding_balance ?? 0), 0);
 
   return (
     <SafeAreaView style={styles.safe}>
-      {/* Header */}
       <View style={styles.header}>
-        <TouchableOpacity onPress={() => navigation.goBack()} style={styles.backBtn}>
-          <Text style={styles.backArrow}>←</Text>
+        <TouchableOpacity onPress={() => navigation.goBack()} style={styles.iconBtn} accessibilityRole="button" accessibilityLabel={t('commonBack')}>
+          <Icon name="chevron-left" size={iconSize.lg} tint={color.textPrimary} />
         </TouchableOpacity>
-        <View>
-          <Text style={styles.headerTitle}>Suppliers</Text>
+        <View style={styles.headerText}>
+          <Text style={styles.headerTitle}>{t('stockSuppliers')}</Text>
           <Text style={styles.headerSub}>{suppliers.length} suppliers</Text>
         </View>
-        <TouchableOpacity style={styles.addHeaderBtn} onPress={() => navigation.navigate('AddSupplierModal')}>
-          <Text style={styles.addHeaderText}>+ Add</Text>
+        <TouchableOpacity style={styles.addHeaderBtn} onPress={() => navigation.navigate('AddSupplierModal')} accessibilityRole="button">
+          <Icon name="plus" size={iconSize.sm} tint={color.textInverse} />
+          <Text style={styles.addHeaderText}>Add</Text>
         </TouchableOpacity>
       </View>
 
       <ScreenContainer scrollable={false} hasTabBar={true} style={styles.container}>
-        {/* Outstanding Summary */}
         {totalOutstanding > 0 && (
-          <TouchableOpacity style={styles.summaryBanner} onPress={() => navigation.navigate('OutstandingPayables')}>
-            <Text style={styles.summaryLabel}>Total Outstanding Payables</Text>
-            <Text style={styles.summaryAmount}>{formatCurrency(totalOutstanding)}</Text>
-            <Text style={styles.summaryArrow}>→</Text>
+          <TouchableOpacity style={styles.summaryBanner} onPress={() => navigation.navigate('OutstandingPayables')} accessibilityRole="button">
+            <Text style={styles.summaryLabel}>{t('supTotalPayables')}</Text>
+            <AmountText paisa={totalOutstanding} tone="out" />
+            <Icon name="chevron-right" size={iconSize.sm} tint={color.textMuted} />
           </TouchableOpacity>
         )}
 
-        {/* Search */}
         <View style={styles.searchWrap}>
-          <Text style={styles.searchIcon}>🔍</Text>
+          <Icon name="search" size={iconSize.sm} tint={color.textMuted} />
           <TextInput
             style={styles.searchInput}
-            placeholder="Search by name or business..."
+            placeholder={t('supSearch')}
             value={search}
             onChangeText={setSearch}
-            placeholderTextColor={Colors.textGray}
+            placeholderTextColor={color.textMuted}
           />
         </View>
 
         {loading ? (
-          <ActivityIndicator size="large" color={Colors.primary} style={{ flex: 1 }} />
+          <ActivityIndicator size="large" color={color.accent} style={styles.spinner} />
         ) : filtered.length === 0 ? (
           <View style={styles.empty}>
-            <Text style={{ fontSize: 56 }}>🏭</Text>
-            <Text style={styles.emptyTitle}>{search ? 'No results found' : 'No Suppliers Yet'}</Text>
+            <Icon name="truck" size={40} tint={color.textMuted} />
+            <Text style={styles.emptyTitle}>{search ? 'No results found' : 'No suppliers yet'}</Text>
             <Text style={styles.emptySub}>{search ? 'Try a different search' : 'Add your first supplier to get started'}</Text>
             {!search && (
-              <TouchableOpacity style={styles.emptyBtn} onPress={() => navigation.navigate('AddSupplierModal')}>
-                <Text style={styles.emptyBtnText}>+ Add Supplier</Text>
+              <TouchableOpacity style={styles.emptyBtn} onPress={() => navigation.navigate('AddSupplierModal')} accessibilityRole="button">
+                <Icon name="plus" size={iconSize.sm} tint={color.textInverse} />
+                <Text style={styles.emptyBtnText}>{t('supAdd')}</Text>
               </TouchableOpacity>
             )}
           </View>
@@ -134,8 +138,8 @@ export const SuppliersScreen = ({ navigation }: any) => {
           <FlatList
             data={filtered}
             keyExtractor={i => i.id}
-            style={{ flex: 1 }}
-            contentContainerStyle={{ padding: 16, paddingBottom: 24 }}
+            style={styles.list}
+            contentContainerStyle={styles.listContent}
             renderItem={({ item }) => (
               <SupplierCard
                 item={item}
@@ -144,7 +148,7 @@ export const SuppliersScreen = ({ navigation }: any) => {
                 onWhatsApp={() => item.phone && handleWhatsApp(item.phone)}
               />
             )}
-            ItemSeparatorComponent={() => <View style={{ height: 10 }} />}
+            ItemSeparatorComponent={() => <View style={styles.separator} />}
           />
         )}
       </ScreenContainer>
@@ -153,58 +157,60 @@ export const SuppliersScreen = ({ navigation }: any) => {
 };
 
 const styles = StyleSheet.create({
-  safe: { flex: 1, backgroundColor: Colors.bgPrimary },
-  container: { flex: 1, backgroundColor: Colors.bgPrimary },
+  safe: { flex: 1, backgroundColor: color.surface },
+  container: { flex: 1, backgroundColor: color.surface },
   header: {
-    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
-    backgroundColor: Colors.bgCard, paddingHorizontal: 16, height: 56,
-    borderBottomWidth: 1, borderBottomColor: Colors.border,
+    flexDirection: 'row', alignItems: 'center', gap: space.xs,
+    paddingHorizontal: space.sm, minHeight: 56, borderBottomWidth: hairline, borderBottomColor: color.border,
   },
-  backBtn: { width: 36 },
-  backArrow: { fontSize: 22, color: Colors.textWhite, fontWeight: '700' },
-  headerTitle: { fontSize: 18, fontWeight: '700', color: Colors.textWhite },
-  headerSub: { fontSize: 12, color: Colors.primaryLight },
-  addHeaderBtn: { backgroundColor: Colors.primary, paddingHorizontal: 12, paddingVertical: 6, borderRadius: 20 },
-  addHeaderText: { color: '#fff', fontWeight: '700', fontSize: 14 },
+  iconBtn: { width: touchTarget, height: touchTarget, alignItems: 'center', justifyContent: 'center' },
+  headerText: { flex: 1 },
+  headerTitle: { ...typeScale.heading, fontSize: 18, color: color.textPrimary },
+  headerSub: { ...typeScale.caption, color: color.textSecondary },
+  addHeaderBtn: {
+    flexDirection: 'row', alignItems: 'center', gap: space.xs, backgroundColor: color.accent,
+    paddingHorizontal: space.md, minHeight: 36, borderRadius: radius.pill, marginRight: space.sm,
+  },
+  addHeaderText: { ...typeScale.bodyMedium, fontSize: 14, color: color.textInverse },
   summaryBanner: {
-    flexDirection: 'row', alignItems: 'center', backgroundColor: Colors.bgCard,
-    borderBottomWidth: 1, borderBottomColor: Colors.border,
-    paddingHorizontal: 16, paddingVertical: 12,
+    flexDirection: 'row', alignItems: 'center', gap: space.sm, minHeight: touchTarget + space.sm,
+    borderBottomWidth: hairline, borderBottomColor: color.border, paddingHorizontal: space.lg,
   },
-  summaryLabel: { flex: 1, fontSize: 13, color: Colors.warning, fontWeight: '600' },
-  summaryAmount: { fontSize: 15, fontWeight: '800', color: Colors.warning, marginRight: 8 },
-  summaryArrow: { fontSize: 16, color: Colors.warning },
+  summaryLabel: { ...typeScale.label, color: color.textSecondary, flex: 1 },
   searchWrap: {
-    flexDirection: 'row', alignItems: 'center', backgroundColor: Colors.bgInput,
-    margin: 16, borderRadius: 12, paddingHorizontal: 14,
-    borderWidth: 1, borderColor: Colors.border,
+    flexDirection: 'row', alignItems: 'center', gap: space.sm, backgroundColor: color.surfaceRaised,
+    margin: space.lg, borderRadius: radius.md, paddingHorizontal: space.md,
+    borderWidth: hairline, borderColor: color.border,
   },
-  searchIcon: { fontSize: 16, marginRight: 8, color: Colors.textGray },
-  searchInput: { flex: 1, height: 44, fontSize: 14, color: Colors.textWhite },
+  searchInput: { flex: 1, minHeight: touchTarget, ...typeScale.body, color: color.textPrimary },
+  spinner: { flex: 1 },
+  list: { flex: 1 },
+  listContent: { paddingHorizontal: space.lg, paddingBottom: space.xxl },
+  separator: { height: space.sm },
   card: {
-    backgroundColor: Colors.bgCard, borderRadius: 16, padding: 14,
-    flexDirection: 'row', alignItems: 'center',
-    borderWidth: 1, borderColor: Colors.border,
+    backgroundColor: color.surface, borderRadius: radius.md, padding: space.md,
+    flexDirection: 'row', alignItems: 'center', gap: space.sm,
+    borderWidth: hairline, borderColor: color.border,
   },
-  cardLeft: { flex: 1, flexDirection: 'row', alignItems: 'center' },
+  cardLeft: { flex: 1, flexDirection: 'row', alignItems: 'center', gap: space.md },
   avatar: {
-    width: 46, height: 46, borderRadius: 23,
-    backgroundColor: Colors.bgInput, justifyContent: 'center', alignItems: 'center', marginRight: 12,
-    borderWidth: 1, borderColor: Colors.border,
+    width: 44, height: 44, borderRadius: radius.pill,
+    backgroundColor: color.surfaceRaised, justifyContent: 'center', alignItems: 'center',
   },
-  avatarText: { fontSize: 18, fontWeight: '800', color: Colors.primaryLight },
-  cardInfo: { flex: 1 },
-  supplierName: { fontSize: 15, fontWeight: '700', color: Colors.textWhite, marginBottom: 2 },
-  businessName: { fontSize: 12, color: Colors.textGray, marginBottom: 2 },
-  phone: { fontSize: 12, color: Colors.textGray },
-  outstandingBadge: { marginTop: 4 },
-  outstandingText: { fontSize: 12, fontWeight: '700', color: Colors.warning },
-  cardActions: { flexDirection: 'row', gap: 8 },
-  actionBtn: { width: 36, height: 36, borderRadius: 18, backgroundColor: Colors.bgInput, justifyContent: 'center', alignItems: 'center' },
-  actionIcon: { fontSize: 16 },
-  empty: { flex: 1, justifyContent: 'center', alignItems: 'center', padding: 20 },
-  emptyTitle: { fontSize: 18, fontWeight: '700', color: Colors.textWhite, marginTop: 12 },
-  emptySub: { fontSize: 13, color: Colors.textGray, marginTop: 4, textAlign: 'center' },
-  emptyBtn: { backgroundColor: Colors.primary, paddingHorizontal: 20, paddingVertical: 12, borderRadius: 12, marginTop: 16 },
-  emptyBtnText: { color: '#fff', fontWeight: '700', fontSize: 14 },
+  avatarText: { ...typeScale.bodyMedium, fontSize: 18, color: color.textPrimary },
+  cardInfo: { flex: 1, gap: 2 },
+  supplierName: { ...typeScale.bodyMedium, color: color.textPrimary },
+  meta: { ...typeScale.caption, color: color.textSecondary },
+  outstandingLine: { flexDirection: 'row', alignItems: 'center', gap: space.xs, marginTop: 2 },
+  outstandingLabel: { ...typeScale.caption, color: color.textSecondary },
+  cardActions: { flexDirection: 'row' },
+  actionBtn: { width: touchTarget, height: touchTarget, justifyContent: 'center', alignItems: 'center' },
+  empty: { flex: 1, justifyContent: 'center', alignItems: 'center', padding: space.xl, gap: space.xs },
+  emptyTitle: { ...typeScale.heading, fontSize: 18, color: color.textPrimary, marginTop: space.sm },
+  emptySub: { ...typeScale.body, color: color.textSecondary, textAlign: 'center' },
+  emptyBtn: {
+    flexDirection: 'row', alignItems: 'center', gap: space.xs, backgroundColor: color.accent,
+    paddingHorizontal: space.xl, minHeight: touchTarget, borderRadius: radius.md, marginTop: space.lg,
+  },
+  emptyBtnText: { ...typeScale.bodyMedium, color: color.textInverse },
 });

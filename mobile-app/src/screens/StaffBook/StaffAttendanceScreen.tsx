@@ -1,21 +1,22 @@
 import React, { useEffect, useState } from 'react';
+import { useLanguageStore } from '../../store/useLanguageStore';
 import {
   View, Text, TouchableOpacity, StyleSheet, FlatList,
   ActivityIndicator, Alert
 } from 'react-native';
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useAuthStore } from '../../store/authStore';
-import { getStaffRecords, StaffRecord } from '../../services/database/staffDb';
+import { getStaffRecords } from '../../services/database/staffDb';
+import type { StaffRecord } from '../../types/staff.types';
 import { getTodayAttendanceForUser, clockIn, clockOut, StaffAttendance } from '../../services/database/attendanceDb';
+import { Icon } from '../../components/ui/primitives';
+import { color, space, radius, hairline, touchTarget, iconSize, type as typeScale } from '../../theme/tokens';
 
-const ORANGE = '#FF6B35';
-const GREEN = '#10B981';
-const RED = '#EF4444';
-const BLUE = '#3B82F6';
 
 export const StaffAttendanceScreen = ({ navigation }: any) => {
   const insets = useSafeAreaInsets();
   const { user } = useAuthStore();
+  const { t } = useLanguageStore();
   
   const [staff, setStaff] = useState<StaffRecord[]>([]);
   const [attendance, setAttendance] = useState<StaffAttendance[]>([]);
@@ -30,7 +31,7 @@ export const StaffAttendanceScreen = ({ navigation }: any) => {
       setStaff(staffList);
       setAttendance(attList);
     } catch (e) {
-      console.error(e);
+      if (__DEV__) console.error(e);
     } finally {
       setLoading(false);
     }
@@ -47,8 +48,8 @@ export const StaffAttendanceScreen = ({ navigation }: any) => {
       await clockIn(user.id, staffId, 'present');
       loadData();
     } catch (err) {
-      console.error(err);
-      Alert.alert('Error', 'Failed to clock in');
+      if (__DEV__) console.error(err);
+      Alert.alert(t('commonError'), t('attClockInFailed'));
     }
   };
 
@@ -58,8 +59,8 @@ export const StaffAttendanceScreen = ({ navigation }: any) => {
       await clockOut(attId, user.id);
       loadData();
     } catch (err) {
-      console.error(err);
-      Alert.alert('Error', 'Failed to clock out');
+      if (__DEV__) console.error(err);
+      Alert.alert(t('commonError'), t('attClockOutFailed'));
     }
   };
 
@@ -70,21 +71,24 @@ export const StaffAttendanceScreen = ({ navigation }: any) => {
       <View style={styles.card}>
         <View style={styles.infoCol}>
           <Text style={styles.name}>{item.name_en}</Text>
-          <Text style={styles.role}>{item.role}</Text>
+          {!!item.role && <Text style={styles.role}>{item.role}</Text>}
         </View>
 
         <View style={styles.actionCol}>
           {!todayAtt ? (
-            <TouchableOpacity style={styles.btnIn} onPress={() => handleClockIn(item.id)}>
-              <Text style={styles.btnText}>Clock IN</Text>
+            <TouchableOpacity style={[styles.btn, styles.btnPrimary]} onPress={() => handleClockIn(item.id)} accessibilityRole="button">
+              <Icon name="log-in" size={iconSize.sm} tint={color.textInverse} />
+              <Text style={styles.btnTextInverse}>{t('attClockIn')}</Text>
             </TouchableOpacity>
           ) : !todayAtt.clock_out ? (
-            <TouchableOpacity style={styles.btnOut} onPress={() => handleClockOut(todayAtt.id)}>
-              <Text style={styles.btnText}>Clock OUT</Text>
+            <TouchableOpacity style={[styles.btn, styles.btnOutline]} onPress={() => handleClockOut(todayAtt.id)} accessibilityRole="button">
+              <Icon name="log-out" size={iconSize.sm} tint={color.accent} />
+              <Text style={styles.btnText}>{t('attClockOut')}</Text>
             </TouchableOpacity>
           ) : (
-            <View style={styles.badgeDone}>
-              <Text style={styles.badgeDoneText}>Shift Completed</Text>
+            <View style={styles.done}>
+              <Icon name="check-circle" size={iconSize.sm} tint={color.textSecondary} />
+              <Text style={styles.doneText}>{t('attShiftDone')}</Text>
             </View>
           )}
         </View>
@@ -95,25 +99,25 @@ export const StaffAttendanceScreen = ({ navigation }: any) => {
   return (
     <View style={[styles.container, { paddingTop: insets.top, paddingBottom: insets.bottom }]}>
       <View style={styles.header}>
-        <TouchableOpacity onPress={() => navigation.goBack()} style={styles.backBtn}>
-          <Text style={styles.backArrow}>{'<'}</Text>
+        <TouchableOpacity onPress={() => navigation.goBack()} style={styles.backBtn} accessibilityRole="button" accessibilityLabel={t('commonBack')}>
+          <Icon name="chevron-left" size={iconSize.lg} tint={color.textPrimary} />
         </TouchableOpacity>
-        <Text style={styles.headerTitle}>Staff Attendance (Today)</Text>
-        <View style={{ width: 40 }} />
+        <Text style={styles.headerTitle} numberOfLines={1}>{t('attToday')}</Text>
+        <View style={styles.backBtn} />
       </View>
 
       {loading ? (
-        <ActivityIndicator size="large" color={ORANGE} style={{ flex: 1 }} />
+        <ActivityIndicator size="large" color={color.accent} style={styles.spinner} />
       ) : staff.length === 0 ? (
         <View style={styles.emptyState}>
-          <Text style={{ fontSize: 60 }}>👥</Text>
-          <Text style={styles.emptyText}>No staff members found.</Text>
+          <Icon name="users" size={40} tint={color.textMuted} />
+          <Text style={styles.emptyText}>{t('attNoStaff')}</Text>
         </View>
       ) : (
         <FlatList
           data={staff}
           keyExtractor={item => item.id}
-          contentContainerStyle={{ padding: 16, paddingBottom: 135 }}
+          contentContainerStyle={styles.listContent}
           renderItem={renderItem}
         />
       )}
@@ -122,30 +126,30 @@ export const StaffAttendanceScreen = ({ navigation }: any) => {
 };
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#F5F5F5' },
+  container: { flex: 1, backgroundColor: color.surface },
   header: {
     flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
-    backgroundColor: ORANGE, paddingHorizontal: 16, height: 60,
+    paddingHorizontal: space.md, minHeight: 56, borderBottomWidth: hairline, borderBottomColor: color.border,
   },
-  backBtn: { width: 40, justifyContent: 'center' },
-  backArrow: { fontSize: 24, color: '#fff', fontWeight: '400' },
-  headerTitle: { fontSize: 16, fontWeight: '600', color: '#fff' },
-  emptyState: { flex: 1, justifyContent: 'center', alignItems: 'center' },
-  emptyText: { fontSize: 16, color: '#6B7280', marginTop: 16 },
-  
+  backBtn: { width: touchTarget, height: touchTarget, alignItems: 'center', justifyContent: 'center' },
+  headerTitle: { ...typeScale.heading, fontSize: 18, color: color.textPrimary, flex: 1, textAlign: 'center' },
+  spinner: { flex: 1 },
+  emptyState: { flex: 1, justifyContent: 'center', alignItems: 'center', gap: space.md },
+  emptyText: { ...typeScale.body, color: color.textSecondary },
+  listContent: { padding: space.lg, paddingBottom: 135 },
   card: {
-    flexDirection: 'row', backgroundColor: '#fff', padding: 16, borderRadius: 12, marginBottom: 12,
-    borderWidth: 1, borderColor: '#E5E7EB', alignItems: 'center', justifyContent: 'space-between',
-    shadowColor: '#000', shadowOffset: { width: 0, height: 1 }, shadowOpacity: 0.05, elevation: 1
+    flexDirection: 'row', backgroundColor: color.surface, padding: space.lg, borderRadius: radius.md, marginBottom: space.md,
+    borderWidth: hairline, borderColor: color.border, alignItems: 'center', justifyContent: 'space-between', gap: space.md,
   },
   infoCol: { flex: 1 },
-  name: { fontSize: 16, fontWeight: '700', color: '#111827' },
-  role: { fontSize: 13, color: '#6B7280', marginTop: 4 },
-  
-  actionCol: { minWidth: 100, alignItems: 'flex-end' },
-  btnIn: { backgroundColor: GREEN, paddingHorizontal: 16, paddingVertical: 8, borderRadius: 8 },
-  btnOut: { backgroundColor: RED, paddingHorizontal: 16, paddingVertical: 8, borderRadius: 8 },
-  btnText: { color: '#fff', fontWeight: '700', fontSize: 14 },
-  badgeDone: { backgroundColor: '#E5E7EB', paddingHorizontal: 12, paddingVertical: 8, borderRadius: 8 },
-  badgeDoneText: { color: '#4B5563', fontWeight: '700', fontSize: 12 },
+  name: { ...typeScale.bodyMedium, fontSize: 16, color: color.textPrimary },
+  role: { ...typeScale.label, color: color.textSecondary, marginTop: space.xs },
+  actionCol: { alignItems: 'flex-end', flexShrink: 0 },
+  btn: { flexDirection: 'row', alignItems: 'center', gap: space.xs, minHeight: touchTarget, paddingHorizontal: space.lg, borderRadius: radius.md },
+  btnPrimary: { backgroundColor: color.accent },
+  btnOutline: { borderWidth: hairline, borderColor: color.accent, backgroundColor: color.surface },
+  btnText: { ...typeScale.bodyMedium, color: color.accent },
+  btnTextInverse: { ...typeScale.bodyMedium, color: color.textInverse },
+  done: { flexDirection: 'row', alignItems: 'center', gap: space.xs, minHeight: touchTarget },
+  doneText: { ...typeScale.label, color: color.textSecondary },
 });

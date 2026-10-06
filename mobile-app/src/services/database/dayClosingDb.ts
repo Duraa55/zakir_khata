@@ -1,7 +1,6 @@
 import type { SQLiteDatabase } from 'expo-sqlite';
 import { getDatabase } from './db';
 import { withWriteTransaction } from './writeTransaction';
-import { userScope, userScopeParams } from './queryHelpers';
 import { parseDateValue, todayDate } from '../../utils/dates';
 import { getDayBook, DayTotals } from './cashbookDb';
 
@@ -55,6 +54,14 @@ async function currentActor(db: SQLiteDatabase): Promise<Actor> {
  *
  * Uses account_level (v32) — the explicit level — not parentId depth.
  */
+/**
+ * ⚠ CONSTANT-TRUE UNDER THE TWO-LEVEL TREE — kept on purpose, not dead code.
+ *
+ * This existed to stop sub-staff closing a day. Sub-staff no longer have logins, so every
+ * account reaching it is an admin or a staff member. It is KEPT, with its call site intact,
+ * as the named boundary for who may close a day: if a third level ever returns, the rule
+ * belongs here and nowhere else.
+ */
 export const mayCloseDay = (actor: Pick<Actor, 'role' | 'account_level'>): boolean =>
   actor.role === 'admin' || actor.account_level === 'admin' || actor.account_level === 'staff';
 
@@ -105,15 +112,18 @@ export const closeDay = async (date: string = todayDate(), note?: string): Promi
   });
 };
 
-/** Closings for one day, visible to whoever is entitled to see that branch. */
+/**
+ * This account's own closings for one day. Own-only like the Cash Book it snapshots:
+ * a staff member's closing is never compared against the admin's day totals.
+ */
 export const getDayClosings = async (userId: string, date: string): Promise<DayClosing[]> => {
   assertDate(date);
   const db = await getDatabase();
   return db.getAllAsync<DayClosing>(
     `SELECT * FROM day_closings
-      WHERE ${userScope('user_id')} AND business_date = ?
+      WHERE user_id = ? AND business_date = ?
       ORDER BY closed_at DESC, id DESC`,
-    [...userScopeParams(userId), date]
+    [userId, date]
   );
 };
 

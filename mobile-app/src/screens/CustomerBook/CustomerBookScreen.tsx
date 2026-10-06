@@ -1,20 +1,26 @@
 import React, { useEffect, useState } from 'react';
+import { useLanguageStore } from '../../store/useLanguageStore';
 import {
   View, Text, StyleSheet, FlatList, TouchableOpacity,
-  TextInput, ActivityIndicator, Modal, Alert, ScrollView
+  TextInput, ActivityIndicator, Modal, Alert, ScrollView, Keyboard, Platform
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useAuthStore } from '../../store/authStore';
 import { searchCustomers, addCustomer, updateCustomer, customerPhotoUri, canViewCnic, Customer, CustomerCursor } from '../../services/database/customerDb';
 import { PAGE_SIZE } from '../../services/database/pagination';
-import { Colors } from '../../theme';
+import { Icon, Button } from '../../components/ui/primitives';
+import { color, space, radius, hairline, touchTarget, iconSize, type as typeScale, chrome } from '../../theme/tokens';
 import { TopHeaderWithBooks } from '../../components/TopHeaderWithBooks';
+import { ReadOnlyBanner } from '../../components/ui/ReadOnlyBanner';
 import { CustomerAvatar } from '../../components/ui/CustomerAvatar';
 import { pickCustomerPhoto, persistCustomerPhoto } from '../../utils/customerPhoto';
 
-export const CustomerBookScreen = ({ navigation }: any) => {
+export const CustomerBookScreen = ({ navigation, route }: any) => {
+  // Staff Book → staff → Entries → Customer: that person's customers, read-only.
+  const viewAs: { userId: string; name: string } | undefined = route?.params?.viewAs;
   const insets = useSafeAreaInsets();
   const { user } = useAuthStore();
+  const { t } = useLanguageStore();
   const [customers, setCustomers] = useState<Customer[]>([]);
   const [total, setTotal] = useState(0);
   const [cursor, setCursor] = useState<CustomerCursor | null>(null);
@@ -35,6 +41,22 @@ export const CustomerBookScreen = ({ navigation }: any) => {
   const [photoUri, setPhotoUri] = useState<string | null>(null);
   const [showCnic, setShowCnic] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [isKeyboardVisible, setIsKeyboardVisible] = useState(false);
+
+  useEffect(() => {
+    const showSub = Keyboard.addListener(
+      Platform.OS === 'ios' ? 'keyboardWillShow' : 'keyboardDidShow',
+      () => setIsKeyboardVisible(true)
+    );
+    const hideSub = Keyboard.addListener(
+      Platform.OS === 'ios' ? 'keyboardWillHide' : 'keyboardDidHide',
+      () => setIsKeyboardVisible(false)
+    );
+    return () => {
+      showSub.remove();
+      hideSub.remove();
+    };
+  }, []);
 
   const openAdd = () => {
     setEditingId(null);
@@ -57,7 +79,7 @@ export const CustomerBookScreen = ({ navigation }: any) => {
     if (!user?.id) return;
     try {
       setLoading(true);
-      const page = await searchCustomers(user.id, searchQuery, PAGE_SIZE);
+      const page = await searchCustomers(user.id, searchQuery, PAGE_SIZE, null, viewAs?.userId);
       setCustomers(page.rows);
       setTotal(page.total);
       setCursor(page.nextCursor);
@@ -72,7 +94,7 @@ export const CustomerBookScreen = ({ navigation }: any) => {
     if (!user?.id || !cursor || loadingMore || loading) return;
     setLoadingMore(true);
     try {
-      const page = await searchCustomers(user.id, searchQuery, PAGE_SIZE, cursor);
+      const page = await searchCustomers(user.id, searchQuery, PAGE_SIZE, cursor, viewAs?.userId);
       setCustomers(prev => [...prev, ...page.rows]);
       setCursor(page.nextCursor);
     } catch (err) {
@@ -99,7 +121,7 @@ export const CustomerBookScreen = ({ navigation }: any) => {
 
   const handleAddCustomer = async () => {
     if (!name.trim()) {
-      Alert.alert('Required', 'Please enter customer name.');
+      Alert.alert(t('commonRequired'), t('customerNameRequired'));
       return;
     }
     if (!user?.id) return;
@@ -115,7 +137,7 @@ export const CustomerBookScreen = ({ navigation }: any) => {
         const durable = photoUri ? await persistCustomerPhoto(photoUri, editingId) : null;
         await updateCustomer(editingId, user.id, { ...fields, photo_local_path: durable });
         await fetchCustomers();
-        Alert.alert('Saved', 'Customer details updated.');
+        Alert.alert(t('commonSaved'), t('customerUpdated'));
       } else {
         const newCust = await addCustomer({ user_id: user.id, ...fields });
         if (photoUri) {
@@ -125,12 +147,12 @@ export const CustomerBookScreen = ({ navigation }: any) => {
           newCust.photo_local_path = durable;
         }
         await fetchCustomers();
-        Alert.alert('Success', 'Customer added successfully!');
+        Alert.alert(t('commonSuccess'), t('customerAdded'));
       }
       setModalVisible(false);
     } catch (err: any) {
       // err.message is a validation message (never field contents) or a generic failure.
-      Alert.alert('Error', err?.message || 'Failed to save customer.');
+      Alert.alert(t('commonError'), err?.message || t('customerSaveFailed'));
     } finally {
       setSaving(false);
     }
@@ -141,46 +163,54 @@ export const CustomerBookScreen = ({ navigation }: any) => {
   const renderCustomerItem = ({ item }: { item: Customer }) => {
     const place = [item.address, item.city].filter(Boolean).join(', ');
     return (
-      <TouchableOpacity style={styles.customerCard} onPress={() => openEdit(item)} activeOpacity={0.7}>
+      <TouchableOpacity style={styles.customerCard} onPress={() => { if (!viewAs) openEdit(item); }} activeOpacity={viewAs ? 1 : 0.7} disabled={!!viewAs}>
         <CustomerAvatar name={item.name} uri={customerPhotoUri(item)} style={styles.avatar} textStyle={styles.avatarText} />
         <View style={styles.customerInfo}>
           <Text style={styles.customerName}>{item.name}</Text>
           {item.phone ? (
-            <Text style={styles.customerSub}>📞 {item.phone}</Text>
+            <View style={styles.subLine}>
+              <Icon name="phone" size={iconSize.sm} tint={color.textSecondary} />
+              <Text style={styles.customerSub}>{item.phone}</Text>
+            </View>
           ) : null}
           {place ? (
-            <Text style={styles.customerSub}>📍 {place}</Text>
+            <View style={styles.subLine}>
+              <Icon name="map-pin" size={iconSize.sm} tint={color.textSecondary} />
+              <Text style={styles.customerSub}>{place}</Text>
+            </View>
           ) : null}
           {item.notes ? (
-            <Text style={styles.customerNotes}>📝 {item.notes}</Text>
+            <View style={styles.subLine}>
+              <Icon name="file-text" size={iconSize.sm} tint={color.textMuted} />
+              <Text style={styles.customerNotes}>{item.notes}</Text>
+            </View>
           ) : null}
         </View>
+        <Icon name="chevron-right" size={iconSize.md} tint={color.textMuted} />
       </TouchableOpacity>
     );
   };
 
   return (
-    <View style={[styles.container, { paddingBottom: insets.bottom }]}>
+    <View style={styles.container}>
       {/* Top Header with Books Navigation Bar */}
-      <TopHeaderWithBooks navigation={navigation} activeBook="CustomerBook" />
+      {viewAs
+        ? <ReadOnlyBanner name={viewAs.name} book="Customer" onBack={() => navigation.goBack()} />
+        : <TopHeaderWithBooks navigation={navigation} activeBook="CustomerBook" />}
 
-      {/* Sub Header */}
+      {/* Sub Header — no header Add button; a single persistent bottom button
+          below replaces it (there used to be two Add Customer buttons). */}
       <View style={styles.subHeader}>
-        <Text style={styles.subHeaderTitle}>Customer Book ({total})</Text>
-        <TouchableOpacity
-          style={styles.addBtnHeader}
-          onPress={openAdd}
-        >
-          <Text style={styles.addBtnHeaderText}>+ Add Customer</Text>
-        </TouchableOpacity>
+        <Text style={styles.subHeaderTitle}>{t('customerTitle')} ({total})</Text>
       </View>
 
       {/* Search Input */}
       <View style={styles.searchContainer}>
+        <Icon name="search" size={iconSize.sm} tint={color.textMuted} />
         <TextInput
           style={styles.searchInput}
-          placeholder="Search customer by name or phone..."
-          placeholderTextColor={Colors.textGray}
+          placeholder={t('customerSearchPlaceholder')}
+          placeholderTextColor={color.textMuted}
           value={searchQuery}
           onChangeText={setSearchQuery}
         />
@@ -189,19 +219,13 @@ export const CustomerBookScreen = ({ navigation }: any) => {
       {/* Customers List */}
       {loading ? (
         <View style={styles.center}>
-          <ActivityIndicator size="large" color={Colors.primary} />
+          <ActivityIndicator size="large" color={color.accent} />
         </View>
       ) : filteredCustomers.length === 0 ? (
         <View style={styles.emptyState}>
-          <Text style={styles.emptyIcon}>👤</Text>
-          <Text style={styles.emptyTitle}>No Customers Found</Text>
-          <Text style={styles.emptyText}>Tap "+ Add Customer" to add your first customer.</Text>
-          <TouchableOpacity
-            style={styles.addBtnEmpty}
-            onPress={openAdd}
-          >
-            <Text style={styles.addBtnEmptyText}>+ ADD CUSTOMER</Text>
-          </TouchableOpacity>
+          <Icon name="user" size={48} tint={color.textMuted} />
+          <Text style={styles.emptyTitle}>{t('customerNoneFound')}</Text>
+          <Text style={styles.emptyText}>{t('customerTapToAdd')}</Text>
         </View>
       ) : (
         <FlatList
@@ -211,8 +235,15 @@ export const CustomerBookScreen = ({ navigation }: any) => {
           contentContainerStyle={styles.listContent}
           onEndReached={loadMore}
           onEndReachedThreshold={0.5}
-          ListFooterComponent={loadingMore ? <ActivityIndicator style={{ margin: 16 }} color={Colors.primary} /> : null}
+          ListFooterComponent={loadingMore ? <ActivityIndicator style={styles.footerSpinner} color={color.accent} /> : null}
         />
+      )}
+
+      {/* Add Customer Button */}
+      {!isKeyboardVisible && !viewAs && (
+        <View style={[styles.addBtnContainer, { bottom: space.lg }]}>
+          <Button label={t('customerAdd')} icon="user-plus" onPress={openAdd} style={styles.addBtn} />
+        </View>
       )}
 
       {/* Add Customer Modal */}
@@ -220,100 +251,97 @@ export const CustomerBookScreen = ({ navigation }: any) => {
         <View style={styles.modalOverlay}>
           <View style={styles.modalContent}>
             <View style={styles.modalHeader}>
-              <Text style={styles.modalTitle}>{editingId ? 'Edit Customer' : 'Add New Customer'}</Text>
-              <TouchableOpacity onPress={() => setModalVisible(false)}>
-                <Text style={styles.closeBtn}>✕</Text>
+              <Text style={styles.modalTitle}>{t(editingId ? 'customerEdit' : 'customerAddNew')}</Text>
+              <TouchableOpacity onPress={() => setModalVisible(false)} style={styles.closeBtn} accessibilityRole="button" accessibilityLabel={t('commonClose')}>
+                <Icon name="x" size={iconSize.md} tint={color.textSecondary} />
               </TouchableOpacity>
             </View>
 
             <ScrollView style={styles.modalBody} keyboardShouldPersistTaps="handled">
-              <Text style={styles.modalLabel}>Photo (Optional)</Text>
+              <Text style={styles.modalLabel}>{t('customerPhoto')}</Text>
               <TouchableOpacity style={styles.photoRow} onPress={async () => { const uri = await pickCustomerPhoto(); if (uri) setPhotoUri(uri); }}>
                 <CustomerAvatar name={name || '?'} uri={photoUri} style={styles.avatar} textStyle={styles.avatarText} />
-                <Text style={styles.photoHint}>{photoUri ? 'Change Photo' : 'Add Photo'}</Text>
+                <Text style={styles.photoHint}>{t(photoUri ? 'customerChangePhoto' : 'customerAddPhoto')}</Text>
               </TouchableOpacity>
 
-              <Text style={styles.modalLabel}>Customer Name *</Text>
+              <Text style={styles.modalLabel}>{t('customerNameLabel')} *</Text>
               <TextInput
                 style={styles.modalInput}
-                placeholder="Enter customer name"
-                placeholderTextColor={Colors.textGray}
+                placeholder={t('customerNamePlaceholder')}
+                placeholderTextColor={color.textMuted}
                 value={name}
                 onChangeText={setName}
                 autoFocus
               />
 
-              <Text style={styles.modalLabel}>Phone Number (Optional)</Text>
+              <Text style={styles.modalLabel}>{t('customerPhoneLabel')}</Text>
               <TextInput
                 style={styles.modalInput}
-                placeholder="Enter phone number"
-                placeholderTextColor={Colors.textGray}
+                placeholder={t('customerPhonePlaceholder')}
+                placeholderTextColor={color.textMuted}
                 keyboardType="phone-pad"
                 value={phone}
                 onChangeText={setPhone}
               />
 
-              <Text style={styles.modalLabel}>Email (Optional)</Text>
+              <Text style={styles.modalLabel}>{t('customerEmailLabel')}</Text>
               <TextInput
                 style={styles.modalInput}
-                placeholder="Enter email address"
-                placeholderTextColor={Colors.textGray}
+                placeholder={t('customerEmailPlaceholder')}
+                placeholderTextColor={color.textMuted}
                 keyboardType="email-address"
                 autoCapitalize="none"
                 value={email}
                 onChangeText={setEmail}
               />
 
-              {showCnic && <><Text style={styles.modalLabel}>CNIC (Optional)</Text>
+              {showCnic && <><Text style={styles.modalLabel}>{t('customerCnicLabel')}</Text>
               <TextInput
                 style={styles.modalInput}
                 placeholder="12345-1234567-1"
-                placeholderTextColor={Colors.textGray}
+                placeholderTextColor={color.textMuted}
                 keyboardType="numbers-and-punctuation"
                 maxLength={15}
                 value={cnic}
                 onChangeText={setCnic}
               /></>}
 
-              <Text style={styles.modalLabel}>Address (Optional)</Text>
+              <Text style={styles.modalLabel}>{t('customerAddressLabel')}</Text>
               <TextInput
                 style={styles.modalInput}
-                placeholder="Enter address"
-                placeholderTextColor={Colors.textGray}
+                placeholder={t('customerAddressPlaceholder')}
+                placeholderTextColor={color.textMuted}
                 value={address}
                 onChangeText={setAddress}
               />
 
-              <Text style={styles.modalLabel}>City (Optional)</Text>
+              <Text style={styles.modalLabel}>{t('customerCityLabel')}</Text>
               <TextInput
                 style={styles.modalInput}
-                placeholder="Enter city"
-                placeholderTextColor={Colors.textGray}
+                placeholder={t('customerCityPlaceholder')}
+                placeholderTextColor={color.textMuted}
                 value={city}
                 onChangeText={setCity}
               />
 
-              <Text style={styles.modalLabel}>Notes (Optional)</Text>
+              <Text style={styles.modalLabel}>{t('customerNotesLabel')}</Text>
               <TextInput
-                style={[styles.modalInput, { minHeight: 60, textAlignVertical: 'top' }]}
-                placeholder="Enter notes..."
-                placeholderTextColor={Colors.textGray}
+                style={[styles.modalInput, styles.notesInput]}
+                placeholder={t('customerNotesPlaceholder')}
+                placeholderTextColor={color.textMuted}
                 value={notes}
                 onChangeText={setNotes}
                 multiline
               />
 
-              <TouchableOpacity
-                style={styles.saveBtn}
+              <Button
+                label={t(editingId ? 'commonSaveChanges' : 'customerSave')}
                 onPress={handleAddCustomer}
+                loading={saving}
                 disabled={saving}
-              >
-                {saving ? (
-                  <ActivityIndicator color="#fff" />
-                ) : (
-                  <Text style={styles.saveBtnText}>{editingId ? 'SAVE CHANGES' : 'SAVE CUSTOMER'}</Text>
-                )}
-              </TouchableOpacity>
+                fullWidth
+                style={styles.saveBtn}
+              />
             </ScrollView>
           </View>
         </View>
@@ -323,194 +351,61 @@ export const CustomerBookScreen = ({ navigation }: any) => {
 };
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: Colors.bgPrimary },
+  container: { flex: 1, backgroundColor: color.surface },
   subHeader: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    paddingHorizontal: 16,
-    paddingVertical: 10,
-    backgroundColor: Colors.bgCard,
-    borderBottomWidth: 1,
-    borderBottomColor: Colors.border,
+    flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center',
+    paddingHorizontal: space.lg, minHeight: touchTarget, backgroundColor: color.surface,
+    borderBottomWidth: hairline, borderBottomColor: color.border,
   },
-  subHeaderTitle: {
-    fontSize: 16,
-    fontWeight: '800',
-    color: Colors.textWhite,
-  },
-  addBtnHeader: {
-    backgroundColor: Colors.primary,
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-    borderRadius: 8,
-  },
-  addBtnHeaderText: {
-    color: '#fff',
-    fontSize: 12,
-    fontWeight: '700',
-  },
+  subHeaderTitle: { ...typeScale.heading, color: color.textPrimary },
   searchContainer: {
-    paddingHorizontal: 16,
-    paddingVertical: 10,
+    flexDirection: 'row', alignItems: 'center', gap: space.sm,
+    marginHorizontal: space.lg, marginVertical: space.md, paddingHorizontal: space.md, minHeight: touchTarget,
+    backgroundColor: color.surfaceRaised, borderWidth: hairline, borderColor: color.border, borderRadius: radius.md,
   },
-  searchInput: {
-    backgroundColor: Colors.bgInput,
-    borderWidth: 1,
-    borderColor: Colors.border,
-    borderRadius: 10,
-    paddingHorizontal: 14,
-    paddingVertical: 10,
-    fontSize: 14,
-    color: Colors.textWhite,
-  },
-  listContent: {
-    paddingHorizontal: 16,
-    paddingBottom: 24,
-  },
+  searchInput: { ...typeScale.body, flex: 1, color: color.textPrimary, paddingVertical: space.sm },
+  listContent: { paddingHorizontal: space.lg, paddingBottom: chrome.listBottom },
+  footerSpinner: { margin: space.lg },
+  addBtnContainer: { position: 'absolute', right: space.lg, alignItems: 'flex-end' },
+  addBtn: { minHeight: chrome.fab, paddingHorizontal: space.lg, borderRadius: radius.pill },
   customerCard: {
-    backgroundColor: Colors.bgCard,
-    padding: 14,
-    borderRadius: 12,
-    marginBottom: 8,
-    flexDirection: 'row',
-    alignItems: 'center',
-    borderWidth: 1,
-    borderColor: Colors.border,
+    backgroundColor: color.surface, padding: space.md, borderRadius: radius.md, marginBottom: chrome.rowGap,
+    flexDirection: 'row', alignItems: 'center', gap: space.md, minHeight: touchTarget + space.md,
+    borderWidth: hairline, borderColor: color.border,
   },
+  // The initial-letter circle: a neutral raised tone, not a colour — it means nothing.
   avatar: {
-    width: 42,
-    height: 42,
-    borderRadius: 21,
-    backgroundColor: Colors.primary,
-    alignItems: 'center',
-    justifyContent: 'center',
-    marginRight: 12,
+    width: 42, height: 42, borderRadius: radius.pill, backgroundColor: color.surfaceRaised,
+    borderWidth: hairline, borderColor: color.border, alignItems: 'center', justifyContent: 'center',
   },
-  avatarText: {
-    color: '#fff',
-    fontSize: 18,
-    fontWeight: '800',
-  },
-  customerInfo: {
-    flex: 1,
-  },
-  customerName: {
-    fontSize: 16,
-    fontWeight: '700',
-    color: Colors.textWhite,
-  },
-  customerSub: {
-    fontSize: 13,
-    color: Colors.textGray,
-    marginTop: 2,
-  },
-  customerNotes: {
-    fontSize: 12,
-    color: Colors.textMuted,
-    marginTop: 2,
-  },
-  center: {
-    flex: 1,
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  emptyState: {
-    flex: 1,
-    justifyContent: 'center',
-    alignItems: 'center',
-    padding: 32,
-  },
-  emptyIcon: {
-    fontSize: 48,
-    marginBottom: 12,
-  },
-  emptyTitle: {
-    fontSize: 18,
-    fontWeight: '700',
-    color: Colors.textWhite,
-    marginBottom: 6,
-  },
-  emptyText: {
-    fontSize: 14,
-    color: Colors.textGray,
-    textAlign: 'center',
-    marginBottom: 20,
-  },
-  addBtnEmpty: {
-    backgroundColor: Colors.primary,
-    paddingHorizontal: 20,
-    paddingVertical: 12,
-    borderRadius: 10,
-  },
-  addBtnEmptyText: {
-    color: '#fff',
-    fontWeight: '800',
-    fontSize: 14,
-  },
-
-  modalOverlay: {
-    flex: 1,
-    backgroundColor: 'rgba(0,0,0,0.75)',
-    justifyContent: 'flex-end',
-  },
+  avatarText: { ...typeScale.heading, fontSize: 18, color: color.textPrimary },
+  customerInfo: { flex: 1 },
+  customerName: { ...typeScale.bodyMedium, fontSize: 16, color: color.textPrimary },
+  subLine: { flexDirection: 'row', alignItems: 'center', gap: space.xs, marginTop: 2 },
+  customerSub: { ...typeScale.label, color: color.textSecondary, flexShrink: 1 },
+  customerNotes: { ...typeScale.caption, color: color.textMuted, flexShrink: 1 },
+  center: { flex: 1, justifyContent: 'center', alignItems: 'center' },
+  emptyState: { flex: 1, justifyContent: 'center', alignItems: 'center', padding: space.xxxl, gap: space.sm },
+  emptyTitle: { ...typeScale.heading, fontSize: 18, color: color.textPrimary },
+  emptyText: { ...typeScale.body, color: color.textSecondary, textAlign: 'center', marginBottom: space.xl },
+  modalOverlay: { flex: 1, backgroundColor: color.scrim, justifyContent: 'flex-end' },
   modalContent: {
-    maxHeight: '90%',
-    backgroundColor: Colors.bgCard,
-    borderTopLeftRadius: 18,
-    borderTopRightRadius: 18,
-    padding: 20,
-    paddingBottom: 32,
-    borderWidth: 1,
-    borderColor: Colors.border,
+    maxHeight: '90%', backgroundColor: color.surface,
+    borderTopLeftRadius: radius.lg, borderTopRightRadius: radius.lg,
+    padding: space.xl, paddingBottom: space.xxxl,
   },
-  modalHeader: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    marginBottom: 16,
-  },
-  modalTitle: {
-    fontSize: 18,
-    fontWeight: '700',
-    color: Colors.textWhite,
-  },
-  closeBtn: {
-    fontSize: 20,
-    fontWeight: '700',
-    color: Colors.textGray,
-    padding: 4,
-  },
+  modalHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', gap: space.md, marginBottom: space.lg },
+  modalTitle: { ...typeScale.title, fontSize: 18, color: color.textPrimary, flex: 1 },
+  closeBtn: { width: touchTarget, height: touchTarget, alignItems: 'center', justifyContent: 'center', marginRight: -space.md },
   modalBody: {},
-  photoRow: { flexDirection: 'row', alignItems: 'center', gap: 12, marginBottom: 14 },
-  photoHint: { fontSize: 14, color: Colors.primary, fontWeight: '700' },
-  modalLabel: {
-    fontSize: 13,
-    fontWeight: '700',
-    color: Colors.textWhite,
-    marginBottom: 6,
-  },
+  photoRow: { flexDirection: 'row', alignItems: 'center', gap: space.md, marginBottom: space.md, minHeight: touchTarget },
+  photoHint: { ...typeScale.bodyMedium, color: color.accent },
+  modalLabel: { ...typeScale.label, color: color.textSecondary, marginBottom: space.xs },
   modalInput: {
-    backgroundColor: Colors.bgInput,
-    borderWidth: 1,
-    borderColor: Colors.border,
-    borderRadius: 10,
-    paddingHorizontal: 14,
-    paddingVertical: 10,
-    fontSize: 15,
-    color: Colors.textWhite,
-    marginBottom: 14,
+    backgroundColor: color.surfaceRaised, borderWidth: hairline, borderColor: color.border,
+    borderRadius: radius.md, paddingHorizontal: space.md, minHeight: touchTarget, paddingVertical: space.sm,
+    ...typeScale.body, color: color.textPrimary, marginBottom: space.md,
   },
-  saveBtn: {
-    backgroundColor: Colors.primary,
-    borderRadius: 12,
-    paddingVertical: 14,
-    alignItems: 'center',
-    marginTop: 8,
-  },
-  saveBtnText: {
-    color: '#fff',
-    fontWeight: '800',
-    fontSize: 15,
-  },
+  notesInput: { minHeight: 60, textAlignVertical: 'top' },
+  saveBtn: { minHeight: 50, marginTop: space.sm },
 });

@@ -1,24 +1,42 @@
-import React from 'react';
-import { View, Text, TouchableOpacity, StyleSheet, ScrollView, Image, Modal, Alert } from 'react-native';
+import React, { useCallback, useState } from 'react';
+import { categoryLabel } from '../../i18n/categoryLabel';
+import { useLanguageStore } from '../../store/useLanguageStore';
+import { View, Text, TouchableOpacity, StyleSheet, Image } from 'react-native';
+import { useFocusEffect } from '@react-navigation/native';
+import { useAuthStore } from '../../store/authStore';
+import { getExpenseById } from '../../services/database/expenseDb';
+import { formatDisplayDate } from '../../utils/dates';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { Colors } from '../../theme';
 import { ScreenContainer } from '../../components/ui/ScreenContainer';
-import { formatCurrency } from '../../utils/calculations';
+import { useAttachmentOpener } from '../../components/ui/AttachmentViewer';
+import { Icon, AmountText } from '../../components/ui/primitives';
+import { color, space, radius, hairline, touchTarget, iconSize, type as typeScale } from '../../theme/tokens';
 
 export const ExpenseDetail = ({ route, navigation }: any) => {
-  const expense = route.params?.expense;
-  const [viewerVisible, setViewerVisible] = React.useState(false);
+  const { user } = useAuthStore();
+  const { t } = useLanguageStore();
+  // Re-read on focus so an edit made from here shows as soon as you come back.
+  const [expense, setExpense] = useState<any>(route.params?.expense);
+  useFocusEffect(useCallback(() => {
+    const id = route.params?.expense?.id;
+    if (id) getExpenseById(id).then(e => { if (e) setExpense(e); }).catch(() => {});
+  }, [route.params?.expense?.id]));
+  // One shared opener: images preview in-app, other files go to the phone, a missing
+  // file says so — the same behaviour in every book.
+  const { openAttachment, attachmentViewer } = useAttachmentOpener();
 
   if (!expense) {
     return (
       <SafeAreaView style={styles.safe}>
         <View style={styles.header}>
-          <TouchableOpacity onPress={() => navigation.goBack()} style={styles.backBtn}>
-            <Text style={styles.backArrow}>{'<'}</Text>
+          <TouchableOpacity onPress={() => navigation.goBack()} style={styles.backBtn} accessibilityRole="button" accessibilityLabel={t('commonBack')}>
+            <Icon name="chevron-left" size={iconSize.lg} tint={color.textPrimary} />
           </TouchableOpacity>
+          <Text style={styles.headerTitle}>{t('expenseDetailTitle')}</Text>
+          <View style={styles.backBtn} />
         </View>
-        <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center' }}>
-          <Text style={{ color: Colors.textGray }}>Expense not found.</Text>
+        <View style={styles.center}>
+          <Text style={styles.emptyText}>{t('expenseNotFound')}</Text>
         </View>
       </SafeAreaView>
     );
@@ -28,115 +46,126 @@ export const ExpenseDetail = ({ route, navigation }: any) => {
     <SafeAreaView style={styles.safe}>
       {/* Header */}
       <View style={styles.header}>
-        <TouchableOpacity onPress={() => navigation.goBack()} style={styles.backBtn}>
-          <Text style={styles.backArrow}>{'<'}</Text>
+        <TouchableOpacity onPress={() => navigation.goBack()} style={styles.backBtn} accessibilityRole="button" accessibilityLabel={t('commonBack')}>
+          <Icon name="chevron-left" size={iconSize.lg} tint={color.textPrimary} />
         </TouchableOpacity>
-        <Text style={styles.headerTitle}>Expense Detail</Text>
-        <TouchableOpacity style={{ padding: 8 }} onPress={() => Alert.alert('Edit Expense', 'Expense editing is coming soon.')}>
-          <Text style={{ fontSize: 20, color: Colors.textWhite }}>✎</Text>
-        </TouchableOpacity>
+        <Text style={styles.headerTitle} numberOfLines={1}>{t('expenseDetailTitle')}</Text>
+        {/* Only the person who recorded it may edit it (enforced again in expenseDb). */}
+        {expense.user_id === user?.id ? (
+          <TouchableOpacity style={styles.backBtn} onPress={() => navigation.navigate('AddExpenseModal', { expense })} accessibilityRole="button" accessibilityLabel={t('expenseEditAction')}>
+            <Icon name="edit-2" size={iconSize.md} tint={color.accent} />
+          </TouchableOpacity>
+        ) : (
+          <View style={styles.backBtn} />
+        )}
       </View>
 
-      <ScreenContainer scrollable={true} hasTabBar={true} contentContainerStyle={{ padding: 16 }}>
-        
-        {/* Main Details Card */}
+      <ScreenContainer scrollable={true} hasTabBar={true} contentContainerStyle={styles.content}>
+
+        {/* Main Details Card — an expense is money out, so its amount is red. */}
         <View style={styles.card}>
-          <View style={{ alignItems: 'center', marginBottom: 16 }}>
-            <Text style={styles.amountText}>{formatCurrency(expense.amount)}</Text>
+          <View style={styles.amountWrap}>
+            <AmountText paisa={expense.amount} tone="out" size="hero" fit currency={expense.currency} />
           </View>
-          
+
           <View style={styles.divider} />
 
           <View style={styles.row}>
-            <Text style={styles.label}>Description</Text>
+            <Text style={styles.label}>{t('expenseDescriptionLabel')}</Text>
             <Text style={styles.value}>{expense.description}</Text>
           </View>
 
-          <View style={styles.row}>
-            <Text style={styles.label}>Date</Text>
-            <Text style={styles.value}>{new Date(expense.expense_date).toLocaleDateString()}</Text>
+          {!!expense.category && (
+            <View style={styles.row}>
+              <Text style={styles.label}>{t('commonCategory')}</Text>
+              <Text style={styles.value}>{categoryLabel(t, expense.category)}</Text>
+            </View>
+          )}
+
+          <View style={[styles.row, styles.rowLast]}>
+            <Text style={styles.label}>{t('commonDate')}</Text>
+            <Text style={styles.value}>{formatDisplayDate(String(expense.expense_date).slice(0, 10))}</Text>
           </View>
         </View>
 
         {/* Note Card */}
         {expense.note ? (
-          <View style={[styles.card, { marginTop: 12 }]}>
-            <Text style={styles.sectionTitle}>Notes</Text>
+          <View style={[styles.card, styles.cardSpaced]}>
+            <Text style={styles.sectionTitle}>{t('commonNote')}</Text>
             <Text style={styles.noteText}>{expense.note}</Text>
           </View>
         ) : null}
 
         {/* Receipt Card */}
         {expense.receipt_url ? (
-          <View style={[styles.card, { marginTop: 12 }]}>
-            <Text style={styles.sectionTitle}>Receipt</Text>
-            <TouchableOpacity 
-              style={styles.receiptPlaceholder} 
-              onPress={() => setViewerVisible(true)}
+          <View style={[styles.card, styles.cardSpaced]}>
+            <Text style={styles.sectionTitle}>{t('expenseReceipt')}</Text>
+            <TouchableOpacity
+              style={styles.receiptPlaceholder}
+              onPress={() => openAttachment(expense.receipt_url)}
               activeOpacity={0.8}
             >
-              <Image 
-                source={{ uri: expense.receipt_url }} 
-                style={{ width: '100%', height: 200, borderRadius: 8, resizeMode: 'cover' }} 
+              <Image
+                source={{ uri: expense.receipt_url }}
+                style={styles.receiptImage}
               />
-              <View style={{ position: 'absolute', backgroundColor: 'rgba(0,0,0,0.6)', padding: 8, borderRadius: 20 }}>
-                <Text style={{ color: '#fff', fontWeight: '600' }}>🔍 Tap to View</Text>
+              <View style={styles.viewHint}>
+                <Icon name="maximize-2" size={iconSize.sm} tint={color.textPrimary} />
+                <Text style={styles.viewHintText}>{t('entryTapToView')}</Text>
               </View>
             </TouchableOpacity>
           </View>
         ) : null}
 
-        <Modal visible={viewerVisible} transparent={true} animationType="fade">
-          <View style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.9)', justifyContent: 'center', alignItems: 'center' }}>
-            <TouchableOpacity 
-              style={{ position: 'absolute', top: 50, right: 20, zIndex: 10, padding: 10 }} 
-              onPress={() => setViewerVisible(false)}
-            >
-              <Text style={{ color: '#fff', fontSize: 24, fontWeight: 'bold' }}>✕</Text>
-            </TouchableOpacity>
-            <Image 
-              source={{ uri: expense.receipt_url }} 
-              style={{ width: '100%', height: '80%', resizeMode: 'contain' }} 
-            />
-          </View>
-        </Modal>
 
       </ScreenContainer>
+      {attachmentViewer}
     </SafeAreaView>
   );
 };
 
 const styles = StyleSheet.create({
-  safe: { flex: 1, backgroundColor: Colors.bgPrimary },
+  safe: { flex: 1, backgroundColor: color.surface },
   header: {
     flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
-    backgroundColor: Colors.bgCard, paddingHorizontal: 16, height: 60,
-    borderBottomWidth: 1, borderBottomColor: Colors.border,
+    backgroundColor: color.surface, paddingHorizontal: space.md, minHeight: 56,
+    borderBottomWidth: hairline, borderBottomColor: color.border,
   },
-  backBtn: { width: 40, justifyContent: 'center' },
-  backArrow: { fontSize: 24, color: Colors.textWhite, fontWeight: '400' },
-  headerTitle: { fontSize: 16, fontWeight: '600', color: Colors.textWhite },
+  backBtn: { width: touchTarget, height: touchTarget, alignItems: 'center', justifyContent: 'center' },
+  headerTitle: { ...typeScale.heading, fontSize: 18, color: color.textPrimary, flex: 1, textAlign: 'center' },
+
+  center: { flex: 1, justifyContent: 'center', alignItems: 'center' },
+  emptyText: { ...typeScale.body, color: color.textSecondary },
+  content: { padding: space.lg },
 
   card: {
-    backgroundColor: Colors.bgCard, borderRadius: 12, padding: 16,
-    borderWidth: 1, borderColor: Colors.border,
-    shadowColor: '#000', shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.15, elevation: 2
+    backgroundColor: color.surface, borderRadius: radius.lg, padding: space.lg,
+    borderWidth: hairline, borderColor: color.border,
   },
-  amountText: { fontSize: 32, fontWeight: '800', color: Colors.error },
-  
-  divider: { height: 1, backgroundColor: Colors.border, marginBottom: 16 },
+  cardSpaced: { marginTop: space.md },
+  amountWrap: { alignItems: 'center', marginBottom: space.lg },
 
-  row: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 12 },
-  label: { fontSize: 14, color: Colors.textGray, fontWeight: '500' },
-  value: { fontSize: 14, color: Colors.textWhite, fontWeight: '600', flex: 1, textAlign: 'right', marginLeft: 16 },
+  divider: { height: hairline, backgroundColor: color.border, marginBottom: space.lg },
 
-  sectionTitle: { fontSize: 14, fontWeight: '700', color: Colors.textWhite, marginBottom: 8 },
-  noteText: { fontSize: 14, color: Colors.textGray, lineHeight: 20 },
+  row: { flexDirection: 'row', justifyContent: 'space-between', gap: space.lg, marginBottom: space.md },
+  rowLast: { marginBottom: 0 },
+  label: { ...typeScale.body, color: color.textSecondary, flexShrink: 0 },
+  value: { ...typeScale.bodyMedium, color: color.textPrimary, flex: 1, textAlign: 'right' },
+
+  sectionTitle: { ...typeScale.bodyMedium, color: color.textPrimary, marginBottom: space.sm },
+  noteText: { ...typeScale.body, color: color.textSecondary, lineHeight: 20 },
 
   receiptPlaceholder: {
-    backgroundColor: Colors.bgInput, height: 150, borderRadius: 8,
-    justifyContent: 'center', alignItems: 'center', borderWidth: 1,
-    borderColor: Colors.border, borderStyle: 'dashed'
-  }
+    backgroundColor: color.surfaceRaised, minHeight: 150, borderRadius: radius.sm,
+    justifyContent: 'center', alignItems: 'center', borderWidth: hairline,
+    borderColor: color.border,
+  },
+  receiptImage: { width: '100%', height: 200, borderRadius: radius.sm, resizeMode: 'cover' },
+  viewHint: {
+    position: 'absolute', right: space.sm, bottom: space.sm,
+    flexDirection: 'row', alignItems: 'center', gap: space.xs,
+    paddingHorizontal: space.sm, paddingVertical: space.xs, borderRadius: radius.pill,
+    backgroundColor: color.surface, borderWidth: hairline, borderColor: color.border,
+  },
+  viewHintText: { ...typeScale.caption, color: color.textPrimary },
 });
-

@@ -1,4 +1,5 @@
 import React, { useRef, useState, useCallback, useMemo } from 'react';
+import { useLanguageStore } from '../../store/useLanguageStore';
 import { useFocusEffect } from '@react-navigation/native';
 import {
   View, Text, SectionList, TouchableOpacity, StyleSheet,
@@ -11,38 +12,44 @@ import { PAGE_SIZE, PageCursor } from '../../services/database/pagination';
 import { thisMonthRange, toDateValue, formatDisplayDate } from '../../utils/dates';
 import { DateRangeFilter, DateRange } from '../../components/ui/DateRangeFilter';
 import { useTransactionStore } from '../../store/transactionStore';
-import { formatCurrency, formatDate } from '../../utils/calculations';
+import { formatDate } from '../../utils/calculations';
 import { CashEntry } from '../../types';
-import { Colors } from '../../theme';
+import { Icon, AmountText } from '../../components/ui/primitives';
+import { color, space, radius, hairline, touchTarget, iconSize, type as typeScale } from '../../theme/tokens';
 
 type FilterType = 'all' | 'in' | 'out';
 
-const CashEntryRow = React.memo(({ item, onPress, handleDelete }: { item: CashEntry; onPress: () => void; handleDelete: (id: string) => void }) => {
+const CashEntryRow = React.memo(({ item, onPress, handleDelete, readOnly }: { item: CashEntry; onPress: () => void; handleDelete: (id: string) => void; readOnly?: boolean }) => {
+  const { t } = useLanguageStore();
   const isIn = item.direction === 'in';
   return (
     <TouchableOpacity style={styles.row} onPress={onPress} activeOpacity={0.7}>
-      <View style={[styles.directionDot, { backgroundColor: isIn ? '#22C55E' : '#EF4444' }]} />
+      {/* Direction by meaning: green in, red out — the arrow says it without colour too. */}
+      <Icon name={isIn ? 'arrow-down-left' : 'arrow-up-right'} size={iconSize.md} tint={isIn ? color.moneyIn : color.moneyOut} />
       <View style={styles.rowInfo}>
-        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+        <View style={styles.rowTitleLine}>
           <Text style={[styles.rowDesc, { flexShrink: 1 }]} numberOfLines={1}>{item.description}</Text>
-          {!!item.attachment_url && <Text style={{ fontSize: 14 }}>📎</Text>}
+          {!!item.attachment_url && <Icon name="paperclip" size={iconSize.sm} tint={color.textSecondary} />}
         </View>
         <Text style={styles.rowDate}>{formatDate(item.date)}</Text>
       </View>
       <View style={styles.rowRight}>
-        <Text style={[styles.rowAmount, { color: isIn ? '#22C55E' : '#EF4444' }]}>
-          {isIn ? '+' : '-'}{formatCurrency(item.amount_paisa)}
-        </Text>
-        <TouchableOpacity onPress={() => handleDelete(item.id)} style={styles.deleteBtn}>
-          <Text style={styles.deleteText}>🗑</Text>
+        <AmountText paisa={item.amount_paisa} tone={isIn ? 'in' : 'out'} />
+        {!readOnly && (
+        <TouchableOpacity onPress={() => handleDelete(item.id)} style={styles.deleteBtn} accessibilityRole="button" accessibilityLabel={t('entryDelete')}>
+          <Icon name="trash-2" size={iconSize.sm} tint={color.textSecondary} />
         </TouchableOpacity>
+        )}
       </View>
     </TouchableOpacity>
   );
 });
 
-export const CashHistory = ({ navigation }: any) => {
+export const CashHistory = ({ navigation, route }: any) => {
+  // Opened from a staff member's Entries → Cash: only their rows, read-only.
+  const viewAs: { userId: string; name: string } | undefined = route?.params?.viewAs;
   const { user } = useAuthStore();
+  const { t } = useLanguageStore();
   const { loadCashBook } = useTransactionStore();
 
   // Rows are PAGED (keyset, PAGE_SIZE at a time); the summary and the per-day subtotals
@@ -60,7 +67,10 @@ export const CashHistory = ({ navigation }: any) => {
   const [search, setSearch] = useState('');
   const [loading, setLoading] = useState(true);
 
-  const activeFilter = useMemo(() => ({ ...range, direction: filter, search }), [range, filter, search]);
+  const activeFilter = useMemo(
+    () => ({ ...range, direction: filter, search, ...(viewAs ? { createdBy: viewAs.userId } : {}) }),
+    [range, filter, search, viewAs?.userId]
+  );
 
   const load = useCallback(async () => {
     const current = ++request.current;
@@ -123,8 +133,8 @@ export const CashHistory = ({ navigation }: any) => {
   }, [load]));
 
   const handleDelete = useCallback((id: string) => {
-    Alert.alert('Delete Entry', 'Are you sure you want to delete this entry?', [
-      { text: 'Cancel', style: 'cancel' },
+    Alert.alert(t('entryDelete'), t('entryDeleteConfirm'), [
+      { text: t('commonCancel'), style: 'cancel' },
       {
         text: 'Delete', style: 'destructive',
         onPress: async () => {
@@ -133,7 +143,7 @@ export const CashHistory = ({ navigation }: any) => {
             if (user) await loadCashBook(user.id);
             await load();
           } catch {
-            Alert.alert('Error', 'Failed to delete entry.');
+            Alert.alert(t('commonError'), t('entryDeleteFailed'));
           }
         },
       },
@@ -144,27 +154,30 @@ export const CashHistory = ({ navigation }: any) => {
   const { cashIn: totalIn, cashOut: totalOut, cashBalance: net } = summary || { cashIn: 0, cashOut: 0, cashBalance: 0 };
 
   const renderItem = useCallback(({ item }: { item: CashEntry }) => {
-    return <CashEntryRow item={item} onPress={() => navigation.navigate('CashEntryDetail', { entry: item })} handleDelete={handleDelete} />;
+    return <CashEntryRow item={item} onPress={() => navigation.navigate('CashEntryDetail', { entry: item, readOnly: !!viewAs })} handleDelete={handleDelete} readOnly={!!viewAs} />;
   }, [handleDelete, navigation]);
 
-  // Day header — the Cash Book's day-header banner, with that day's SQL subtotal.
+  // Day header with that day's SQL subtotal. In is green, out is red — labels carry
+  // the words too, so the figures never rely on colour alone.
   const renderSectionHeader = useCallback(({ section }: { section: { day: string } }) => {
-    const t = dayTotals.get(section.day);
+    // Named `day`, not `t`: `t` is the translator, and shadowing it here is what broke
+    // the Purchase Book day header the moment a label was translated.
+    const day = dayTotals.get(section.day);
     return (
       <View style={styles.dateHeaderBanner}>
         <View style={styles.dateHeaderLeft}>
           <Text style={styles.dateTitle}>{formatDisplayDate(section.day)}</Text>
-          {t && <Text style={styles.entriesCountText}>{t.entryCount} {t.entryCount === 1 ? 'Entry' : 'Entries'}</Text>}
+          {day && <Text style={styles.entriesCountText}>{day.entryCount} {day.entryCount === 1 ? 'entry' : 'entries'}</Text>}
         </View>
-        {t && (
+        {day && (
           <View style={styles.dateHeaderRight}>
-            <View style={styles.totalsHeaderRow}>
-              <Text style={[styles.columnLabel, { color: Colors.error }]}>Out</Text>
-              <Text style={[styles.columnLabel, { color: Colors.success }]}>In</Text>
+            <View style={styles.dayFigure}>
+              <Text style={styles.columnLabel}>Out</Text>
+              <AmountText paisa={day.cashOut} tone="out" size="label" />
             </View>
-            <View style={styles.totalsValueRow}>
-              <Text style={[styles.columnVal, { color: Colors.error }]}>{formatCurrency(t.cashOut)}</Text>
-              <Text style={[styles.columnVal, { color: Colors.success }]}>{formatCurrency(t.cashIn)}</Text>
+            <View style={styles.dayFigure}>
+              <Text style={styles.columnLabel}>In</Text>
+              <AmountText paisa={day.cashIn} tone="in" size="label" />
             </View>
           </View>
         )}
@@ -176,46 +189,44 @@ export const CashHistory = ({ navigation }: any) => {
     <SafeAreaView style={styles.safe}>
       {/* Header */}
       <View style={styles.header}>
-        <TouchableOpacity onPress={() => navigation.goBack()} style={styles.backBtn}>
-          <Text style={styles.backArrow}>←</Text>
+        <TouchableOpacity onPress={() => navigation.goBack()} style={styles.backBtn} accessibilityRole="button" accessibilityLabel={t('commonBack')}>
+          <Icon name="chevron-left" size={iconSize.lg} tint={color.textPrimary} />
         </TouchableOpacity>
-        <Text style={styles.headerTitle}>Cash History</Text>
-        <View style={{ width: 40 }} />
+        <Text style={styles.headerTitle} numberOfLines={1}>{viewAs ? `${viewAs.name} · Cash history` : 'Cash history'}</Text>
+        <View style={styles.backBtn} />
       </View>
 
-      {/* Summary strip */}
+      {/* Summary strip — whole filtered set (SQL). In green, out red, net is neutral ink. */}
       <View style={styles.summaryStrip}>
         <View style={styles.summaryItem}>
-          <Text style={styles.summaryLabel}>Total In</Text>
-          <Text style={[styles.summaryValue, { color: '#22C55E' }]}>{result ? `+${formatCurrency(totalIn)}` : '—'}</Text>
+          <Text style={styles.summaryLabel}>{t('histTotalIn')}</Text>
+          {result ? <AmountText paisa={totalIn} tone="in" fit /> : <Text style={styles.summaryDash}>—</Text>}
         </View>
         <View style={styles.summaryDivider} />
         <View style={styles.summaryItem}>
-          <Text style={styles.summaryLabel}>Total Out</Text>
-          <Text style={[styles.summaryValue, { color: '#EF4444' }]}>{result ? `-${formatCurrency(totalOut)}` : '—'}</Text>
+          <Text style={styles.summaryLabel}>{t('histTotalOut')}</Text>
+          {result ? <AmountText paisa={totalOut} tone="out" fit /> : <Text style={styles.summaryDash}>—</Text>}
         </View>
         <View style={styles.summaryDivider} />
         <View style={styles.summaryItem}>
           <Text style={styles.summaryLabel}>Net</Text>
-          <Text style={[styles.summaryValue, { color: net >= 0 ? '#22C55E' : '#EF4444' }]}>
-            {result ? formatCurrency(net) : '—'}
-          </Text>
+          {result ? <AmountText paisa={net} signed fit /> : <Text style={styles.summaryDash}>—</Text>}
         </View>
       </View>
 
       {/* Search */}
       <View style={styles.searchWrap}>
-        <Text style={styles.searchIcon}>🔍</Text>
+        <Icon name="search" size={iconSize.sm} tint={color.textMuted} />
         <TextInput
           style={styles.searchInput}
-          placeholder="Search transactions..."
-          placeholderTextColor={Colors.textGray}
+          placeholder={t('histSearch')}
+          placeholderTextColor={color.textMuted}
           value={search}
           onChangeText={setSearch}
         />
         {!!search && (
-          <TouchableOpacity onPress={() => setSearch('')}>
-            <Text style={{ fontSize: 18, color: Colors.textGray }}>✕</Text>
+          <TouchableOpacity onPress={() => setSearch('')} style={styles.clearBtn} accessibilityRole="button" accessibilityLabel={t('histClearSearch')}>
+            <Icon name="x" size={iconSize.sm} tint={color.textSecondary} />
           </TouchableOpacity>
         )}
       </View>
@@ -228,31 +239,31 @@ export const CashHistory = ({ navigation }: any) => {
             style={[styles.filterTab, filter === f && styles.filterTabActive]}
             onPress={() => setFilter(f)}
           >
-            <Text style={[styles.filterTabText, filter === f && styles.filterTabTextActive]}>
-              {f === 'all' ? 'All' : f === 'in' ? '↑ Cash In' : '↓ Cash Out'}
+            <Text style={[styles.filterTabText, filter === f && styles.filterTabTextActive]} numberOfLines={1}>
+              {f === 'all' ? 'All' : f === 'in' ? 'Cash in' : 'Cash out'}
             </Text>
           </TouchableOpacity>
         ))}
       </View>
 
-      <View style={{ paddingHorizontal: 12 }}>
+      <View style={styles.rangeWrap}>
         <DateRangeFilter value={range} onChange={setRange}
-          fieldStyle={[styles.searchWrap, { margin: 0 }]} textStyle={styles.filterTabText} />
+          fieldStyle={[styles.searchWrap, styles.rangeField]} textStyle={styles.rangeText} />
       </View>
 
       {/* List */}
       {loading ? (
         <View style={styles.center}>
-          <ActivityIndicator size="large" color={Colors.primary} />
+          <ActivityIndicator size="large" color={color.accent} />
         </View>
       ) : error ? (
         <View style={styles.center}>
           <Text style={styles.emptyText}>{error}</Text>
-          <TouchableOpacity onPress={load}><Text style={styles.filterTabText}>Retry</Text></TouchableOpacity>
+          <TouchableOpacity onPress={load} style={styles.retryBtn}><Text style={styles.retryText}>{t('histRetry')}</Text></TouchableOpacity>
         </View>
       ) : entries.length === 0 ? (
         <View style={styles.center}>
-          <Text style={styles.emptyText}>No transactions found</Text>
+          <Text style={styles.emptyText}>{t('histNoTransactions')}</Text>
         </View>
       ) : (
         <SectionList
@@ -261,14 +272,14 @@ export const CashHistory = ({ navigation }: any) => {
           renderItem={renderItem}
           renderSectionHeader={renderSectionHeader}
           stickySectionHeadersEnabled
-          contentContainerStyle={{ padding: 16, paddingBottom: 135 }}
-          ItemSeparatorComponent={() => <View style={{ height: 8 }} />}
-          SectionSeparatorComponent={() => <View style={{ height: 8 }} />}
+          contentContainerStyle={styles.listContent}
+          ItemSeparatorComponent={() => <View style={styles.gap} />}
+          SectionSeparatorComponent={() => <View style={styles.gap} />}
           onRefresh={load}
           refreshing={loading}
           onEndReached={loadMore}
           onEndReachedThreshold={0.5}
-          ListFooterComponent={loadingMore ? <ActivityIndicator style={{ margin: 16 }} color={Colors.primary} /> : null}
+          ListFooterComponent={loadingMore ? <ActivityIndicator style={styles.footerSpinner} color={color.accent} /> : null}
           initialNumToRender={10}
           maxToRenderPerBatch={10}
           windowSize={5}
@@ -280,80 +291,84 @@ export const CashHistory = ({ navigation }: any) => {
 };
 
 const styles = StyleSheet.create({
-  safe: { flex: 1, backgroundColor: Colors.bgPrimary },
+  safe: { flex: 1, backgroundColor: color.surface },
 
   header: {
     flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
-    backgroundColor: Colors.bgCard, paddingHorizontal: 16, paddingVertical: 14,
-    borderBottomWidth: 1, borderBottomColor: Colors.border,
+    backgroundColor: color.surface, paddingHorizontal: space.md, minHeight: 56,
+    borderBottomWidth: hairline, borderBottomColor: color.border,
   },
-  backBtn: { width: 40 },
-  backArrow: { fontSize: 22, color: Colors.textWhite, fontWeight: '700' },
-  headerTitle: { fontSize: 18, fontWeight: '700', color: Colors.textWhite },
+  backBtn: { width: touchTarget, height: touchTarget, alignItems: 'center', justifyContent: 'center' },
+  headerTitle: { ...typeScale.heading, fontSize: 18, color: color.textPrimary, flex: 1, textAlign: 'center' },
 
   summaryStrip: {
-    flexDirection: 'row', backgroundColor: Colors.bgCard,
-    paddingVertical: 14, borderBottomWidth: 1, borderBottomColor: Colors.border,
+    flexDirection: 'row', backgroundColor: color.surfaceRaised,
+    paddingVertical: space.md, paddingHorizontal: space.sm,
+    borderBottomWidth: hairline, borderBottomColor: color.border,
   },
-  summaryItem: { flex: 1, alignItems: 'center' },
-  summaryLabel: { fontSize: 11, color: Colors.textGray, marginBottom: 2 },
-  summaryValue: { fontSize: 15, fontWeight: '800' },
-  summaryDivider: { width: 1, backgroundColor: Colors.border, marginVertical: 4 },
+  summaryItem: { flex: 1, alignItems: 'center', paddingHorizontal: space.xs },
+  summaryLabel: { ...typeScale.caption, color: color.textSecondary, marginBottom: 2 },
+  summaryDash: { ...typeScale.bodyMedium, color: color.textMuted },
+  summaryDivider: { width: hairline, backgroundColor: color.border, marginVertical: space.xs },
 
   searchWrap: {
     flexDirection: 'row', alignItems: 'center',
-    backgroundColor: Colors.bgInput, margin: 12,
-    paddingHorizontal: 14, paddingVertical: 10,
-    borderRadius: 12, borderWidth: 1, borderColor: Colors.border,
-    gap: 8,
+    backgroundColor: color.surfaceRaised, margin: space.md,
+    paddingHorizontal: space.md, minHeight: touchTarget,
+    borderRadius: radius.md, borderWidth: hairline, borderColor: color.border,
+    gap: space.sm,
   },
-  searchIcon: { fontSize: 16 },
-  searchInput: { flex: 1, fontSize: 14, color: Colors.textWhite },
+  searchInput: { ...typeScale.body, flex: 1, color: color.textPrimary, paddingVertical: space.sm },
+  clearBtn: { width: touchTarget, height: touchTarget, alignItems: 'center', justifyContent: 'center', marginRight: -space.md },
 
   filterRow: {
-    flexDirection: 'row', paddingHorizontal: 12, gap: 8, marginBottom: 4,
+    flexDirection: 'row', paddingHorizontal: space.md, gap: space.sm, marginBottom: space.xs,
   },
   filterTab: {
-    flex: 1, paddingVertical: 8, borderRadius: 20,
-    backgroundColor: Colors.bgInput, alignItems: 'center',
-    borderWidth: 1, borderColor: Colors.border,
+    flex: 1, minHeight: touchTarget, paddingHorizontal: space.sm, borderRadius: radius.pill,
+    backgroundColor: color.surface, alignItems: 'center', justifyContent: 'center',
+    borderWidth: hairline, borderColor: color.borderStrong,
   },
-  filterTabActive: { backgroundColor: Colors.primary, borderColor: Colors.primary },
-  filterTabText: { fontSize: 12, fontWeight: '600', color: Colors.textGray },
-  filterTabTextActive: { color: Colors.textWhite, fontWeight: '700' },
+  filterTabActive: { backgroundColor: color.accent, borderColor: color.accent },
+  filterTabText: { ...typeScale.label, color: color.textSecondary },
+  filterTabTextActive: { ...typeScale.label, fontWeight: typeScale.bodyMedium.fontWeight, color: color.textInverse },
+
+  rangeWrap: { paddingHorizontal: space.md },
+  rangeField: { margin: 0 },
+  rangeText: { ...typeScale.label, color: color.textPrimary },
 
   row: {
     flexDirection: 'row', alignItems: 'center',
-    backgroundColor: Colors.bgCard, borderRadius: 12,
-    padding: 14, gap: 12,
-    borderWidth: 1, borderColor: Colors.border,
-    shadowColor: '#000', shadowOffset: { width: 0, height: 1 },
-    shadowOpacity: 0.2, shadowRadius: 4, elevation: 2,
+    backgroundColor: color.surface, borderRadius: radius.md,
+    padding: space.md, gap: space.md, minHeight: touchTarget + space.md,
+    borderWidth: hairline, borderColor: color.border,
   },
-  directionDot: { width: 10, height: 10, borderRadius: 5 },
   rowInfo: { flex: 1 },
-  rowDesc: { fontSize: 14, fontWeight: '600', color: Colors.textWhite },
-  rowDate: { fontSize: 11, color: Colors.textGray, marginTop: 2 },
-  rowRight: { alignItems: 'flex-end', gap: 4 },
-  rowAmount: { fontSize: 15, fontWeight: '800' },
-  deleteBtn: { padding: 4 },
-  deleteText: { fontSize: 16 },
+  rowTitleLine: { flexDirection: 'row', alignItems: 'center', gap: space.xs },
+  rowDesc: { ...typeScale.bodyMedium, color: color.textPrimary },
+  rowDate: { ...typeScale.caption, color: color.textSecondary, marginTop: 2 },
+  rowRight: { flexDirection: 'row', alignItems: 'center', gap: space.xs, flexShrink: 0 },
+  deleteBtn: { width: touchTarget, height: touchTarget, alignItems: 'center', justifyContent: 'center', marginRight: -space.sm },
 
-  center: { flex: 1, justifyContent: 'center', alignItems: 'center' },
-  emptyText: { fontSize: 15, color: Colors.textGray },
+  center: { flex: 1, justifyContent: 'center', alignItems: 'center', padding: space.lg, gap: space.sm },
+  emptyText: { ...typeScale.body, color: color.textSecondary, textAlign: 'center' },
+  retryBtn: { minHeight: touchTarget, paddingHorizontal: space.lg, justifyContent: 'center' },
+  retryText: { ...typeScale.bodyMedium, color: color.accent },
 
-  // Day header — the same values as CashBookScreen's dateHeaderBanner block.
+  listContent: { padding: space.lg, paddingBottom: 135 },
+  gap: { height: space.sm },
+  footerSpinner: { margin: space.lg },
+
+  // Day header — a raised band, like the Cash Book's day header.
   dateHeaderBanner: {
-    flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center',
-    backgroundColor: Colors.bgCard, borderRadius: 12, paddingVertical: 12, paddingHorizontal: 14,
-    borderWidth: 1, borderColor: Colors.border,
+    flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', gap: space.md,
+    backgroundColor: color.surfaceRaised, borderRadius: radius.md, paddingVertical: space.md, paddingHorizontal: space.md,
+    borderWidth: hairline, borderColor: color.border,
   },
   dateHeaderLeft: { flex: 1 },
-  dateTitle: { fontSize: 13, fontWeight: '800', color: Colors.textWhite, letterSpacing: 0.5 },
-  entriesCountText: { fontSize: 12, color: Colors.textGray, marginTop: 2 },
-  dateHeaderRight: { alignItems: 'flex-end' },
-  totalsHeaderRow: { flexDirection: 'row', gap: 16, marginBottom: 2 },
-  totalsValueRow: { flexDirection: 'row', gap: 16 },
-  columnLabel: { fontSize: 12, fontWeight: '700', minWidth: 60, textAlign: 'right' },
-  columnVal: { fontSize: 13, fontWeight: '800', minWidth: 60, textAlign: 'right', flexShrink: 0 },
+  dateTitle: { ...typeScale.bodyMedium, color: color.textPrimary },
+  entriesCountText: { ...typeScale.caption, color: color.textSecondary, marginTop: 2 },
+  dateHeaderRight: { flexDirection: 'row', gap: space.lg, flexShrink: 0 },
+  dayFigure: { alignItems: 'flex-end' },
+  columnLabel: { ...typeScale.caption, color: color.textSecondary },
 });

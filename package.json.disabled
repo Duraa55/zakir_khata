@@ -1,6 +1,7 @@
 {
   "dependencies": {
-    "expo": "^56.0.12"
+    "expo": "^56.0.12",
+    "expo-dev-client": "~56.0.27"
   },
   "devDependencies": {
     "@types/react": "~19.2.14",

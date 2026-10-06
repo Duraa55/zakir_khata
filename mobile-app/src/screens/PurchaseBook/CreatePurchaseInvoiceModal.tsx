@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { useLanguageStore } from '../../store/useLanguageStore';
 import {
   View, Text, TextInput, TouchableOpacity, StyleSheet,
   ScrollView, KeyboardAvoidingView, Platform, Alert, ActivityIndicator
@@ -10,10 +11,13 @@ import { useSupplierStore } from '../../store/useSupplierStore';
 import { getStockItemsByUserId } from '../../services/database/stockDb';
 import { PurchaseInvoiceItem, PurchaseOrderItem } from '../../types/purchase.types';
 import { ScreenContainer } from '../../components/ui/ScreenContainer';
-import { Colors } from '../../theme';
+import { Icon, AmountText, Button } from '../../components/ui/primitives';
+import { color, space, radius, hairline, touchTarget, iconSize, type as typeScale } from '../../theme/tokens';
 import { formatCurrency, rupeesToPaisa, paisaToRupeesString } from '../../utils/calculations';
 import { DateField } from '../../components/ui/DateField';
 import { todayDate } from '../../utils/dates';
+import { CurrencyPicker } from '../../components/ui/CurrencyPicker';
+import { resolveCurrency, type CurrencyCode } from '../../utils/currency';
 
 interface CartItem extends Omit<PurchaseInvoiceItem, 'id' | 'invoice_id' | 'is_deleted'> {
   tempId: string;
@@ -26,7 +30,11 @@ export const CreatePurchaseInvoiceModal = ({ navigation, route }: any) => {
   } = route?.params ?? {};
 
   const { user } = useAuthStore();
+  const { t } = useLanguageStore();
   const { createInvoice } = usePurchaseStore();
+  // Opens on the account default EVERY time — never the last currency used.
+  const accountCurrency = resolveCurrency(user?.defaultCurrency).code;
+  const [currency, setCurrency] = useState<CurrencyCode>(accountCurrency);
   const { suppliers, loadSuppliers } = useSupplierStore();
 
   const [supplierId, setSupplierId] = useState(initSupplierId ?? '');
@@ -91,8 +99,8 @@ export const CreatePurchaseInvoiceModal = ({ navigation, route }: any) => {
   const total = subtotal - disc + tax;
 
   const handleSubmit = async () => {
-    if (!supplierId) { Alert.alert('Error', 'Please select a supplier'); return; }
-    if (cart.length === 0) { Alert.alert('Error', 'Add at least one item'); return; }
+    if (!supplierId) { Alert.alert(t('commonError'), t('poSelectSupplier')); return; }
+    if (cart.length === 0) { Alert.alert(t('commonError'), t('poAddOneItem')); return; }
     if (!user) return;
     setLoading(true);
     try {
@@ -104,12 +112,13 @@ export const CreatePurchaseInvoiceModal = ({ navigation, route }: any) => {
         discountAmount: disc,
         taxAmount: tax,
         notes: notes.trim() || undefined,
+        currency,
       });
-      Alert.alert('✅ Invoice Created', 'Purchase invoice created and stock updated.', [
+      Alert.alert(t('piCreatedTitle'), t('piCreatedBody'), [
         { text: 'Done', onPress: () => navigation.goBack() }
       ]);
     } catch (e) {
-      Alert.alert('Error', 'Failed to create invoice. Please try again.');
+      Alert.alert(t('commonError'), t('piCreateFailed'));
     } finally {
       setLoading(false);
     }
@@ -118,26 +127,26 @@ export const CreatePurchaseInvoiceModal = ({ navigation, route }: any) => {
   return (
     <SafeAreaView style={styles.safe}>
       <View style={styles.header}>
-        <TouchableOpacity onPress={() => navigation.goBack()} style={styles.backBtn}>
-          <Text style={styles.backArrow}>←</Text>
+        <TouchableOpacity onPress={() => navigation.goBack()} style={styles.backBtn} accessibilityRole="button" accessibilityLabel={t('commonBack')}>
+          <Icon name="chevron-left" size={iconSize.lg} tint={color.textPrimary} />
         </TouchableOpacity>
-        <Text style={styles.headerTitle}>{poId ? 'Invoice from PO' : 'New Purchase Invoice'}</Text>
-        <View style={{ width: 40 }} />
+        <Text style={styles.headerTitle} numberOfLines={1}>{poId ? 'Invoice from order' : 'New purchase invoice'}</Text>
+        <View style={styles.backBtn} />
       </View>
 
       <ScreenContainer scrollable={true} hasTabBar={true} contentContainerStyle={styles.form}>
 
           {/* Supplier */}
           <View style={styles.section}>
-            <Text style={styles.label}>Supplier *</Text>
+            <Text style={styles.label}>{t('piSupplierLabel')} *</Text>
             {supplierId && !showSupplierPicker ? (
               <TouchableOpacity style={styles.selectedSupplier} onPress={() => setShowSupplierPicker(true)}>
-                <Text style={styles.selectedName}>{supplierName}</Text>
-                <Text style={styles.changeText}>Change</Text>
+                <Text style={styles.selectedSupplierName} numberOfLines={1}>{supplierName}</Text>
+                <Text style={styles.changeText}>{t('poChange')}</Text>
               </TouchableOpacity>
             ) : (
               suppliers.map(s => (
-                <TouchableOpacity key={s.id} style={styles.supplierOpt}
+                <TouchableOpacity key={s.id} style={styles.supplierOption}
                   onPress={() => { setSupplierId(s.id); setSupplierName(s.name); setShowSupplierPicker(false); }}
                 >
                   <Text style={styles.supplierOptName}>{s.name}</Text>
@@ -149,24 +158,27 @@ export const CreatePurchaseInvoiceModal = ({ navigation, route }: any) => {
 
           {/* Invoice Details */}
           <View style={styles.section}>
-            <Text style={styles.label}>Invoice Number (auto if blank)</Text>
-            <TextInput style={styles.input} value={invoiceNumber} onChangeText={setInvoiceNumber} placeholder="e.g. INV-2025-001" placeholderTextColor={Colors.textGray} />
-            <View style={{ flexDirection: 'row', gap: 10, marginTop: 12 }}>
-              <View style={{ flex: 1 }}>
-                <Text style={styles.label}>Invoice Date *</Text>
+            <Text style={styles.label}>{t('piNumberPlaceholder')}</Text>
+            <TextInput style={styles.input} value={invoiceNumber} onChangeText={setInvoiceNumber} placeholder={t('piNumberExample')} placeholderTextColor={color.textMuted} />
+            <View style={[styles.row2col, { marginTop: space.md }]}>
+              <View style={styles.col}>
+                <Text style={styles.label}>{t('piInvoiceDate')} *</Text>
                 <DateField style={styles.input} value={invoiceDate} onChange={setInvoiceDate} />
               </View>
-              <View style={{ flex: 1 }}>
-                <Text style={styles.label}>Due Date</Text>
-                <DateField style={styles.input} value={dueDate} onChange={setDueDate} placeholder="Optional" />
+              <View style={styles.col}>
+                <Text style={styles.label}>{t('piDueDate')}</Text>
+                <DateField style={styles.input} value={dueDate} onChange={setDueDate} placeholder={t('poOptional')} />
               </View>
             </View>
           </View>
 
           {/* Item Search */}
           <View style={styles.section}>
-            <Text style={styles.label}>Add Items</Text>
-            <TextInput style={styles.input} placeholder="🔍 Search stock items..." value={stockSearch} onChangeText={searchStock} placeholderTextColor={Colors.textGray} />
+            <Text style={styles.label}>{t('poAddItems')}</Text>
+            <View style={styles.searchBox}>
+              <Icon name="search" size={iconSize.sm} tint={color.textMuted} />
+              <TextInput style={styles.searchInput} placeholder={t('poSearchStock')} value={stockSearch} onChangeText={searchStock} placeholderTextColor={color.textMuted} />
+            </View>
             {stockResults.map(item => (
               <TouchableOpacity key={item.id} style={styles.stockResult} onPress={() => addToCart(item)}>
                 <Text style={styles.stockResultName}>{item.name_en}</Text>
@@ -180,117 +192,142 @@ export const CreatePurchaseInvoiceModal = ({ navigation, route }: any) => {
             <View style={styles.section}>
               <Text style={styles.label}>Items ({cart.length})</Text>
               {cart.map(item => (
-                <View key={item.tempId} style={styles.cartRow}>
-                  <Text style={styles.cartName} numberOfLines={1}>{item.item_name}</Text>
-                  <View style={styles.cartControls}>
+                <View key={item.tempId} style={styles.cartItem}>
+                  <Text style={styles.cartItemName} numberOfLines={1}>{item.item_name}</Text>
+                  <View style={styles.cartItemControls}>
                     <TextInput
-                      style={styles.smallInput}
+                      style={styles.costInput}
                       value={String(item.quantity)}
                       onChangeText={v => updateItem(item.tempId, 'quantity', parseFloat(v) || 0)}
                       keyboardType="decimal-pad"
-                      placeholder="Qty"
-                      placeholderTextColor={Colors.textGray}
+                      placeholder={t('commonQty')}
+                      placeholderTextColor={color.textMuted}
                     />
                     <Text style={styles.cartX}>×</Text>
                     <TextInput
-                      style={styles.smallInput}
+                      style={styles.costInput}
                       value={paisaToRupeesString(item.unit_cost)}
                       onChangeText={v => updateItem(item.tempId, 'unit_cost', rupeesToPaisa(v) ?? 0)}
                       keyboardType="decimal-pad"
-                      placeholder="Cost"
-                      placeholderTextColor={Colors.textGray}
+                      placeholder={t('poCost')}
+                      placeholderTextColor={color.textMuted}
                     />
-                    <Text style={styles.cartLine}>=  {formatCurrency(item.line_total)}</Text>
-                    <TouchableOpacity onPress={() => removeItem(item.tempId)}>
-                      <Text style={{ color: Colors.error, fontSize: 18, marginLeft: 6 }}>✕</Text>
+                    <Text style={styles.cartX}>=</Text>
+                    <AmountText currency={currency} paisa={item.line_total} size="label" />
+                    <TouchableOpacity onPress={() => removeItem(item.tempId)} style={styles.removeBtn} accessibilityLabel={t('poRemoveItem')}>
+                      <Icon name="x" size={iconSize.md} tint={color.textSecondary} />
                     </TouchableOpacity>
                   </View>
                 </View>
               ))}
 
-              {/* Totals */}
-              <View style={styles.totals}>
-                <View style={styles.totalRow}><Text style={styles.totalLabel}>Subtotal</Text><Text style={styles.totalVal}>Rs. {subtotal.toFixed(2)}</Text></View>
-                <View style={styles.totalRow}>
-                  <Text style={styles.totalLabel}>Discount (Rs.)</Text>
-                  <TextInput style={styles.inlineInput} value={discountAmount} onChangeText={setDiscountAmount} keyboardType="decimal-pad" placeholderTextColor={Colors.textGray} />
-                </View>
-                <View style={styles.totalRow}>
-                  <Text style={styles.totalLabel}>Tax (Rs.)</Text>
-                  <TextInput style={styles.inlineInput} value={taxAmount} onChangeText={setTaxAmount} keyboardType="decimal-pad" placeholderTextColor={Colors.textGray} />
-                </View>
-                <View style={[styles.totalRow, { paddingTop: 10, borderTopWidth: 1, borderTopColor: Colors.border }]}>
-                  <Text style={[styles.totalLabel, { fontSize: 15, fontWeight: '800', color: Colors.textWhite }]}>TOTAL</Text>
-                  <Text style={[styles.totalVal, { fontSize: 16, fontWeight: '800', color: Colors.primaryLight }]}>Rs. {total.toFixed(2)}</Text>
-                </View>
+              {/* Totals — paisa, formatted once (they used to print raw paisa as rupees). */}
+              <View style={styles.totalRow}>
+                <Text style={styles.totalLabel}>{t('piSubtotal')}</Text>
+                <AmountText currency={currency} paisa={subtotal} />
               </View>
+              <View style={styles.totalRow}>
+                <Text style={styles.totalLabel}>{t('piDiscount')} (Rs.)</Text>
+                <TextInput style={styles.inlineInput} value={discountAmount} onChangeText={setDiscountAmount} keyboardType="decimal-pad" placeholderTextColor={color.textMuted} />
+              </View>
+              <View style={styles.totalRow}>
+                <Text style={styles.totalLabel}>{t('piTax')} (Rs.)</Text>
+                <TextInput style={styles.inlineInput} value={taxAmount} onChangeText={setTaxAmount} keyboardType="decimal-pad" placeholderTextColor={color.textMuted} />
+              </View>
+              {/* The currency sits WITH the figure it applies to. */}
+              <View style={[styles.totalRow, styles.totalRowGrand]}>
+                <Text style={styles.totalLabelGrand}>{t('billTotal')}</Text>
+                <CurrencyPicker value={currency} onChange={setCurrency} />
+                <AmountText currency={currency} paisa={total} signed />
+              </View>
+              <Text style={styles.currencyHint}>{t('currencyEntryHint')}</Text>
             </View>
           )}
 
+
           {/* Notes */}
           <View style={styles.section}>
-            <Text style={styles.label}>Notes (Optional)</Text>
-            <TextInput style={[styles.input, { minHeight: 60, textAlignVertical: 'top' }]} value={notes} onChangeText={setNotes} multiline placeholder="Any notes..." placeholderTextColor={Colors.textGray} />
+            <Text style={styles.label}>{t('poNotesLabel')}</Text>
+            <TextInput style={[styles.input, styles.notesInput]} value={notes} onChangeText={setNotes} multiline placeholder={t('piNotesPlaceholder')} placeholderTextColor={color.textMuted} />
           </View>
 
-          <TouchableOpacity style={[styles.submitBtn, loading && { opacity: 0.6 }]} onPress={handleSubmit} disabled={loading}>
-            {loading ? <ActivityIndicator color="#fff" /> : <Text style={styles.submitText}>🧾 CREATE INVOICE</Text>}
-          </TouchableOpacity>
+          <Button label={t('piCreate')} icon="file-text" onPress={handleSubmit} loading={loading} disabled={loading} fullWidth style={styles.submitBtn} />
         </ScreenContainer>
     </SafeAreaView>
   );
 };
 
 const styles = StyleSheet.create({
-  safe: { flex: 1, backgroundColor: Colors.bgPrimary },
+  safe: { flex: 1, backgroundColor: color.surface },
   header: {
     flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
-    backgroundColor: Colors.bgCard, paddingHorizontal: 16, paddingVertical: 14,
-    borderBottomWidth: 1, borderBottomColor: Colors.border,
+    backgroundColor: color.surface, paddingHorizontal: space.md, minHeight: 56,
+    borderBottomWidth: hairline, borderBottomColor: color.border,
   },
-  backBtn: { width: 36 },
-  backArrow: { fontSize: 22, color: Colors.textWhite, fontWeight: '700' },
-  headerTitle: { fontSize: 17, fontWeight: '700', color: Colors.textWhite },
-  form: { padding: 16, paddingBottom: 40 },
+  backBtn: { width: touchTarget, height: touchTarget, alignItems: 'center', justifyContent: 'center' },
+  headerTitle: { ...typeScale.heading, fontSize: 18, color: color.textPrimary, flex: 1, textAlign: 'center' },
+  form: { padding: space.lg, paddingBottom: 40 },
   section: {
-    backgroundColor: Colors.bgCard, borderRadius: 14, padding: 14, marginBottom: 12,
-    borderWidth: 1, borderColor: Colors.border, shadowColor: '#000', shadowOpacity: 0.2, elevation: 2
+    backgroundColor: color.surface, borderRadius: radius.lg, padding: space.lg, marginBottom: space.md,
+    borderWidth: hairline, borderColor: color.border,
   },
-  label: { fontSize: 12, fontWeight: '700', color: Colors.textGray, marginBottom: 6, textTransform: 'uppercase' },
+  currencyHint: { ...typeScale.caption, color: color.textMuted, marginTop: space.xs },
+  label: { ...typeScale.label, color: color.textSecondary, marginBottom: space.sm },
   input: {
-    backgroundColor: Colors.bgInput, borderWidth: 1, borderColor: Colors.border,
-    borderRadius: 10, paddingHorizontal: 12, paddingVertical: 10, fontSize: 14, color: Colors.textWhite
+    backgroundColor: color.surfaceRaised, borderWidth: hairline, borderColor: color.border,
+    borderRadius: radius.md, paddingHorizontal: space.md, minHeight: touchTarget, paddingVertical: space.sm,
+    ...typeScale.body, color: color.textPrimary,
   },
+  notesInput: { minHeight: 70, textAlignVertical: 'top' },
+  row2col: { flexDirection: 'row', gap: space.md },
+  col: { flex: 1 },
+  searchBox: {
+    flexDirection: 'row', alignItems: 'center', gap: space.sm,
+    backgroundColor: color.surfaceRaised, borderWidth: hairline, borderColor: color.border,
+    borderRadius: radius.md, paddingHorizontal: space.md, minHeight: touchTarget,
+  },
+  searchInput: { ...typeScale.body, flex: 1, color: color.textPrimary, paddingVertical: space.sm },
+  spinner: { marginTop: space.sm },
   selectedSupplier: {
-    flexDirection: 'row', justifyContent: 'space-between', backgroundColor: Colors.bgInput,
-    borderRadius: 10, padding: 12, borderWidth: 1, borderColor: Colors.border
+    flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', gap: space.md,
+    minHeight: touchTarget, paddingHorizontal: space.md, paddingVertical: space.sm,
+    backgroundColor: color.surfaceRaised, borderRadius: radius.md, borderWidth: hairline, borderColor: color.border,
   },
-  selectedName: { fontSize: 14, fontWeight: '700', color: Colors.primaryLight },
-  changeText: { fontSize: 13, color: Colors.textGray },
-  supplierOpt: { padding: 12, borderRadius: 10, borderWidth: 1, borderColor: Colors.border, marginBottom: 8, backgroundColor: Colors.bgInput },
-  supplierOptName: { fontSize: 14, fontWeight: '700', color: Colors.textWhite },
-  supplierOptBiz: { fontSize: 12, color: Colors.textGray },
-  stockResult: { padding: 10, borderBottomWidth: 1, borderBottomColor: Colors.border },
-  stockResultName: { fontSize: 14, fontWeight: '600', color: Colors.textWhite },
-  stockResultDetail: { fontSize: 12, color: Colors.textGray },
-  cartRow: { paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: Colors.border },
-  cartName: { fontSize: 13, fontWeight: '700', color: Colors.textWhite, marginBottom: 6 },
-  cartControls: { flexDirection: 'row', alignItems: 'center' },
-  smallInput: {
-    width: 64, backgroundColor: Colors.bgInput, borderWidth: 1, borderColor: Colors.border,
-    borderRadius: 8, paddingHorizontal: 6, paddingVertical: 6, fontSize: 13, textAlign: 'center', color: Colors.textWhite
+  selectedSupplierName: { ...typeScale.bodyMedium, color: color.textPrimary, flex: 1 },
+  changeText: { ...typeScale.label, color: color.accent },
+  supplierOption: {
+    minHeight: touchTarget, padding: space.md, borderRadius: radius.md, borderWidth: hairline,
+    borderColor: color.borderStrong, marginBottom: space.sm, backgroundColor: color.surface,
   },
-  cartX: { fontSize: 14, color: Colors.textGray, marginHorizontal: 6 },
-  cartLine: { flex: 1, fontSize: 13, fontWeight: '700', color: Colors.primaryLight, marginLeft: 6 },
-  totals: { marginTop: 12, paddingTop: 8 },
-  totalRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingVertical: 6 },
-  totalLabel: { fontSize: 13, color: Colors.textGray, fontWeight: '600' },
-  totalVal: { fontSize: 14, fontWeight: '700', color: Colors.textWhite },
+  supplierOptName: { ...typeScale.bodyMedium, color: color.textPrimary },
+  supplierOptBiz: { ...typeScale.caption, color: color.textSecondary, marginTop: 2 },
+  addSupplierHint: { minHeight: touchTarget, flexDirection: 'row', gap: space.sm, alignItems: 'center', justifyContent: 'center' },
+  addSupplierHintText: { ...typeScale.bodyMedium, color: color.accent },
+  stockResult: { minHeight: touchTarget, paddingVertical: space.sm, borderBottomWidth: hairline, borderBottomColor: color.border, justifyContent: 'center' },
+  stockResultName: { ...typeScale.bodyMedium, color: color.textPrimary },
+  stockResultDetail: { ...typeScale.caption, color: color.textSecondary, marginTop: 2 },
+  cartItem: { paddingVertical: space.md, borderBottomWidth: hairline, borderBottomColor: color.border },
+  cartItemName: { ...typeScale.bodyMedium, color: color.textPrimary, marginBottom: space.sm },
+  cartItemControls: { flexDirection: 'row', alignItems: 'center', flexWrap: 'wrap', gap: space.xs },
+  qtyBtn: {
+    width: touchTarget, height: touchTarget, backgroundColor: color.surface, borderWidth: hairline,
+    borderColor: color.borderStrong, borderRadius: radius.sm, justifyContent: 'center', alignItems: 'center',
+  },
+  qtyVal: { ...typeScale.bodyMedium, minWidth: 36, textAlign: 'center', color: color.textPrimary },
+  cartX: { ...typeScale.label, color: color.textSecondary, marginHorizontal: space.xs },
+  costInput: {
+    minWidth: 80, backgroundColor: color.surfaceRaised, borderWidth: hairline, borderColor: color.border,
+    borderRadius: radius.sm, paddingHorizontal: space.sm, minHeight: touchTarget, ...typeScale.body, textAlign: 'center', color: color.textPrimary,
+  },
+  removeBtn: { width: touchTarget, height: touchTarget, alignItems: 'center', justifyContent: 'center' },
+  lineTotalRow: { flexDirection: 'row', justifyContent: 'flex-end', marginTop: space.xs },
+  totalRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', gap: space.md, paddingVertical: space.sm },
+  totalRowGrand: { paddingTop: space.md, marginTop: space.xs, borderTopWidth: hairline, borderTopColor: color.border },
+  totalLabel: { ...typeScale.body, color: color.textSecondary, flex: 1 },
+  totalLabelGrand: { ...typeScale.bodyMedium, color: color.textPrimary, flex: 1 },
   inlineInput: {
-    width: 90, backgroundColor: Colors.bgInput, borderWidth: 1, borderColor: Colors.border,
-    borderRadius: 8, paddingHorizontal: 8, paddingVertical: 4, fontSize: 14, textAlign: 'right', color: Colors.textWhite
+    minWidth: 90, backgroundColor: color.surfaceRaised, borderWidth: hairline, borderColor: color.border,
+    borderRadius: radius.sm, paddingHorizontal: space.sm, minHeight: touchTarget, ...typeScale.body, textAlign: 'right', color: color.textPrimary,
   },
-  submitBtn: { backgroundColor: Colors.primary, borderRadius: 14, paddingVertical: 16, alignItems: 'center', marginTop: 8 },
-  submitText: { color: Colors.textWhite, fontWeight: '800', fontSize: 15 },
+  submitBtn: { minHeight: 52, marginTop: space.sm },
 });
-

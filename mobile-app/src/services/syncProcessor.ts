@@ -77,7 +77,7 @@ export async function processSyncQueue(): Promise<void> {
 
   // Update pending count
   const remainingCount = await db.getFirstAsync<{ count: number }>(
-    `SELECT COUNT(*) as count FROM sync_queue WHERE status != 'completed'`
+    `SELECT COUNT(*) as count FROM sync_queue WHERE status IN ('pending', 'failed')`
   );
   useSyncStore.getState().setPendingCount(remainingCount?.count || 0);
 }
@@ -121,12 +121,12 @@ export async function batchProcessSyncQueue(): Promise<void> {
       await db.runAsync(`DELETE FROM sync_queue WHERE id=?`, [item.id]);
     }
   } catch (error) {
-    console.error('Batch sync failed:', error);
+    if (__DEV__) console.error('Batch sync failed:', error);
   }
 
   // Update pending count
   const remainingCount = await db.getFirstAsync<{ count: number }>(
-    `SELECT COUNT(*) as count FROM sync_queue WHERE status != 'completed'`
+    `SELECT COUNT(*) as count FROM sync_queue WHERE status IN ('pending', 'failed')`
   );
   useSyncStore.getState().setPendingCount(remainingCount?.count || 0);
 }

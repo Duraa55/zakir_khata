@@ -1,21 +1,28 @@
 import React, { useState, useEffect } from 'react';
-import { View, Text, ScrollView, ActivityIndicator, TouchableOpacity } from 'react-native';
+import { useLanguageStore } from '../../store/useLanguageStore';
+import { View, Text, ScrollView, ActivityIndicator, TouchableOpacity, StyleSheet } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import { StackScreenProps } from '@react-navigation/stack';
-import { LineChart } from 'react-native-gifted-charts';
 import { useAuthStore } from '../../store/authStore';
 import { getSalesReportSummary, getSalesTrend, SalesSummary, SalesTrendData } from '../../services/database/reports';
-import { DateFilterPicker } from '../../components/reports/DateFilterPicker';
-import { formatCurrency } from '../../utils/calculations';
+import { DateFilterPicker, presetRange } from '../../components/reports/DateFilterPicker';
+import { formatSignedCurrency } from '../../utils/calculations';
+import { formatDisplayDate } from '../../utils/dates';
 import { handleReportExport } from '../../utils/exportUtils';
+import { Card, SectionHeader, AmountText, AmountStack, Icon } from '../../components/ui/primitives';
+import { soleTotal, stackedTotalText, isMixed } from '../../utils/currencyTotals';
+import { color, space, radius, hairline, touchTarget, iconSize, type as typeScale } from '../../theme/tokens';
 
 type Props = StackScreenProps<any, any>;
 
 export const SalesReportScreen: React.FC<Props> = ({ navigation }) => {
   const user = useAuthStore(state => state.user);
+  const { t } = useLanguageStore();
   const [loading, setLoading] = useState(true);
   const [summary, setSummary] = useState<SalesSummary | null>(null);
   const [trend, setTrend] = useState<SalesTrendData[]>([]);
-  const [filter, setFilter] = useState({});
+  // Starts on the same range the picker shows by default, not all-time.
+  const [filter, setFilter] = useState(() => presetRange('currentMonth'));
   const [filterLabel, setFilterLabel] = useState('Current Month');
 
   const loadData = async (newFilter: any) => {
@@ -27,7 +34,7 @@ export const SalesReportScreen: React.FC<Props> = ({ navigation }) => {
       setSummary(sum);
       setTrend(trn);
     } catch (e) {
-      console.error(e);
+      if (__DEV__) console.error(e);
     } finally {
       setLoading(false);
     }
@@ -40,90 +47,156 @@ export const SalesReportScreen: React.FC<Props> = ({ navigation }) => {
   const handleExport = async () => {
     if (!summary || trend.length === 0) return;
     try {
+      // Amounts are formatted, not raw paisa — a raw 150000 in the file reads as
+      // Rs. 1,50,000 for a Rs. 1,500 sale.
+      // A day that spans currencies exports BOTH figures on their own lines — the same
+      // lines the screen shows. It must never collapse to one number here either.
       const data = trend.map(t => ({
         Date: t.date,
-        'Total Sales': t.total,
+        'Total Sales': stackedTotalText(t.total, formatSignedCurrency, ' / '),
         'Number of Bills': t.count
       }));
-      data.push({ Date: 'TOTAL', 'Total Sales': summary.totalSales, 'Number of Bills': summary.totalBills });
+      data.push({
+        Date: 'Total',
+        'Total Sales': stackedTotalText(summary.totalSales, formatSignedCurrency, ' / '),
+        'Number of Bills': summary.totalBills,
+      });
       handleReportExport(`Sales_Report_${filterLabel}`, data, 'Sales');
     } catch (e) {
-      console.error('Export failed', e);
+      if (__DEV__) console.error('Export failed', e);
     }
   };
 
-  const chartData = trend.map(t => ({
-    value: t.total,
-    label: t.date.substring(8, 10), // just the day
-    dataPointText: t.total > 0 ? (t.total / 1000).toFixed(1) + 'k' : ''
-  }));
+  // Newest day first, so today's figure is the first thing read. The bar only
+  // compares days with each other; the exact amount sits beside it.
+  const days = [...trend].reverse();
+  // A bar compares days with one another. Across currencies there is nothing to
+  // compare, so when the range is mixed the bars go away and the figures stand alone —
+  // a single-currency range keeps exactly the bars it always had.
+  const spansCurrencies = isMixed(summary?.totalSales ?? []) || trend.some(t => isMixed(t.total));
+  const busiest = Math.max(1, ...trend.map(t => soleTotal(t.total)?.amount ?? 0));
 
   return (
-    <View className="flex-1 bg-gray-50">
-      <View className="bg-blue-600 px-4 pt-4 pb-12 rounded-b-3xl">
-        <View className="flex-row justify-between items-center mb-4">
-          <TouchableOpacity onPress={() => navigation.goBack()}>
-            <Text className="text-white text-lg">← Back</Text>
-          </TouchableOpacity>
-          <Text className="text-white text-xl font-bold">Sales Report</Text>
-          <TouchableOpacity onPress={handleExport}>
-            <Text className="text-white text-base">Export</Text>
-          </TouchableOpacity>
-        </View>
-        <DateFilterPicker onFilterChange={(f, l) => { setFilter(f); setFilterLabel(l); }} />
+    <SafeAreaView style={styles.safe} edges={['top']}>
+      <View style={styles.header}>
+        <TouchableOpacity onPress={() => navigation.goBack()} style={styles.headerBtn} accessibilityRole="button" accessibilityLabel={t('commonBack')}>
+          <Icon name="chevron-left" size={iconSize.lg} tint={color.textPrimary} />
+        </TouchableOpacity>
+        <Text style={styles.headerTitle} numberOfLines={1}>{t('repSalesTitle')}</Text>
+        <TouchableOpacity onPress={handleExport} style={[styles.headerBtn, { alignItems: 'flex-end' }]}>
+          <Text style={styles.exportText}>{t('repExport')}</Text>
+        </TouchableOpacity>
       </View>
 
-      <ScrollView className="flex-1 px-4 -mt-8" contentContainerStyle={{ paddingBottom: 40 }}>
+      <ScrollView style={styles.scroll} contentContainerStyle={styles.content}>
+        <DateFilterPicker onFilterChange={(f, l) => { setFilter(f); setFilterLabel(l); }} />
+
         {loading ? (
-          <ActivityIndicator size="large" color="#2563eb" className="mt-10" />
+          <ActivityIndicator size="large" color={color.accent} style={{ marginTop: space.xxxl }} />
         ) : summary ? (
           <>
-            <View className="bg-white rounded-2xl p-5 shadow-sm border border-gray-100 mb-4 flex-row flex-wrap justify-between">
-              <View className="w-[48%] mb-4">
-                <Text className="text-gray-500 text-xs uppercase tracking-wider mb-1">Total Sales</Text>
-                <Text className="text-2xl font-bold text-gray-900">{formatCurrency(summary.totalSales)}</Text>
-              </View>
-              <View className="w-[48%] mb-4">
-                <Text className="text-gray-500 text-xs uppercase tracking-wider mb-1">Total Bills</Text>
-                <Text className="text-2xl font-bold text-gray-900">{summary.totalBills}</Text>
-              </View>
-              <View className="w-[48%]">
-                <Text className="text-gray-500 text-xs uppercase tracking-wider mb-1">Avg Bill Value</Text>
-                <Text className="text-lg font-bold text-blue-600">{formatCurrency(summary.averageBillValue)}</Text>
-              </View>
-            </View>
+            <Text style={styles.intro}>{t('repSalesIntro')}</Text>
 
-            <View className="bg-white rounded-2xl p-5 shadow-sm border border-gray-100 mb-4">
-              <Text className="text-gray-800 font-bold text-lg mb-4">Sales Trend</Text>
-              {chartData.length > 0 ? (
-                <View className="items-center">
-                  <LineChart
-                    data={chartData}
-                    width={300}
-                    height={200}
-                    spacing={chartData.length > 10 ? 25 : 40}
-                    thickness={3}
-                    color="#2563eb"
-                    dataPointsColor="#2563eb"
-                    textColor="#6b7280"
-                    textShiftY={-10}
-                    textShiftX={-15}
-                    textFontSize={10}
-                    hideRules
-                    yAxisThickness={0}
-                    xAxisThickness={1}
-                    xAxisColor="#e5e7eb"
-                  />
+            {/* Headline figures, each with one line saying what it means. */}
+            <Card tone="outlined" style={styles.figures}>
+              <View style={styles.figureRow}>
+                <View style={styles.figureText}>
+                  <Text style={styles.figureLabel}>{t('repTotalSales')}</Text>
+                  <Text style={styles.figureHint}>{t('repAllBillsAdded')}</Text>
                 </View>
+                <AmountStack totals={summary.totalSales} size="title" />
+              </View>
+
+              <View style={styles.divider} />
+
+              <View style={styles.figureRow}>
+                <View style={styles.figureText}>
+                  <Text style={styles.figureLabel}>{t('repBillsMade')}</Text>
+                  <Text style={styles.figureHint}>{t('repBillsMadeDesc')}</Text>
+                </View>
+                <Text style={styles.count}>{summary.totalBills}</Text>
+              </View>
+
+              <View style={styles.divider} />
+
+              <View style={styles.figureRow}>
+                <View style={styles.figureText}>
+                  <Text style={styles.figureLabel}>{t('repAverageBill')}</Text>
+                  <Text style={styles.figureHint}>{t('repAverageBillDesc')}</Text>
+                </View>
+                <AmountStack totals={summary.averageBillValue} />
+              </View>
+            </Card>
+
+            <View style={styles.section}>
+              <SectionHeader title={t('repSalesByDay')} />
+              {days.length > 0 ? (
+                <Card tone="outlined" padded={false}>
+                  {days.map((d, i) => (
+                    <View key={d.date} style={[styles.dayRow, i > 0 && styles.dayRowBorder]}>
+                      <View style={styles.dayTop}>
+                        <View style={styles.figureText}>
+                          <Text style={styles.dayDate}>{formatDisplayDate(d.date)}</Text>
+                          <Text style={styles.figureHint}>{d.count} {d.count === 1 ? 'bill' : 'bills'}</Text>
+                        </View>
+                        <AmountStack totals={d.total} />
+                      </View>
+                      {!spansCurrencies && (
+                        <View style={styles.barTrack}>
+                          <View style={[styles.barFill, { width: `${Math.max(2, ((soleTotal(d.total)?.amount ?? 0) / busiest) * 100)}%` }]} />
+                        </View>
+                      )}
+                    </View>
+                  ))}
+                </Card>
               ) : (
-                <View className="h-40 items-center justify-center">
-                  <Text className="text-gray-400">No data for this period</Text>
-                </View>
+                <Card tone="outlined">
+                  <Text style={styles.empty}>{t('repNoBills')}</Text>
+                </Card>
               )}
             </View>
           </>
         ) : null}
       </ScrollView>
-    </View>
+    </SafeAreaView>
   );
 };
+
+const styles = StyleSheet.create({
+  safe: { flex: 1, backgroundColor: color.surface },
+  header: {
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
+    paddingHorizontal: space.lg, height: 56, backgroundColor: color.surface,
+    borderBottomWidth: hairline, borderBottomColor: color.border,
+  },
+  headerBtn: { minWidth: touchTarget, height: touchTarget, justifyContent: 'center' },
+  headerTitle: { ...typeScale.heading, fontSize: 18, color: color.textPrimary, flex: 1, textAlign: 'center' },
+  exportText: { ...typeScale.bodyMedium, color: color.accent },
+
+  scroll: { flex: 1, backgroundColor: color.surface },
+  content: { padding: space.lg, paddingBottom: space.xxxl },
+
+  intro: { ...typeScale.label, color: color.textSecondary, marginBottom: space.md },
+
+  figures: { gap: space.md },
+  // Label takes the slack (Urdu runs ~40% longer); the figure never shrinks.
+  figureRow: { flexDirection: 'row', alignItems: 'center', gap: space.md },
+  figureText: { flex: 1 },
+  figureLabel: { ...typeScale.bodyMedium, color: color.textPrimary },
+  figureHint: { ...typeScale.caption, color: color.textSecondary, marginTop: 2 },
+  count: { ...typeScale.title, color: color.textPrimary, flexShrink: 0 },
+  divider: { height: hairline, backgroundColor: color.border },
+
+  section: { marginTop: space.xxl },
+  dayRow: { paddingVertical: space.md, paddingHorizontal: space.lg },
+  dayRowBorder: { borderTopWidth: hairline, borderTopColor: color.border },
+  dayTop: { flexDirection: 'row', alignItems: 'center', gap: space.md },
+  dayDate: { ...typeScale.body, color: color.textPrimary },
+  barTrack: {
+    height: 6, borderRadius: radius.pill, backgroundColor: color.surfaceRaised,
+    marginTop: space.sm, overflow: 'hidden',
+  },
+  barFill: { height: '100%', borderRadius: radius.pill, backgroundColor: color.accent },
+
+  empty: { ...typeScale.body, color: color.textMuted },
+});

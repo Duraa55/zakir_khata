@@ -1,6 +1,7 @@
 import { getDatabase } from './db';
 import { assertAllowedUpdateFields } from './updateFields';
-import { writeWithSync } from './syncHelpers';
+import { writeWithSync, writeRowWithSyncIn, afterSyncedWrite } from './syncHelpers';
+import { withWriteTransaction } from './writeTransaction';
 import { generateId, nowISO, todayDate } from './queryHelpers';
 import { Supplier, SupplierPayment, SupplierLedgerEntry } from '../../types/supplier.types';
 
@@ -105,6 +106,12 @@ export const deleteSupplier = async (id: string, userId: string): Promise<void> 
 
 // ─── Supplier Payments ────────────────────────────────────────────────────────
 
+/**
+ * Record a payment to a supplier — ALL-OR-NOTHING. The amount is whole paisa above
+ * zero; when it is against an invoice it can be no more than that invoice's balance,
+ * and the payment row and the invoice's paid/balance/status are written in one
+ * transaction (a failure part way used to leave a payment with no effect on the bill).
+ */
 export const addSupplierPayment = async (
   userId: string,
   supplierId: string,
@@ -115,7 +122,8 @@ export const addSupplierPayment = async (
   reference?: string,
   notes?: string
 ): Promise<SupplierPayment> => {
-  const db = await getDatabase();
+  if (!Number.isInteger(amount) || amount <= 0) throw new Error('Enter an amount above zero.');
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(paymentDate)) throw new Error('Invalid payment date.');
   const id = generateId('spay');
   const now = nowISO();
 
@@ -137,31 +145,40 @@ export const addSupplierPayment = async (
     firestore_path: `users/${userId}/supplier_payments/${id}`,
   };
 
-  await writeWithSync({
-    tableName: 'supplier_payments',
-    recordId: id,
-    operation: 'create',
-    data,
-    firestorePath: `users/${userId}/supplier_payments/${id}`,
-    userId
-  });
+  await withWriteTransaction(async db => {
+    const supplier = await db.getFirstAsync<{ id: string }>('SELECT id FROM suppliers WHERE id = ? AND is_deleted = 0', [supplierId]);
+    if (!supplier) throw new Error('Supplier not found.');
+    let inv: { total: number; amount_paid: number } | null = null;
+    if (invoiceId) {
+      inv = await db.getFirstAsync<{ total: number; amount_paid: number }>(
+        'SELECT total, amount_paid FROM purchase_invoices WHERE id = ? AND supplier_id = ? AND is_deleted = 0 LIMIT 1',
+        [invoiceId, supplierId]
+      );
+      if (!inv) throw new Error('Invoice not found.');
+      const balance = Math.max(0, inv.total - (inv.amount_paid || 0));
+      if (amount > balance) throw new Error('The payment is more than the balance due on this invoice.');
+    }
 
-  // If linked to an invoice, update its amount_paid and balance_due
-  if (invoiceId) {
-    const inv = await db.getFirstAsync<{ total: number; amount_paid: number }>(
-      'SELECT total, amount_paid FROM purchase_invoices WHERE id = ? LIMIT 1',
-      [invoiceId]
-    );
-    if (inv) {
+    await writeRowWithSyncIn(db, {
+      tableName: 'supplier_payments',
+      recordId: id,
+      operation: 'create',
+      data,
+      firestorePath: `users/${userId}/supplier_payments/${id}`,
+      userId
+    });
+
+    if (invoiceId && inv) {
       const newPaid = (inv.amount_paid || 0) + amount;
       const newBalance = Math.max(0, inv.total - newPaid);
-      const newStatus = newBalance <= 0 ? 'paid' : newPaid > 0 ? 'partial' : 'unpaid';
+      const newStatus = newBalance <= 0 ? 'paid' : 'partial';
       await db.runAsync(
         `UPDATE purchase_invoices SET amount_paid = ?, balance_due = ?, status = ?, updated_at = ?, synced = 0 WHERE id = ?`,
         [newPaid, newBalance, newStatus, now, invoiceId]
       );
     }
-  }
+  });
+  afterSyncedWrite();
 
   return data;
 };

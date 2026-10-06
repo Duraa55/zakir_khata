@@ -1,9 +1,14 @@
 import React, { useState, useEffect } from 'react';
-import { View, Text, TouchableOpacity, ScrollView, ActivityIndicator, FlatList, RefreshControl } from 'react-native';
+import { useLanguageStore } from '../../store/useLanguageStore';
+import { View, Text, TouchableOpacity, ScrollView, ActivityIndicator, RefreshControl, Alert, StyleSheet } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import { StackScreenProps } from '@react-navigation/stack';
 import { useSyncStore } from '../../store/useSyncStore';
 import { getDatabase } from '../../services/database/db';
 import { format } from 'date-fns';
+import { Icon, Button, Card } from '../../components/ui/primitives';
+import { color, space, radius, hairline, touchTarget, iconSize, type as typeScale } from '../../theme/tokens';
+import { IS_FIREBASE_CONFIGURED } from '../../services/firebase/firebaseConfig';
 
 type Props = StackScreenProps<any, any>;
 
@@ -23,8 +28,16 @@ interface SyncMetadata {
   pending_count: number;
 }
 
+const tableLabel = (t: string) => {
+  const s = (t || '').replace(/_/g, ' ');
+  return s ? s.charAt(0).toUpperCase() + s.slice(1) : s;
+};
+const opLabel = (op: string) => (op ? op.charAt(0).toUpperCase() + op.slice(1).toLowerCase() : op);
+const when = (iso: string, pattern: string) => { try { return format(new Date(iso), pattern); } catch { return ''; } };
+
 export const SyncCenterScreen: React.FC<Props> = ({ navigation }) => {
-  const { isOnline, isSyncing, pendingCount, processSyncQueue } = useSyncStore();
+  const { isOnline, isSyncing, processSyncQueue } = useSyncStore();
+  const { t } = useLanguageStore();
   const [queueItems, setQueueItems] = useState<SyncQueueItem[]>([]);
   const [metadata, setMetadata] = useState<SyncMetadata[]>([]);
   const [loading, setLoading] = useState(true);
@@ -33,24 +46,21 @@ export const SyncCenterScreen: React.FC<Props> = ({ navigation }) => {
     setLoading(true);
     try {
       const db = await getDatabase();
-      
-      // Load pending/failed queue
+      // Pending and failed only — dismissed rows are kept on the phone but not shown.
       const queue = await db.getAllAsync<SyncQueueItem>(
-        `SELECT id, table_name, operation, status, error_message, created_at, retry_count 
-         FROM sync_queue 
-         ORDER BY created_at DESC 
+        `SELECT id, table_name, operation, status, error_message, created_at, retry_count
+         FROM sync_queue
+         WHERE status IN ('pending', 'failed')
+         ORDER BY created_at DESC
          LIMIT 50`
       );
       setQueueItems(queue);
-
-      // Load metadata
       const meta = await db.getAllAsync<SyncMetadata>(
         `SELECT table_name, last_synced_at, pending_count FROM sync_metadata`
       );
       setMetadata(meta);
-
     } catch (err) {
-      console.error(err);
+      if (__DEV__) console.error(err);
     } finally {
       setLoading(false);
     }
@@ -66,146 +76,197 @@ export const SyncCenterScreen: React.FC<Props> = ({ navigation }) => {
     await loadSyncData();
   };
 
-  const handleDismissAllFailed = async () => {
-    try {
-      const db = await getDatabase();
-      await db.runAsync(`DELETE FROM sync_queue WHERE status = 'failed'`);
-      await loadSyncData();
-    } catch (err) {
-      console.error('Failed to dismiss items:', err);
-    }
+  /**
+   * Stop retrying the failed uploads. They are marked 'dismissed', NOT deleted: the
+   * entries themselves are untouched on this phone — only their upload is given up.
+   * (This used to hard-delete the queue rows with no warning.)
+   */
+  const handleDismissAllFailed = () => {
+    Alert.alert(
+      t('syncStopTitle'),
+      t('syncStopBody'),
+      [
+        { text: t('commonCancel'), style: 'cancel' },
+        {
+          text: t('syncStopRetrying'), style: 'destructive',
+          onPress: async () => {
+            try {
+              const db = await getDatabase();
+              await db.runAsync(`UPDATE sync_queue SET status = 'dismissed' WHERE status = 'failed'`);
+              await loadSyncData();
+            } catch (err) {
+              if (__DEV__) console.error('Failed to dismiss items:', err);
+            }
+          },
+        },
+      ]
+    );
   };
 
   const failedItems = queueItems.filter(q => q.status === 'failed');
   const pendingItems = queueItems.filter(q => q.status === 'pending');
 
   return (
-    <View className="flex-1 bg-gray-50">
-      <ScrollView 
-        className="flex-1 px-4 pt-4"
-        refreshControl={<RefreshControl refreshing={loading} onRefresh={loadSyncData} />}
+    <SafeAreaView style={styles.safe} edges={['top']}>
+      <View style={styles.header}>
+        <TouchableOpacity onPress={() => navigation.goBack()} style={styles.backBtn} accessibilityRole="button" accessibilityLabel={t('commonBack')}>
+          <Icon name="chevron-left" size={iconSize.lg} tint={color.textPrimary} />
+        </TouchableOpacity>
+        <Text style={styles.headerTitle} numberOfLines={1}>{t('syncTitle')}</Text>
+        <View style={styles.backBtn} />
+      </View>
+
+      <ScrollView
+        style={styles.scroll}
+        contentContainerStyle={styles.content}
+        refreshControl={<RefreshControl refreshing={loading} onRefresh={loadSyncData} tintColor={color.accent} />}
       >
-        
-        {/* Connection Status Card */}
-        <View className="bg-white p-5 rounded-2xl shadow-sm border border-gray-100 mb-6 flex-row items-center">
-          <View className={`w-14 h-14 rounded-full items-center justify-center mr-4 ${isOnline ? 'bg-emerald-100' : 'bg-red-100'}`}>
-            <Text className="text-2xl">{isOnline ? '🌐' : '📵'}</Text>
+        {/* Connection — offline is something to be aware of (amber), not money (red). */}
+        <Card tone="outlined" style={styles.statusCard}>
+          <View style={styles.statusIcon}>
+            <Icon name={isOnline ? 'wifi' : 'wifi-off'} size={iconSize.lg} tint={isOnline ? color.textSecondary : color.attention} />
           </View>
-          <View className="flex-1">
-            <Text className="text-gray-500 font-medium mb-1">Network Status</Text>
-            <Text className={`text-xl font-bold ${isOnline ? 'text-emerald-700' : 'text-red-700'}`}>
-              {isOnline ? 'Online / Connected' : 'Offline Mode'}
+          <View style={styles.flex}>
+            <Text style={styles.statusLabel}>{t('syncNetwork')}</Text>
+            <Text style={[styles.statusValue, !isOnline && styles.attentionText]}>
+              {/* Being online says nothing about whether sync EXISTS. */}
+              {!IS_FIREBASE_CONFIGURED ? t('syncNotSetUp') : isOnline ? t('syncOnline') : t('syncOffline')}
             </Text>
           </View>
-        </View>
+        </Card>
 
-        {/* Sync Summary */}
-        <View className="flex-row justify-between mb-6">
-          <View className="bg-white flex-1 p-4 rounded-2xl shadow-sm border border-gray-100 mr-2 items-center">
-            <Text className="text-gray-500 font-medium mb-2 text-center">Pending</Text>
-            <Text className="text-3xl font-bold text-amber-600">{pendingItems.length}</Text>
+        <View style={styles.tiles}>
+          <View style={styles.tile}>
+            <Text style={styles.tileLabel}>{t('syncWaiting')}</Text>
+            <Text style={styles.tileValue}>{pendingItems.length}</Text>
           </View>
-          <View className="bg-white flex-1 p-4 rounded-2xl shadow-sm border border-gray-100 mx-2 items-center">
-            <Text className="text-gray-500 font-medium mb-2 text-center">Failed</Text>
-            <Text className="text-3xl font-bold text-red-600">{failedItems.length}</Text>
-          </View>
-          <View className="bg-white flex-1 p-4 rounded-2xl shadow-sm border border-gray-100 ml-2 items-center justify-center">
-            {isSyncing ? (
-              <ActivityIndicator size="small" color="#2563eb" />
-            ) : (
-              <TouchableOpacity onPress={handleManualSync} disabled={!isOnline || isSyncing} className="items-center w-full">
-                <Text className={`text-3xl ${isOnline ? 'text-blue-600' : 'text-gray-300'}`}>🔄</Text>
-                <Text className={`text-xs font-bold mt-2 ${isOnline ? 'text-blue-600' : 'text-gray-400'}`}>SYNC</Text>
-              </TouchableOpacity>
-            )}
+          <View style={styles.tile}>
+            <Text style={styles.tileLabel}>{t('syncFailed')}</Text>
+            <Text style={[styles.tileValue, failedItems.length > 0 && styles.attentionText]}>{failedItems.length}</Text>
           </View>
         </View>
 
-        {/* Failed Operations Error Log */}
+        {isSyncing ? (
+          <View style={styles.syncing}><ActivityIndicator color={color.accent} /><Text style={styles.statusLabel}>{t('syncSyncing')}</Text></View>
+        ) : (
+          <Button label={t('syncNow')} icon="refresh-cw" onPress={handleManualSync} disabled={!isOnline} fullWidth />
+        )}
+
         {failedItems.length > 0 && (
-          <View className="mb-6">
-            <View className="flex-row items-center justify-between mb-3">
-              <Text className="text-red-700 font-bold text-lg">⚠️ Failed Operations</Text>
-              <View className="flex-row items-center">
-                <TouchableOpacity onPress={handleDismissAllFailed} className="mr-4">
-                  <Text className="text-gray-500 font-bold">Clear All</Text>
-                </TouchableOpacity>
-                <TouchableOpacity onPress={handleManualSync}>
-                  <Text className="text-blue-600 font-bold">Retry All</Text>
-                </TouchableOpacity>
-              </View>
+          <View style={styles.section}>
+            <View style={styles.sectionHead}>
+              <Icon name="alert-triangle" size={iconSize.sm} tint={color.attention} />
+              <Text style={styles.sectionTitle}>{t('syncFailedUploads')}</Text>
+              <TouchableOpacity onPress={handleManualSync} style={styles.linkBtn}><Text style={styles.linkText}>{t('syncRetryAll')}</Text></TouchableOpacity>
+              <TouchableOpacity onPress={handleDismissAllFailed} style={styles.linkBtn}><Text style={styles.linkMuted}>{t('syncStopRetrying')}</Text></TouchableOpacity>
             </View>
-            
             {failedItems.map(item => (
-              <View key={item.id} className="bg-red-50 p-4 rounded-xl border border-red-100 mb-2">
-                <View className="flex-row justify-between items-center mb-1">
-                  <Text className="font-bold text-red-800 uppercase text-xs tracking-wider">
-                    {item.operation} {item.table_name}
-                  </Text>
-                  <Text className="text-xs text-red-600 font-medium">Retry: {item.retry_count}</Text>
+              <View key={item.id} style={[styles.item, styles.itemAttention]}>
+                <View style={styles.itemTop}>
+                  <Text style={styles.itemTitle}>{opLabel(item.operation)} · {tableLabel(item.table_name)}</Text>
+                  <Text style={styles.itemMeta}>Tried {item.retry_count}×</Text>
                 </View>
-                <Text className="text-red-700 text-sm mt-1">{item.error_message}</Text>
-                <Text className="text-red-400 text-xs mt-2">{format(new Date(item.created_at), 'dd MMM, HH:mm')}</Text>
+                {!!item.error_message && <Text style={styles.itemBody}>{item.error_message}</Text>}
+                <Text style={styles.itemMeta}>{when(item.created_at, 'dd MMM, HH:mm')}</Text>
               </View>
             ))}
           </View>
         )}
 
-        {/* Pending Operations Log */}
         {pendingItems.length > 0 && (
-          <View className="mb-6">
-            <View className="flex-row items-center justify-between mb-3">
-              <Text className="text-amber-700 font-bold text-lg">⏳ Pending Operations</Text>
+          <View style={styles.section}>
+            <View style={styles.sectionHead}>
+              <Icon name="clock" size={iconSize.sm} tint={color.textSecondary} />
+              <Text style={styles.sectionTitle}>{t('syncWaitingToUpload')}</Text>
             </View>
-            
             {pendingItems.map(item => (
-              <View key={item.id} className="bg-amber-50 p-4 rounded-xl border border-amber-100 mb-2">
-                <View className="flex-row justify-between items-center mb-1">
-                  <Text className="font-bold text-amber-800 uppercase text-xs tracking-wider">
-                    {item.operation} {item.table_name}
-                  </Text>
-                  <Text className="text-xs text-amber-600 font-medium">{format(new Date(item.created_at), 'HH:mm:ss')}</Text>
+              <View key={item.id} style={styles.item}>
+                <View style={styles.itemTop}>
+                  <Text style={styles.itemTitle}>{opLabel(item.operation)} · {tableLabel(item.table_name)}</Text>
+                  <Text style={styles.itemMeta}>{when(item.created_at, 'HH:mm')}</Text>
                 </View>
-                <Text className="text-amber-700 text-sm mt-1">
-                  Waiting to sync with online database...
-                </Text>
               </View>
             ))}
           </View>
         )}
 
-        {/* Table Metadata */}
-        <View className="mb-10">
-          <Text className="text-gray-800 font-bold text-lg mb-3">Table Status</Text>
-          <View className="bg-white rounded-2xl shadow-sm border border-gray-100 overflow-hidden">
+        <View style={styles.section}>
+          <Text style={styles.sectionTitle}>{t('syncTables')}</Text>
+          <Card tone="outlined" padded={false}>
             {metadata.length === 0 ? (
-              <View className="p-6 items-center">
-                <Text className="text-gray-400">No sync metadata available yet.</Text>
-              </View>
+              <Text style={styles.empty}>{t('syncNoHistory')}</Text>
             ) : (
               metadata.map((meta, index) => (
-                <View 
-                  key={meta.table_name} 
-                  className={`p-4 flex-row justify-between items-center ${index < metadata.length - 1 ? 'border-b border-gray-100' : ''}`}
-                >
-                  <View>
-                    <Text className="font-bold text-gray-800 text-base capitalize">{meta.table_name.replace('_', ' ')}</Text>
-                    <Text className="text-gray-500 text-xs mt-1">
-                      Last Synced: {meta.last_synced_at ? format(new Date(meta.last_synced_at), 'dd MMM, HH:mm') : 'Never'}
-                    </Text>
+                <View key={meta.table_name} style={[styles.metaRow, index > 0 && styles.metaRowBorder]}>
+                  <View style={styles.flex}>
+                    <Text style={styles.itemTitle}>{tableLabel(meta.table_name)}</Text>
+                    <Text style={styles.itemMeta}>Last synced: {meta.last_synced_at ? when(meta.last_synced_at, 'dd MMM, HH:mm') : 'never'}</Text>
                   </View>
                   {meta.pending_count > 0 && (
-                    <View className="bg-amber-100 px-3 py-1 rounded-full">
-                      <Text className="text-amber-800 text-xs font-bold">{meta.pending_count} pending</Text>
-                    </View>
+                    <Text style={styles.pendingPill}>{meta.pending_count} waiting</Text>
                   )}
                 </View>
               ))
             )}
-          </View>
+          </Card>
         </View>
-
       </ScrollView>
-    </View>
+    </SafeAreaView>
   );
 };
+
+const styles = StyleSheet.create({
+  safe: { flex: 1, backgroundColor: color.surface },
+  flex: { flex: 1 },
+  header: {
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
+    paddingHorizontal: space.md, minHeight: 56, borderBottomWidth: hairline, borderBottomColor: color.border,
+  },
+  backBtn: { width: touchTarget, height: touchTarget, alignItems: 'center', justifyContent: 'center' },
+  headerTitle: { ...typeScale.heading, fontSize: 18, color: color.textPrimary, flex: 1, textAlign: 'center' },
+  scroll: { flex: 1 },
+  content: { padding: space.lg, paddingBottom: space.xxxl },
+
+  statusCard: { flexDirection: 'row', alignItems: 'center', gap: space.md, marginBottom: space.md },
+  statusIcon: {
+    width: 48, height: 48, borderRadius: radius.pill, backgroundColor: color.surfaceRaised,
+    alignItems: 'center', justifyContent: 'center',
+  },
+  statusLabel: { ...typeScale.label, color: color.textSecondary },
+  statusValue: { ...typeScale.bodyMedium, color: color.textPrimary, marginTop: 2 },
+  attentionText: { color: color.attention },
+
+  tiles: { flexDirection: 'row', gap: space.md, marginBottom: space.md },
+  tile: {
+    flex: 1, backgroundColor: color.surfaceRaised, borderRadius: radius.md, padding: space.md,
+    borderWidth: hairline, borderColor: color.border, alignItems: 'center', gap: space.xs,
+  },
+  tileLabel: { ...typeScale.label, color: color.textSecondary },
+  tileValue: { ...typeScale.title, fontSize: 28, color: color.textPrimary },
+  syncing: { flexDirection: 'row', gap: space.sm, alignItems: 'center', justifyContent: 'center', minHeight: touchTarget },
+
+  section: { marginTop: space.xl },
+  sectionHead: { flexDirection: 'row', alignItems: 'center', gap: space.sm, marginBottom: space.sm, flexWrap: 'wrap' },
+  sectionTitle: { ...typeScale.heading, color: color.textPrimary, flex: 1 },
+  linkBtn: { minHeight: touchTarget, justifyContent: 'center', paddingHorizontal: space.xs },
+  linkText: { ...typeScale.bodyMedium, color: color.accent },
+  linkMuted: { ...typeScale.bodyMedium, color: color.textSecondary },
+
+  item: {
+    backgroundColor: color.surface, borderRadius: radius.md, padding: space.md, marginBottom: space.sm,
+    borderWidth: hairline, borderColor: color.border, gap: space.xs,
+  },
+  itemAttention: { borderColor: color.borderAttention },
+  itemTop: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', gap: space.md },
+  itemTitle: { ...typeScale.bodyMedium, color: color.textPrimary, flexShrink: 1 },
+  itemBody: { ...typeScale.label, color: color.textSecondary },
+  itemMeta: { ...typeScale.caption, color: color.textMuted },
+
+  metaRow: { flexDirection: 'row', alignItems: 'center', gap: space.md, padding: space.lg },
+  metaRowBorder: { borderTopWidth: hairline, borderTopColor: color.border },
+  pendingPill: {
+    ...typeScale.caption, color: color.attention, borderWidth: hairline, borderColor: color.borderAttention,
+    borderRadius: radius.pill, paddingHorizontal: space.sm, paddingVertical: 2, overflow: 'hidden',
+  },
+  empty: { ...typeScale.body, color: color.textMuted, padding: space.lg },
+});

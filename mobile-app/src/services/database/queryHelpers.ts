@@ -4,8 +4,8 @@
  */
 
 /**
- * Builds a WHERE clause fragment that matches records belonging to a user
- * and all of their direct + indirect staff (up to 2 levels deep).
+ * Builds a WHERE clause fragment that matches records belonging to a user and their
+ * own staff. The tree is two levels (admin -> staff), so there is nothing deeper.
  *
  * Usage:
  *   WHERE ${userScope('userId')} AND isDeleted = 0
@@ -15,14 +15,14 @@
  *            or 'user_id' for snake_case tables (expenses, stock_items, bills, etc.)
  */
 export const userScope = (col: 'userId' | 'user_id' = 'user_id'): string =>
-  `(${col} = ? OR ${col} IN (SELECT id FROM users WHERE parentId = ?) OR ${col} IN (SELECT id FROM users WHERE parentId IN (SELECT id FROM users WHERE parentId = ?)))`;
+  `(${col} = ? OR ${col} IN (SELECT id FROM users WHERE parentId = ?))`;
 
 /**
- * Returns the 3 repeated params required by userScope().
+ * Returns the 2 repeated params required by userScope().
  * Always pass as a spread: [...userScopeParams(userId), ...otherParams]
  */
-export const userScopeParams = (userId: string): [string, string, string] =>
-  [userId, userId, userId];
+export const userScopeParams = (userId: string): [string, string] =>
+  [userId, userId];
 
 /**
  * Generates a unique ID with a given prefix.

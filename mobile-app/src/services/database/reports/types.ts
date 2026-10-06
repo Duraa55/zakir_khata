@@ -3,23 +3,37 @@ export type DateRangeFilter = {
   endDate?: string;
 };
 
-// Common utility to generate SQL where clause for dates and user hierarchy
+/**
+ * A bill that counts as a SALE: posted, not a draft and not on hold — the same rule
+ * as the Bill Book's headline. Reports used to add drafts and holds to sales.
+ * `alias` qualifies the columns when the query joins other tables ("b" → b.is_draft).
+ */
+export const postedBill = (alias = ''): string => {
+  const a = alias ? alias + '.' : '';
+  return ` AND COALESCE(${a}is_draft, 0) = 0 AND COALESCE(${a}is_hold, 0) = 0`;
+};
+
+// Common utility to generate SQL where clause for dates and user hierarchy.
+// `alias` qualifies user_id / is_deleted for a joined query — without it a join with
+// bill_items or stock_items (which have the same columns) failed as "ambiguous".
 export const buildReportQuery = (
   userId: string,
   dateColumn: string,
-  filters: DateRangeFilter
+  filters: DateRangeFilter,
+  alias = ''
 ): { whereClause: string; params: any[] } => {
+  const a = alias ? alias + '.' : '';
   let whereClause = `
-    (user_id = ? OR user_id IN (SELECT id FROM users WHERE parentId = ?) OR user_id IN (SELECT id FROM users WHERE parentId IN (SELECT id FROM users WHERE parentId = ?))) 
-    AND is_deleted = 0
+    ${a}user_id = ?
+    AND ${a}is_deleted = 0
   `;
-  const params: any[] = [userId, userId, userId];
+  const params: any[] = [userId];
 
   if (filters.startDate) {
     whereClause += ` AND date(${dateColumn}) >= date(?)`;
     params.push(filters.startDate);
   }
-  
+
   if (filters.endDate) {
     whereClause += ` AND date(${dateColumn}) <= date(?)`;
     params.push(filters.endDate);
@@ -34,10 +48,10 @@ export const buildTransactionReportQuery = (
   filters: DateRangeFilter
 ): { whereClause: string; params: any[] } => {
   let whereClause = `
-    (userId = ? OR userId IN (SELECT id FROM users WHERE parentId = ?) OR userId IN (SELECT id FROM users WHERE parentId IN (SELECT id FROM users WHERE parentId = ?))) 
+    userId = ? 
     AND isDeleted = 0
   `;
-  const params: any[] = [userId, userId, userId];
+  const params: any[] = [userId];
 
   if (filters.startDate) {
     whereClause += ` AND date(${dateColumn}) >= date(?)`;

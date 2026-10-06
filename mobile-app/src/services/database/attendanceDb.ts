@@ -20,7 +20,8 @@ export const clockIn = async (
 ): Promise<string> => {
   const id = `att_${Date.now()}_${Math.random().toString(36).substring(2, 11)}`;
   const now = new Date().toISOString();
-  const date = now.split('T')[0];
+  // The LOCAL day (PKT), not the UTC one — before 5 AM the UTC date is still yesterday.
+  const date = todayDate();
 
   const data = {
     id, staff_id: staffId, date, clock_in: now, clock_out: null, status, is_deleted: 0

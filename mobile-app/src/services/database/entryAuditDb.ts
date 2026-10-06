@@ -14,6 +14,19 @@ type RecordRow = Record<string, string | number | null>;
 type BookConfig = {
   owner: string; deleted: string; deletedAt: string; fields: Record<string, ValueKind>;
   timestamps: string[]; syncState: RecordRow; deletionAliases?: Record<string, 'flag' | 'date'>;
+  /**
+   * Columns written WITH an audited edit but never audited themselves, because they are
+   * derived from the edit rather than chosen by the person making it — the same standing
+   * as `timestamps` and `syncState` below.
+   *
+   * This exists so a derived column does not have to be added to `fields` to be kept in
+   * step. A column in `fields` is a column any caller may set and every change to it
+   * appears in the entry's visible history; an opaque id belongs in neither.
+   *
+   * `row` is the record as it will be AFTER the edit. Runs inside the same transaction,
+   * on the same connection, before the row is written and enqueued.
+   */
+  derive?: (db: SQLiteDatabase, row: RecordRow, changed: Set<string>) => Promise<RecordRow>;
 };
 // Enroll other books only when their data-layer rollout is ready.
 const books: Record<string, BookConfig> = {
@@ -22,6 +35,18 @@ const books: Record<string, BookConfig> = {
     timestamps: ['updatedAt', 'updated_at'], syncState: { synced: 0, syncStatus: 'pending' },
     deletionAliases: { is_deleted: 'flag', deleted_at: 'date' },
     fields: { partyName: 'text', amount_paisa: 'money_paisa', type: 'text', notes: 'text', date: 'date' },
+    // Renaming the party re-links the entry, by the SAME rule createTransaction and
+    // createBill use. An entry edited ONTO a real customer used to stay name-keyed and
+    // never appear in their ledger; one edited AWAY from them kept claiming to be
+    // theirs. Dynamically imported because customerDb reaches this module through
+    // syncHelpers' isAuditedBook — a static import here is a cycle (same reason
+    // currentActor imports the auth store this way).
+    derive: async (db, row, changed): Promise<RecordRow> => {
+      if (!changed.has('partyName')) return {};
+      const { matchCustomerByName } = await import('./customerDb');
+      const { id } = await matchCustomerByName(String(row.userId), String(row.partyName ?? ''), db);
+      return { customer_id: id };
+    },
   },
 };
 export const isAuditedBook = (table: string): boolean => Object.prototype.hasOwnProperty.call(books, table);
@@ -46,25 +71,28 @@ async function mayAccess(db: SQLiteDatabase, actor: Person, ownerId: string): Pr
   // Removed owners must remain in this chain, so their historical entries stay visible.
   const owner = await db.getFirstAsync<Person>('SELECT id, role, parentId FROM users WHERE id = ?', [ownerId]);
   if (!owner || owner.role !== 'staff') return false;
-  if (actor.role === 'admin') {
-    if (owner.parentId === actor.id) return true;
-    const parent = owner.parentId && await db.getFirstAsync<Person>('SELECT id, role, parentId FROM users WHERE id = ?', [owner.parentId]);
-    return !!parent && parent.role === 'staff' && parent.parentId === actor.id;
-  }
-  if (actor.role !== 'staff' || owner.parentId !== actor.id) return false;
-  // Sub-staff share the staff role in this schema, but can only act on their own work.
-  const parent = actor.parentId && await db.getFirstAsync<Person>('SELECT id, role FROM users WHERE id = ?', [actor.parentId]);
-  return !actor.parentId || (!!parent && parent.role === 'admin');
+  // Two levels: an admin sees their own staff's history, and nobody sees sideways or
+  // upward. A staff member has nobody below them, so they see only their own work.
+  return actor.role === 'admin' && owner.parentId === actor.id;
 }
 
-async function ownedRecord(db: SQLiteDatabase, table: string, id: string, actor: Person): Promise<RecordRow> {
+/**
+ * `write`: every account is its own business — only the AUTHOR may change or delete an
+ * entry. Parents (admin → staff → sub-staff) keep READ access to its history for
+ * monitoring, via mayAccess, but can never edit it.
+ */
+async function ownedRecord(db: SQLiteDatabase, table: string, id: string, actor: Person, write = false): Promise<RecordRow> {
   const config = configFor(table);
   // Includes deleted records for ActivityLog history; no normal visibility query changes.
   const record = await db.getFirstAsync<RecordRow>(`SELECT * FROM ${table} WHERE id = ?`, [id]);
-  if (!record || !(await mayAccess(db, actor, String(record[config.owner])))) {
-    throw new Error('You do not have permission to access or change this entry.');
+  const ownerId = record ? String(record[config.owner]) : '';
+  const allowed = !!record && (write ? actor.id === ownerId : await mayAccess(db, actor, ownerId));
+  if (!allowed) {
+    throw new Error(write && record && await mayAccess(db, actor, ownerId)
+      ? 'You do not have permission to change this entry. Only the person who created it can change it.'
+      : 'You do not have permission to access or change this entry.');
   }
-  return record;
+  return record as RecordRow;
 }
 
 function validateField(table: string, field: string, value: unknown, kind: ValueKind): void {
@@ -85,7 +113,7 @@ export async function mutateAuditedEntry(table: string, id: string, action: 'edi
   let queued = false;
   await withWriteTransaction(async db => {
     const actor = await currentActor(db);
-    const record = await ownedRecord(db, table, id, actor);
+    const record = await ownedRecord(db, table, id, actor, true);
     if (record[config.deleted] || record.is_deleted) throw new Error('This entry has been deleted. Its history is still available in Activity Log.');
     if (!updates || typeof updates !== 'object' || Array.isArray(updates)) throw new Error('Invalid entry changes.');
     const now = new Date().toISOString();
@@ -120,6 +148,11 @@ export async function mutateAuditedEntry(table: string, id: string, action: 'edi
       for (const [field, kind] of Object.entries(config.deletionAliases || {})) payload[field] = kind === 'flag' ? 1 : now;
     }
     for (const field of config.timestamps) payload[field] = now;
+    // Derived columns last among the record's own fields, so they see the edited values
+    // and cannot be overwritten by them. Never audited: see BookConfig.derive.
+    if (config.derive && action !== 'deleted') {
+      Object.assign(payload, await config.derive(db, { ...record, ...payload }, new Set(changes.map(c => c.field))));
+    }
     Object.assign(payload, config.syncState);
     payload.firestore_path = `users/${ownerId}/${table}/${id}`;
     await db.runAsync(`UPDATE ${table} SET ${Object.keys(payload).map(k => k + ' = ?').join(',')} WHERE id = ?`, [...Object.values(payload), id]);

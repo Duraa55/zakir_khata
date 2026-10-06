@@ -1,8 +1,12 @@
 import React, { useState } from 'react';
-import { View, Text, TouchableOpacity, Modal, ActivityIndicator, Alert, Linking, Platform } from 'react-native';
+import { useLanguageStore } from '../../store/useLanguageStore';
+import { View, Text, TouchableOpacity, Modal, ActivityIndicator, Alert, Linking, Platform, StyleSheet } from 'react-native';
 import { useAuthStore } from '../../store/authStore';
 import { addReminder } from '../../services/database/reminderDb';
 import { formatCurrency } from '../../utils/calculations';
+import { internationalPhone } from '../../utils/phone';
+import { Button } from '../../components/ui/primitives';
+import { color, space, radius, hairline, touchTarget, type as typeScale } from '../../theme/tokens';
 
 interface Props {
   visible: boolean;
@@ -14,7 +18,9 @@ interface Props {
 
 export const ReminderModal: React.FC<Props> = ({ visible, onClose, partyName, netBalance, phone }) => {
   const { user } = useAuthStore();
+  const { t } = useLanguageStore();
   const [submitting, setSubmitting] = useState(false);
+  const intl = internationalPhone(phone);
 
   const handleSetReminder = async (days: number) => {
     if (!user?.id) return;
@@ -26,14 +32,14 @@ export const ReminderModal: React.FC<Props> = ({ visible, onClose, partyName, ne
 
       await addReminder({
         user_id: user.id,
-        title: `Payment Due: ${partyName}`,
+        title: `Payment due: ${partyName}`,
         description: `Collect ${formatCurrency(Math.abs(netBalance))} from ${partyName}.`,
         type: 'payment',
         due_date: isoDate
       });
-      Alert.alert('Success', `Reminder set for ${date.toLocaleDateString()}`);
+      Alert.alert(t('remSetTitleDone'), t('remSetBody', { date: date.toLocaleDateString('en-PK') }));
     } catch (e) {
-      Alert.alert('Error', 'Failed to set reminder');
+      Alert.alert(t('commonError'), t('remFailed'));
     } finally {
       setSubmitting(false);
     }
@@ -45,104 +51,68 @@ export const ReminderModal: React.FC<Props> = ({ visible, onClose, partyName, ne
   };
 
   const handleWhatsApp = async () => {
-    if (!phone) {
-      Alert.alert('No Phone', 'No phone number saved for this customer.');
+    if (!intl) {
+      Alert.alert(t('remNoPhoneTitle'), t('remNoPhoneBody'));
       return;
     }
     const text = encodeURIComponent(getMessageText());
-    const url = `whatsapp://send?phone=${phone}&text=${text}`;
-    
+    const url = `whatsapp://send?phone=${intl}&text=${text}`;
     try {
       const supported = await Linking.canOpenURL(url);
-      if (supported) {
-        await Linking.openURL(url);
-      } else {
-        Alert.alert('Error', 'WhatsApp is not installed on your device.');
-      }
+      if (supported) await Linking.openURL(url);
+      else Alert.alert(t('remNoWhatsAppTitle'), t('remNoWhatsAppBody'));
     } catch (err) {
-      console.error('Error opening WhatsApp', err);
+      if (__DEV__) console.error('Error opening WhatsApp', err);
     }
   };
 
   const handleSMS = async () => {
-    if (!phone) {
-      Alert.alert('No Phone', 'No phone number saved for this customer.');
+    if (!intl) {
+      Alert.alert(t('remNoPhoneTitle'), t('remNoPhoneBody'));
       return;
     }
     const text = encodeURIComponent(getMessageText());
     const separator = Platform.OS === 'ios' ? '&' : '?';
-    const url = `sms:${phone}${separator}body=${text}`;
-    
+    const url = `sms:+${intl}${separator}body=${text}`;
     try {
       await Linking.openURL(url);
     } catch (err) {
-      console.error('Error opening SMS', err);
+      if (__DEV__) console.error('Error opening SMS', err);
     }
   };
 
+  const DayBtn = ({ days, label, wide }: { days: number; label: string; wide?: boolean }) => (
+    <TouchableOpacity style={[styles.dayBtn, wide && styles.dayBtnWide]} onPress={() => handleSetReminder(days)} disabled={submitting} accessibilityRole="button">
+      <Text style={styles.dayBtnText}>{label}</Text>
+    </TouchableOpacity>
+  );
+
   return (
-    <Modal visible={visible} transparent animationType="fade">
-      <View className="flex-1 justify-center items-center bg-black/60 p-4">
-        <View className="bg-white rounded-3xl p-6 w-full max-w-sm shadow-xl">
-          <Text className="text-2xl font-bold text-gray-800 mb-2">Set Reminder</Text>
-          <Text className="text-gray-500 mb-6">When do you want to be reminded to collect {formatCurrency(Math.abs(netBalance))}?</Text>
+    <Modal visible={visible} transparent animationType="fade" onRequestClose={onClose}>
+      <View style={styles.overlay}>
+        <View style={styles.card}>
+          <Text style={styles.title}>{t('remSetTitle')}</Text>
+          <Text style={styles.sub}>When do you want to be reminded to collect {formatCurrency(Math.abs(netBalance))}?</Text>
 
-          <View className="flex-row flex-wrap gap-2 mb-6">
-            <TouchableOpacity 
-              className="bg-blue-50 px-4 py-3 rounded-xl flex-1 items-center border border-blue-100"
-              onPress={() => handleSetReminder(1)}
-              disabled={submitting}
-            >
-              <Text className="text-blue-600 font-bold">Tomorrow</Text>
-            </TouchableOpacity>
-            
-            <TouchableOpacity 
-              className="bg-blue-50 px-4 py-3 rounded-xl flex-1 items-center border border-blue-100"
-              onPress={() => handleSetReminder(3)}
-              disabled={submitting}
-            >
-              <Text className="text-blue-600 font-bold">In 3 Days</Text>
-            </TouchableOpacity>
-
-            <TouchableOpacity 
-              className="bg-blue-50 px-4 py-3 rounded-xl w-full items-center border border-blue-100"
-              onPress={() => handleSetReminder(7)}
-              disabled={submitting}
-            >
-              <Text className="text-blue-600 font-bold">Next Week</Text>
-            </TouchableOpacity>
+          <View style={styles.dayRow}>
+            <DayBtn days={1} label={t('remTomorrow')} />
+            <DayBtn days={3} label={t('remIn3Days')} />
+            <DayBtn days={7} label={t('remNextWeek')} wide />
           </View>
 
-          <View className="h-px bg-gray-100 mb-6" />
-          
-          <Text className="text-sm font-bold text-gray-800 mb-3">Quick Actions</Text>
-          
-          <View className="flex-row gap-3 mb-6">
-            <TouchableOpacity 
-              className="flex-1 bg-green-500 p-3 rounded-xl items-center flex-row justify-center"
-              onPress={handleWhatsApp}
-            >
-              <Text className="text-white font-bold">WhatsApp</Text>
-            </TouchableOpacity>
-            
-            <TouchableOpacity 
-              className="flex-1 bg-blue-500 p-3 rounded-xl items-center flex-row justify-center"
-              onPress={handleSMS}
-            >
-              <Text className="text-white font-bold">Send SMS</Text>
-            </TouchableOpacity>
+          <View style={styles.divider} />
+
+          <Text style={styles.sectionLabel}>{t('remSendMessage')}</Text>
+          <View style={styles.quickRow}>
+            <Button label={t('supWhatsApp')} icon="message-circle" variant="secondary" onPress={handleWhatsApp} style={styles.quickBtn} />
+            <Button label={t('remSms')} icon="message-square" variant="secondary" onPress={handleSMS} style={styles.quickBtn} />
           </View>
 
-          <TouchableOpacity 
-            className="w-full p-4 rounded-xl items-center bg-gray-100"
-            onPress={onClose}
-          >
-            <Text className="font-bold text-gray-600 text-lg">Close</Text>
-          </TouchableOpacity>
-          
+          <Button label={t('commonClose')} variant="quiet" onPress={onClose} fullWidth />
+
           {submitting && (
-            <View className="absolute inset-0 bg-white/50 justify-center items-center rounded-3xl">
-              <ActivityIndicator size="large" color="#3B82F6" />
+            <View style={styles.busy}>
+              <ActivityIndicator size="large" color={color.accent} />
             </View>
           )}
         </View>
@@ -150,3 +120,28 @@ export const ReminderModal: React.FC<Props> = ({ visible, onClose, partyName, ne
     </Modal>
   );
 };
+
+const styles = StyleSheet.create({
+  overlay: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: color.scrim, padding: space.lg },
+  card: {
+    width: '100%', maxWidth: 400, backgroundColor: color.surface, borderRadius: radius.lg,
+    padding: space.xl, borderWidth: hairline, borderColor: color.border,
+  },
+  title: { ...typeScale.title, color: color.textPrimary, marginBottom: space.xs },
+  sub: { ...typeScale.body, color: color.textSecondary, marginBottom: space.lg },
+  dayRow: { flexDirection: 'row', flexWrap: 'wrap', gap: space.sm, marginBottom: space.lg },
+  dayBtn: {
+    flex: 1, minHeight: touchTarget, borderRadius: radius.md, borderWidth: hairline, borderColor: color.borderStrong,
+    backgroundColor: color.surface, alignItems: 'center', justifyContent: 'center', paddingHorizontal: space.sm,
+  },
+  dayBtnWide: { flexBasis: '100%' },
+  dayBtnText: { ...typeScale.bodyMedium, color: color.accent },
+  divider: { height: hairline, backgroundColor: color.border, marginBottom: space.lg },
+  sectionLabel: { ...typeScale.label, color: color.textSecondary, marginBottom: space.sm },
+  quickRow: { flexDirection: 'row', gap: space.md, marginBottom: space.lg },
+  quickBtn: { flex: 1 },
+  busy: {
+    ...StyleSheet.absoluteFillObject, backgroundColor: color.scrim, borderRadius: radius.lg,
+    justifyContent: 'center', alignItems: 'center',
+  },
+});

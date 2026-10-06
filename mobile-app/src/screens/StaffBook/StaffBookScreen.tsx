@@ -1,4 +1,5 @@
 import React, { useEffect, useRef } from 'react';
+import { useLanguageStore } from '../../store/useLanguageStore';
 import {
   View, Text, TouchableOpacity, StyleSheet, FlatList, ScrollView,
   Animated, ActivityIndicator, Dimensions, Keyboard, Platform
@@ -6,28 +7,21 @@ import {
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useAuthStore } from '../../store/authStore';
 import { useStaffStore } from '../../store/useStaffStore';
-import { useSettingsStore } from '../../store/useSettingsStore';
 import { StaffRecord } from '../../types/staff.types';
 import { getDisplayName } from '../../utils/displayName';
-import { themeColors } from '../../theme/theme';
 import { TopHeaderWithBooks } from '../../components/TopHeaderWithBooks';
-
-const ORANGE = '#FF6B35';
-const GREEN = '#4CAF50';
-const GRAY = '#9CA3AF';
+import { SummaryBar, SummaryFigure } from '../../components/ui/primitives';
+import { CustomerAvatar } from '../../components/ui/CustomerAvatar';
+import { staffPhotoUri } from '../../services/database/staffDb';
+import { canCreateStaff } from '../../services/database/managedAccountDb';
+import { color, space, radius, hairline, touchTarget, iconSize, type as typeScale, chrome } from '../../theme/tokens';
+import { Icon } from '../../components/ui/primitives';
 
 // Defined outside component to avoid recreation on every render
-const StaffItem = React.memo(({ item, onPress, onSalaryPress, nameDisplayMode }: {
+const StaffItem = React.memo(({ item, onPress }: {
   item: StaffRecord;
   onPress: () => void;
-  onSalaryPress: () => void;
-  nameDisplayMode: 'en' | 'ur' | 'both';
 }) => {
-  const [localMode, setLocalMode] = React.useState(nameDisplayMode);
-
-  React.useEffect(() => {
-    setLocalMode(nameDisplayMode);
-  }, [nameDisplayMode]);
 
   return (
     <TouchableOpacity
@@ -35,18 +29,14 @@ const StaffItem = React.memo(({ item, onPress, onSalaryPress, nameDisplayMode }:
       onPress={onPress}
     >
       <View style={styles.itemHeader}>
-        <View style={styles.avatarBox}>
-          <Text style={{ fontSize: 20 }}>👤</Text>
-        </View>
+        {/* remote → local copy → initial, the same chain as customer photos */}
+        <CustomerAvatar name={item.name_en} uri={staffPhotoUri(item)} style={styles.avatarBox} textStyle={styles.avatarInitial} />
         <View style={styles.itemInfo}>
-          <TouchableOpacity onPress={() => setLocalMode(prev => prev === 'en' ? 'ur' : 'en')}>
-            <Text style={styles.staffName}>{getDisplayName(item, localMode)}</Text>
-          </TouchableOpacity>
-          <Text style={styles.staffRole}>{item.role} | Joined: {new Date(item.joining_date).toLocaleDateString()}</Text>
+          <Text style={styles.staffName}>{getDisplayName(item)}</Text>
+          <Text style={styles.staffRole}>{item.role} · Joined {new Date(item.joining_date).toLocaleDateString()}</Text>
         </View>
-        <TouchableOpacity style={{ backgroundColor: themeColors.primary, paddingHorizontal: 10, paddingVertical: 6, borderRadius: 8 }} onPress={onSalaryPress}>
-          <Text style={{ color: '#fff', fontSize: 12, fontWeight: '700' }}>💵 Salary</Text>
-        </TouchableOpacity>
+        {/* Salary lives inside staff details ("Salary & cash ledger"); the row opens those. */}
+        <Icon name="chevron-right" size={iconSize.sm} tint={color.textMuted} />
       </View>
     </TouchableOpacity>
   );
@@ -54,13 +44,18 @@ const StaffItem = React.memo(({ item, onPress, onSalaryPress, nameDisplayMode }:
 
 export const StaffBookScreen = ({ navigation }: any) => {
   const insets = useSafeAreaInsets();
+  const { t } = useLanguageStore();
   const user = useAuthStore(state => state.user);
   const staff = useStaffStore(state => state.staff);
   const loading = useStaffStore(state => state.loading);
   const stats = useStaffStore(state => state.stats);
   const fetchStaff = useStaffStore(state => state.fetchStaff);
   const loadStats = useStaffStore(state => state.loadStats);
-  const nameDisplayMode = useSettingsStore(state => state.nameDisplayMode);
+  // Two levels: an admin adds a staff member WITH a login; a staff member adds a sub-staff
+  // RECORD with no login. The data layer enforces who may do which; the button is only
+  // hidden so it never leads to a refusal.
+  const [canAdd, setCanAdd] = React.useState(false);
+  useEffect(() => { canCreateStaff().then(setCanAdd); }, [user?.id]);
 
   const pulseAnim = useRef(new Animated.Value(0)).current;
 
@@ -112,50 +107,46 @@ export const StaffBookScreen = ({ navigation }: any) => {
     return (
       <StaffItem 
         item={item} 
-        onPress={() => navigation.navigate('StaffDetail', { staff: item })} 
-        onSalaryPress={() => navigation.navigate('StaffSalaryDetail', { staff: item })} 
-        nameDisplayMode={nameDisplayMode} 
+        onPress={() => navigation.navigate('StaffDetailBook', { staff: item })} 
       />
     );
-  }, [navigation, nameDisplayMode]);
+  }, [navigation]);
 
   return (
-    <View style={[styles.container, { paddingBottom: insets.bottom }]}>
+    <View style={styles.container}>
       
       {/* Top Header with Profile & Books Bar */}
       <TopHeaderWithBooks navigation={navigation} activeBook="StaffBook" />
 
       {/* Sub Header */}
-      <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingHorizontal: 16, paddingTop: 10 }}>
-        <Text style={{ fontSize: 18, fontWeight: '800', color: '#fff' }}>Staff Book</Text>
+      <View style={styles.subHeader}>
         <TouchableOpacity 
-          style={{ padding: 6 }} 
+          style={styles.pdfBtn} 
           onPress={() => navigation.navigate('DownloadOptionsModal', { reportType: 'staff' })}
         >
-          <Text style={{ fontSize: 14, fontWeight: '800', color: '#1dd1a1' }}>⬇ PDF Report</Text>
+          <Text style={styles.pdfBtnText}>{t('staffPdfReport')}</Text>
         </TouchableOpacity>
       </View>
 
-      {/* Summary Card */}
-      <View style={styles.summaryCard}>
-        <View>
-          <Text style={styles.summaryTitle}>Total Staff: {stats.total}</Text>
-          <Text style={styles.summarySub}>Active: {stats.active} | Inactive: {stats.inactive}</Text>
-        </View>
-      </View>
+      {/* Summary — same brand surface as the dashboard and the other books */}
+      <SummaryBar>
+        <SummaryFigure label={`Active ${stats.active} · Inactive ${stats.inactive}`}>
+          <Text style={styles.summaryTitle}>{t('staffTotal')}: {stats.total}</Text>
+        </SummaryFigure>
+      </SummaryBar>
 
       {/* Content */}
       {loading ? (
         <View style={styles.center}>
-          <ActivityIndicator size="large" color={ORANGE} />
+          <ActivityIndicator size="large" color={color.accent} />
         </View>
       ) : staff.length === 0 ? (
-        <ScrollView contentContainerStyle={{ flexGrow: 1, paddingBottom: 140, justifyContent: 'center', alignItems: 'center', paddingHorizontal: 20 }}>
+        <ScrollView contentContainerStyle={{ flexGrow: 1, paddingBottom: chrome.listBottom, justifyContent: 'center', alignItems: 'center', paddingHorizontal: space.xl }}>
           <View style={styles.emptyState}>
-            <View style={{ alignItems: 'center' }}>
-              <Text style={styles.instructionText}>1- Add staff details</Text>
-              <Text style={styles.instructionText}>2- Maintain staff directory</Text>
-              <Text style={styles.instructionText}>3- Manage team profiles</Text>
+            <View style={{ alignItems: 'center', gap: space.sm }}>
+              <Text style={styles.instructionText}>{t('staffStep1')}</Text>
+              <Text style={styles.instructionText}>{t('staffStep2')}</Text>
+              <Text style={styles.instructionText}>{t('staffStep3')}</Text>
             </View>
           </View>
         </ScrollView>
@@ -164,15 +155,15 @@ export const StaffBookScreen = ({ navigation }: any) => {
           data={staff}
           keyExtractor={item => item.id}
           renderItem={renderItem}
-          contentContainerStyle={{ padding: 12, paddingBottom: 140 }}
+          contentContainerStyle={{ padding: space.lg, paddingBottom: chrome.listBottom }}
         />
       )}
 
       {/* Add Button */}
-      {!isKeyboardVisible && (
-        <View style={[styles.addBtnContainer, { bottom: 85 + Math.max(insets.bottom, 8) }]}>
-          <TouchableOpacity style={styles.addBtn} onPress={() => navigation.navigate('AddStaffModal')}>
-            <Text style={styles.addBtnText}>👥+ ADD STAFF</Text>
+      {!isKeyboardVisible && canAdd && (
+        <View style={[styles.addBtnContainer, { bottom: 0 }]}>
+          <TouchableOpacity style={styles.addBtn} onPress={() => navigation.navigate('AddStaffModal')} activeOpacity={0.85} accessibilityRole="button">
+            <Text style={styles.addBtnText} numberOfLines={1}>{t(user?.role === 'admin' ? 'staffAdd' : 'staffAddSub')}</Text>
           </TouchableOpacity>
         </View>
       )}
@@ -181,67 +172,41 @@ export const StaffBookScreen = ({ navigation }: any) => {
 };
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: themeColors.background },
+  container: { flex: 1, backgroundColor: color.surface },
 
-  header: {
-    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
-    backgroundColor: themeColors.cardBg, paddingHorizontal: 16, height: 56,
-    borderBottomWidth: 1, borderBottomColor: themeColors.border,
+  subHeader: {
+    flexDirection: 'row', justifyContent: 'flex-end', alignItems: 'center',
+    paddingHorizontal: space.lg, paddingTop: chrome.barPadY,
   },
-  backBtn: { width: 36, justifyContent: 'center' },
-  backArrow: { fontSize: 28, color: '#fff', fontWeight: '300' },
-  headerTitle: { fontSize: 18, fontWeight: '700', color: '#fff' },
+  pdfBtn: { minHeight: touchTarget, justifyContent: 'center', paddingLeft: space.md },
+  pdfBtnText: { ...typeScale.bodyMedium, fontSize: 14, color: color.accent },
 
-  summaryCard: {
-    flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center',
-    backgroundColor: themeColors.cardBg, marginHorizontal: 12, marginTop: 12,
-    borderRadius: 14, padding: 16,
-    borderWidth: 1, borderColor: themeColors.border,
-    shadowColor: '#000', shadowOffset: { width: 0, height: 3 }, shadowOpacity: 0.25, elevation: 3,
-    marginBottom: 12
-  },
-  summaryTitle: { fontSize: 15, fontWeight: '700', color: '#fff' },
-  summarySub: { fontSize: 12, color: themeColors.textSecondary, marginTop: 2 },
-  rateListLink: { fontSize: 13, color: '#1dd1a1', textDecorationLine: 'none', fontWeight: '700' },
-  rateListArrow: { fontSize: 14, color: '#1dd1a1', fontWeight: '700' },
+  summaryTitle: { ...typeScale.title, color: color.onBrand },
 
   itemRow: {
-    backgroundColor: themeColors.cardBg, borderRadius: 14, padding: 14, marginBottom: 10,
-    borderWidth: 1, borderColor: themeColors.border,
-    shadowColor: '#000', shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.2, elevation: 2
+    backgroundColor: color.surface, borderRadius: radius.md,
+    paddingVertical: chrome.rowPadY, paddingHorizontal: space.lg, marginBottom: chrome.rowGap,
+    borderWidth: hairline, borderColor: color.border, minHeight: touchTarget,
   },
-  itemHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
-  avatarBox: { width: 40, height: 40, borderRadius: 20, backgroundColor: themeColors.inputBg, justifyContent: 'center', alignItems: 'center', marginRight: 12, borderWidth: 1, borderColor: themeColors.borderLight },
+  itemHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', gap: space.md },
+  avatarBox: {
+    width: 40, height: 40, borderRadius: radius.pill, backgroundColor: color.surfaceRaised,
+    justifyContent: 'center', alignItems: 'center', borderWidth: hairline, borderColor: color.border,
+  },
+  avatarInitial: { ...typeScale.bodyMedium, color: color.textSecondary },
+  // flex: 1 so a long (or Urdu) name wraps before it pushes the chevron off.
   itemInfo: { flex: 1 },
-  staffName: { fontSize: 15, fontWeight: '700', color: '#fff' },
-  staffRole: { fontSize: 12, color: themeColors.textSecondary, marginTop: 4 },
-  statusWrap: { alignItems: 'flex-end' },
+  staffName: { ...typeScale.bodyMedium, color: color.textPrimary },
+  staffRole: { ...typeScale.caption, color: color.textSecondary, marginTop: space.xs },
 
   center: { flex: 1, justifyContent: 'center', alignItems: 'center' },
   emptyState: { flex: 1, justifyContent: 'center', alignItems: 'center' },
-  emptyIcons: { position: 'relative', width: 140, height: 140, alignItems: 'center', justifyContent: 'center' },
-  shieldWrap: { position: 'absolute', top: -10, left: -10, backgroundColor: themeColors.cardBg, borderRadius: 40 },
-  instructionText: { fontSize: 14, color: themeColors.textSecondary, marginBottom: 8 },
-  arrowWrap: { marginTop: 24 },
-  arrowIcon: { fontSize: 36, color: '#1dd1a1', fontWeight: '800' },
+  instructionText: { ...typeScale.label, color: color.textSecondary },
 
-  addBtnContainer: {
-    position: 'absolute', bottom: 75, left: 0, right: 0, alignItems: 'center'
-  },
+  addBtnContainer: { position: 'absolute', right: space.lg },
   addBtn: {
-    backgroundColor: themeColors.primary, width: '80%', height: 50, borderRadius: 25,
+    backgroundColor: color.accent, minHeight: chrome.fab, paddingHorizontal: space.lg, borderRadius: radius.pill,
     justifyContent: 'center', alignItems: 'center',
-    shadowColor: '#1dd1a1', shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.5, shadowRadius: 8, elevation: 6
   },
-  addBtnText: { color: '#fff', fontSize: 15, fontWeight: '800', letterSpacing: 0.5 },
-
-  tabBar: {
-    backgroundColor: themeColors.cardBg, borderTopWidth: 1, borderTopColor: themeColors.border, height: 60, flexDirection: 'row'
-  },
-  tabItem: { width: Dimensions.get('window').width / 5, alignItems: 'center', justifyContent: 'center', paddingVertical: 6 },
-  tabItemActive: {},
-  tabIcon: { fontSize: 18, marginBottom: 2 },
-  tabLabel: { fontSize: 11, fontWeight: '600', color: themeColors.textSecondary },
-  tabLabelActive: { color: '#1dd1a1' },
-  tabIndicator: { position: 'absolute', bottom: 2, width: 24, height: 3, backgroundColor: '#1dd1a1', borderRadius: 2 },
+  addBtnText: { ...typeScale.bodyMedium, color: color.textInverse },
 });

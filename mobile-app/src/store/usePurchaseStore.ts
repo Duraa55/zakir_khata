@@ -14,15 +14,18 @@ import {
   getPurchaseInvoicesBySupplier, createPurchaseReturn,
   getPurchaseSummary
 } from '../services/database/purchaseDb';
+import { entryOwner } from '../services/database/entryScope';
+import type { CurrencyCode } from '../utils/currency';
 
 export type PurchaseListState = {
   rows: any[];
-  summary: { count: number; total: number; settled: number };
+  /** COUNT only — the money totals live in dayTotals and the summary tiles. */
+  summary: { count: number };
   dayTotals: Record<string, PurchaseDayTotal>;
   cursor: PageCursor | null;
   loadingMore: boolean;
 };
-const EMPTY_LIST: PurchaseListState = { rows: [], summary: { count: 0, total: 0, settled: 0 }, dayTotals: {}, cursor: null, loadingMore: false };
+const EMPTY_LIST: PurchaseListState = { rows: [], summary: { count: 0 }, dayTotals: {}, cursor: null, loadingMore: false };
 
 interface PurchaseState {
   orders: PurchaseOrder[];
@@ -33,7 +36,10 @@ interface PurchaseState {
   orderList: PurchaseListState;
   invoiceList: PurchaseListState;
   setFilter: (userId: string, filter: PurchaseFilter) => Promise<void>;
-  loadLists: (userId: string) => Promise<void>;
+  /** `viewingId`: the Staff Book drill-down (read-only). Omitted = the viewer's own purchases. */
+  loadLists: (userId: string, viewingId?: string) => Promise<void>;
+  /** Whose purchases are loaded (undefined = own). Set by every loadLists call. */
+  viewingId?: string;
   loadMore: (userId: string, tab: 'orders' | 'invoices') => Promise<void>;
   selectedOrder: PurchaseOrder | null;
   selectedInvoice: PurchaseInvoice | null;
@@ -45,13 +51,13 @@ interface PurchaseState {
   loadInvoices: (userId: string, status?: InvoiceStatus) => Promise<void>;
   loadOrderById: (id: string) => Promise<void>;
   loadInvoiceById: (id: string) => Promise<void>;
-  loadSummary: (userId: string) => Promise<void>;
+  loadSummary: (userId: string, viewingId?: string) => Promise<void>;
   loadInvoicesBySupplier: (supplierId: string) => Promise<void>;
 
   createOrder: (
     userId: string, supplierId: string,
     items: Omit<PurchaseOrderItem, 'id' | 'po_id' | 'received_qty' | 'is_deleted'>[],
-    orderDate: string, expectedDate?: string, notes?: string
+    orderDate: string, expectedDate?: string, notes?: string, currency?: CurrencyCode
   ) => Promise<PurchaseOrder>;
 
   updateOrderStatus: (id: string, userId: string, status: POStatus) => Promise<void>;
@@ -65,7 +71,7 @@ interface PurchaseState {
     userId: string, supplierId: string,
     items: Omit<import('../types/purchase.types').PurchaseInvoiceItem, 'id' | 'invoice_id' | 'is_deleted'>[],
     invoiceDate: string,
-    opts?: { poId?: string; invoiceNumber?: string; dueDate?: string; discountAmount?: number; taxAmount?: number; notes?: string }
+    opts?: { poId?: string; invoiceNumber?: string; dueDate?: string; discountAmount?: number; taxAmount?: number; notes?: string; currency?: CurrencyCode }
   ) => Promise<PurchaseInvoice>;
 
   createReturn: (
@@ -91,14 +97,16 @@ export const usePurchaseStore = create<PurchaseState>((set, get) => ({
 
   setFilter: async (userId, filter) => {
     set({ filter });
-    await get().loadLists(userId);
+    await get().loadLists(userId, get().viewingId);
   },
 
   // Page 1 of both tabs + whole-set summaries + day subtotals, one predicate per tab.
-  loadLists: async (userId) => {
-    set({ loading: true, error: null });
+  loadLists: async (viewerId, viewingId) => {
+    set({ loading: true, error: null, viewingId });
     const filter = get().filter;
     try {
+      // Purchases are own-only; the drill-down reads that person's after the permission check.
+      const userId = await entryOwner(viewerId, viewingId);
       const [o, od, i, id] = await Promise.all([
         getFilteredPurchaseOrders(userId, filter, PAGE_SIZE),
         getPurchaseOrderDayTotals(userId, filter),
@@ -120,9 +128,10 @@ export const usePurchaseStore = create<PurchaseState>((set, get) => ({
     if (!cur.cursor || cur.loadingMore || get().loading) return;
     set({ [key]: { ...cur, loadingMore: true } } as any);
     try {
+      const ownerId = await entryOwner(userId, get().viewingId);
       const page = tab === 'orders'
-        ? await getFilteredPurchaseOrders(userId, get().filter, PAGE_SIZE, cur.cursor)
-        : await getFilteredPurchaseInvoices(userId, get().filter, PAGE_SIZE, cur.cursor);
+        ? await getFilteredPurchaseOrders(ownerId, get().filter, PAGE_SIZE, cur.cursor)
+        : await getFilteredPurchaseInvoices(ownerId, get().filter, PAGE_SIZE, cur.cursor);
       set(s => ({ [key]: { ...s[key], rows: [...s[key].rows, ...page.rows], cursor: page.nextCursor, loadingMore: false } } as any));
     } catch (e: any) { set(s => ({ [key]: { ...s[key], loadingMore: false }, error: e.message } as any)); }
   },
@@ -159,9 +168,9 @@ export const usePurchaseStore = create<PurchaseState>((set, get) => ({
     } catch (e: any) { set({ error: e.message, loading: false }); }
   },
 
-  loadSummary: async (userId) => {
+  loadSummary: async (userId, viewingId) => {
     try {
-      const summary = await getPurchaseSummary(userId);
+      const summary = await getPurchaseSummary(await entryOwner(userId, viewingId));
       set({ summary });
     } catch (e: any) { set({ error: e.message }); }
   },
@@ -174,8 +183,8 @@ export const usePurchaseStore = create<PurchaseState>((set, get) => ({
     } catch (e: any) { set({ error: e.message, loading: false }); }
   },
 
-  createOrder: async (userId, supplierId, items, orderDate, expectedDate, notes) => {
-    const order = await createPurchaseOrder(userId, supplierId, items, orderDate, expectedDate, notes);
+  createOrder: async (userId, supplierId, items, orderDate, expectedDate, notes, currency) => {
+    const order = await createPurchaseOrder(userId, supplierId, items, orderDate, expectedDate, notes, currency);
     await get().loadOrders(userId);
     await get().loadSummary(userId);
     return order;

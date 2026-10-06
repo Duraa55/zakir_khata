@@ -1,3 +1,4 @@
+import { csvCell } from '../components/Download/csvGenerator';
 import * as FileSystem from 'expo-file-system';
 import * as Sharing from 'expo-sharing';
 
@@ -6,14 +7,7 @@ export const exportToCSV = async (filename: string, headers: string[], data: any
   const rows = [headers, ...data];
   const csvContent = rows
     .map((row) => 
-      row.map((cell) => {
-        // Escape quotes and wrap in quotes if there's a comma
-        const cellString = String(cell ?? '');
-        if (cellString.includes(',') || cellString.includes('"') || cellString.includes('\n')) {
-          return `"${cellString.replace(/"/g, '""')}"`;
-        }
-        return cellString;
-      }).join(',')
+      row.map((cell) => csvCell(cell)).join(',')
     )
     .join('\n');
 
@@ -35,10 +29,10 @@ export const exportToCSV = async (filename: string, headers: string[], data: any
         UTI: 'public.comma-separated-values-text',
       });
     } else {
-      console.warn('Sharing is not available on this device');
+      if (__DEV__) console.warn('Sharing is not available on this device');
     }
   } catch (error) {
-    console.error('Error exporting to CSV:', error);
+    if (__DEV__) console.error('Error exporting to CSV:', error);
     throw error;
   }
 };

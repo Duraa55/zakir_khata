@@ -1,3 +1,4 @@
+import type { CurrencyCode } from '../utils/currency';
 export interface Expense {
   id: string;
   user_id: string;
@@ -12,4 +13,6 @@ export interface Expense {
   synced: 0 | 1;
   is_deleted: 0 | 1;
   deleted_at?: string;
+  /** Currency this expense was ENTERED in (v41). Never converted. */
+  currency?: CurrencyCode;
 }

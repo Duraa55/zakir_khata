@@ -23,7 +23,7 @@ export interface StockMovement {
   id: string;
   item_id: string;
   change: number; // +ve for in, -ve for out
-  reason: 'purchase' | 'sale' | 'adjustment';
+  reason: 'purchase' | 'sale' | 'adjustment' | 'customer_return';
   date: string; // ISO format
   cost_per_unit?: number;      // integer paisa
   sale_price_unit?: number;    // integer paisa

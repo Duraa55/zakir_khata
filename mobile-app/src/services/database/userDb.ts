@@ -2,6 +2,7 @@ import * as Crypto from 'expo-crypto';
 import { getDatabase } from './db';
 import { AccountLevel, assertConsistentLevel } from './accountLevel';
 import { User } from '../../types';
+import { resolveCurrency, type CurrencyCode } from '../../utils/currency';
 
 // Internal DB record — includes the hash, never returned to callers outside this file.
 interface UserRecord {
@@ -16,6 +17,13 @@ interface UserRecord {
   area?: string | null;
   pictureUrl?: string | null;
   parentId?: string | null;
+  /**
+   * v32. ROLE CHECKS ONLY, never scoping. Read at login so an account below staff is
+   * refused the door: 'substaff' is retired in code, but legacy rows still carry it.
+   */
+  account_level?: string | null;
+  /** v41. NOT NULL DEFAULT 'PKR', so every row has one; nullable here for old fixtures. */
+  default_currency?: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -63,6 +71,9 @@ function toPublicUser(record: UserRecord): User {
     area: record.area ?? undefined,
     pictureUrl: record.pictureUrl ?? undefined,
     parentId: record.parentId ?? undefined,
+    // Carried on the session so a form can default its currency chip without a query.
+    // resolveCurrency is total, so a pre-v41 row with no value reads as PKR.
+    defaultCurrency: resolveCurrency(record.default_currency).code,
     createdAt: record.createdAt,
   };
 }
@@ -83,7 +94,9 @@ export const createUser = async (
   name_ur?: string,
   businessType?: string,
   area?: string,
-  pictureUrl?: string
+  pictureUrl?: string,
+  /** Suggested from the phone by the caller; unknown values fall back to PKR. */
+  defaultCurrency?: CurrencyCode
 ): Promise<User> => {
   const db = await getDatabase();
 
@@ -95,26 +108,36 @@ export const createUser = async (
   if (parentId && !parent) throw new Error('Parent account not found.');
   assertConsistentLevel({ role, parentId, parentLevel: parent?.account_level ?? null, level: accountLevel });
 
+  // Stored in the SAME form login looks it up in. Saving the number as typed meant
+  // "0300 1234567" or "+923001234567" produced an account that could never log in.
+  phone = normalisePhone(phone);
+  // users.phone is UNIQUE across removed accounts too (their rows are kept), so say so
+  // plainly instead of surfacing a raw constraint error.
+  const taken = await db.getFirstAsync<{ id: string }>('SELECT id FROM users WHERE phone = ? LIMIT 1', [phone]);
+  if (taken) throw new Error('This phone number already has a login (possibly a removed account).');
+
+  // resolveCurrency is total, so a stray or missing value can never write a bad column.
+  const currency = resolveCurrency(defaultCurrency).code;
   const passwordHash = await hashPassword(password);
   const id = `user_${Date.now()}_${Math.random().toString(36).substring(2, 11)}`;
   const now = new Date().toISOString();
 
   await db.runAsync(
-    `INSERT INTO users (id, name, name_ur, phone, passwordHash, role, account_level, businessName, businessType, area, pictureUrl, parentId, createdAt, updatedAt)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO users (id, name, name_ur, phone, passwordHash, role, account_level, businessName, businessType, area, pictureUrl, parentId, default_currency, createdAt, updatedAt)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [id, name, name_ur ?? null, phone, passwordHash, role, accountLevel,
      businessName ?? null, businessType ?? null, area ?? null,
-     pictureUrl ?? null, parentId ?? null, now, now]
+     pictureUrl ?? null, parentId ?? null, currency, now, now]
   );
 
-  return { id, name, name_ur, phone, role, businessName, businessType, area, pictureUrl, parentId, createdAt: now };
+  return { id, name, name_ur, phone, role, businessName, businessType, area, pictureUrl, parentId, defaultCurrency: currency, createdAt: now };
 };
 
 /**
  * Normalises a phone to the local 0XXXXXXXXXX format.
  * Strips country code (+92, 0092) if present.
  */
-function normalisePhone(raw: string): string {
+export function normalisePhone(raw: string): string {
   let p = raw.replace(/\s+/g, '');
   if (p.startsWith('00')) p = p.slice(2);
   else if (p.startsWith('+')) p = p.slice(1);
@@ -139,7 +162,6 @@ export const verifyUserLogin = async (
 ): Promise<User | null> => {
   const db = await getDatabase();
   const normalised = normalisePhone(phone);
-  console.log('[DB] verifyUserLogin — raw phone:', phone, '| normalised:', normalised);
 
   // is_deleted = 1 means the account was removed by an owner/parent staff. The row
   // is kept so their historical entries stay visible, but they cannot log in.
@@ -147,17 +169,51 @@ export const verifyUserLogin = async (
     'SELECT * FROM users WHERE phone = ? AND is_deleted = 0 LIMIT 1',
     [normalised]
   );
+  // Never log the phone (or anything typed here): it is the login and personal data.
   if (!record) {
-    console.warn('[DB] verifyUserLogin — no user found for phone:', normalised);
+    if (__DEV__) console.warn('[DB] verifyUserLogin — no matching account');
     return null;
   }
-  console.log('[DB] verifyUserLogin — found user:', record.id, record.role);
   const valid = await verifyStoredHash(password, record.passwordHash);
   if (!valid) {
-    console.warn('[DB] verifyUserLogin — password mismatch for:', record.id);
+    if (__DEV__) console.warn('[DB] verifyUserLogin — password mismatch');
+    return null;
+  }
+  // SUB-STAFF HAVE NO LOGIN. Nothing creates one any more — assertConsistentLevel
+  // refuses it outright — but a row created BEFORE that rule still carries a password
+  // hash, and this function only ever checked is_deleted and the hash. So a legacy
+  // sub-staff could still sign in on a phone that had not run the dev wipe. The policy
+  // is enforced here, at the door, rather than relying on every row having been cleaned
+  // up: no account below staff authenticates, whatever is in the table.
+  if (record.account_level === 'substaff') {
+    if (__DEV__) console.warn('[DB] verifyUserLogin — refused: sub-staff have no login');
     return null;
   }
   return toPublicUser(record);
+};
+
+/** THE password strength rule — account creation and password change share it. */
+export function accountPasswordProblem(password: string): string | null {
+  if (password.length < 8) return 'Password must be at least 8 characters';
+  if (!/[A-Z]/.test(password)) return 'Password must contain an uppercase letter';
+  if (!/[0-9]/.test(password)) return 'Password must contain a number';
+  return null;
+}
+
+/**
+ * A signed-in user changing their OWN password: the current password must be right,
+ * and the new one must pass the same strength rule as account creation (it used to
+ * accept 6 characters and never asked for the current password).
+ */
+export const changeOwnPassword = async (userId: string, currentPassword: string, newPassword: string): Promise<void> => {
+  const db = await getDatabase();
+  const record = await db.getFirstAsync<UserRecord>('SELECT * FROM users WHERE id = ? AND is_deleted = 0 LIMIT 1', [userId]);
+  if (!record) throw new Error('Account not found.');
+  if (!(await verifyStoredHash(currentPassword, record.passwordHash))) throw new Error('Current password is incorrect.');
+  const problem = accountPasswordProblem(newPassword);
+  if (problem) throw new Error(problem + '.');
+  if (currentPassword === newPassword) throw new Error('The new password must be different from the current one.');
+  await changePassword(userId, newPassword);
 };
 
 export const changePassword = async (userId: string, newPassword: string): Promise<void> => {
@@ -212,9 +268,9 @@ export const getUsersInScope = async (viewerId: string): Promise<ScopedUser[]> =
        LEFT JOIN users p ON p.id = u.parentId
       WHERE u.is_deleted = 0
         AND u.id != ?
-        AND (u.parentId = ? OR u.parentId IN (SELECT id FROM users WHERE parentId = ?))
+        AND u.parentId = ?
       ORDER BY u.createdAt DESC`,
-    [viewerId, viewerId, viewerId]
+    [viewerId, viewerId]
   );
   return records.map(r => ({ ...toPublicUser(r), account_level: r.account_level, parentName: r.parentName }));
 };
@@ -263,54 +319,6 @@ export const deactivateUser = async (id: string): Promise<void> => {
   );
 };
 
-export const getSubStaffByParentId = async (parentId: string): Promise<User[]> => {
-  const db = await getDatabase();
-  const records = await db.getAllAsync<UserRecord>(
-    'SELECT * FROM users WHERE parentId = ? AND role = "staff" AND is_deleted = 0 ORDER BY name ASC',
-    [parentId]
-  );
-  return records.map(toPublicUser);
-};
-
-/** A sub-staff row for the management screen, with its parent staff's name. */
-export interface SubStaffRow extends User {
-  parentName?: string | null;
-}
-
-/**
- * Sub-staff the viewer is allowed to manage, split into active and removed.
- *  - staff  → only their own sub-staff (parentId = viewer)
- *  - admin  → every staff's sub-staff in their tree (grandchildren), flat,
- *             each row carrying the parent staff's name
- */
-export const getSubStaffFor = async (
-  viewerId: string,
-  viewerRole: 'admin' | 'staff'
-): Promise<{ active: SubStaffRow[]; removed: SubStaffRow[] }> => {
-  const db = await getDatabase();
-
-  const scope =
-    viewerRole === 'admin'
-      ? 'u.parentId IN (SELECT id FROM users WHERE parentId = ?)'
-      : 'u.parentId = ?';
-
-  const rows = await db.getAllAsync<UserRecord & { parentName: string | null; is_deleted: number }>(
-    `SELECT u.id, u.name, u.name_ur, u.phone, u.role, u.businessName, u.businessType,
-            u.area, u.pictureUrl, u.parentId, u.createdAt, u.updatedAt,
-            u.is_deleted AS is_deleted, p.name AS parentName
-       FROM users u
-       LEFT JOIN users p ON p.id = u.parentId
-      WHERE ${scope} AND u.role = 'staff'
-      ORDER BY u.name ASC`,
-    [viewerId]
-  );
-
-  const active: SubStaffRow[] = [];
-  const removed: SubStaffRow[] = [];
-  for (const r of rows) {
-    const row: SubStaffRow = { ...toPublicUser(r), parentName: r.parentName };
-    if (r.is_deleted === 1) removed.push(row);
-    else active.push(row);
-  }
-  return { active, removed };
-};
+// getSubStaffByParentId, SubStaffRow and getSubStaffFor lived here. They existed only
+// to list accounts BELOW a staff member — a level that no longer exists — and their one
+// consumer (screens/admin/StaffDetailScreen) was already unreachable.

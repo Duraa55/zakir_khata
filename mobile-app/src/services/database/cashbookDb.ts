@@ -3,10 +3,45 @@ import { assertAllowedUpdateFields } from './updateFields';
 import { CashEntry } from '../../types';
 import { writeWithSync } from './syncHelpers';
 import { todayDate, parseDateValue } from '../../utils/dates';
-import { userScope, userScopeParams } from './queryHelpers';
 import { keysetClause, keysetParams, nextCursorOf, PageCursor } from './pagination';
+import { assertCanViewEntriesOf } from './entryScope';
+
+/** Staff entries drill-down: only rows this login created (see entryScope.ts). */
+export type CreatorOption = { createdBy?: string };
+
+/**
+ * OWN-ONLY BOOK. Every account's Cash Book holds exactly the rows it created —
+ * an admin's book does not include their staff's entries, and no total merges
+ * two people. The only way to see someone else's cash is the drill-down
+ * (Staff Book → staff → Entries), which passes `createdBy` and is permission-
+ * checked downward-only by assertCanViewEntriesOf.
+ */
+const cashOwner = async (viewerId: string, createdBy?: string): Promise<string> => {
+  if (createdBy) {
+    await assertCanViewEntriesOf(viewerId, createdBy);
+    return createdBy;
+  }
+  return viewerId;
+};
+
+/**
+ * A live row. Deletion has written BOTH spellings over time: the generic soft delete
+ * sets `is_deleted`, so a query that read only `isDeleted` kept showing — and
+ * totalling — deleted cash entries. Read-side only: no stored row is rewritten.
+ */
+const CASH_LIVE = 'isDeleted = 0 AND COALESCE(is_deleted, 0) = 0';
+
+/** Only the person who wrote an entry may edit or delete it — never a parent. */
+const assertOwnCashEntry = async (id: string, userId: string): Promise<void> => {
+  const db = await getDatabase();
+  const row = await db.getFirstAsync<{ userId: string }>('SELECT userId FROM cashbook WHERE id = ?', [id]);
+  if (!row) throw new Error('Entry not found.');
+  if (!userId || row.userId !== userId) throw new Error('You can only change your own entries.');
+};
 
 export type CashHistoryFilter = {
+  /** Drill-down: only entries this login created. Permission is checked by the caller-facing functions. */
+  createdBy?: string;
   startDate?: string;
   endDate?: string;
   direction?: 'all' | 'in' | 'out';
@@ -20,7 +55,7 @@ export type CashDayTotal = { day: string; cashIn: number; cashOut: number; entry
  * THE one predicate for Cash History: the rows, the headline summary and the
  * per-day subtotals all come from here, so none of them can disagree.
  */
-const cashHistoryWhere = (userId: string, filter: CashHistoryFilter) => {
+const cashHistoryWhere = (ownerId: string, filter: CashHistoryFilter) => {
   for (const date of [filter.startDate, filter.endDate]) {
     if (date !== undefined && (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !parseDateValue(date))) {
       throw new Error('Invalid date range.');
@@ -28,8 +63,8 @@ const cashHistoryWhere = (userId: string, filter: CashHistoryFilter) => {
   }
   if (filter.startDate && filter.endDate && filter.startDate > filter.endDate) throw new Error('From date must not be after To date.');
   if (filter.direction && !['all', 'in', 'out'].includes(filter.direction)) throw new Error('Invalid cash direction.');
-  let where = `${userScope('userId')} AND isDeleted = 0`;
-  const params: (string | number)[] = [...userScopeParams(userId)];
+  let where = `userId = ? AND ${CASH_LIVE}`;
+  const params: (string | number)[] = [ownerId];
   if (filter.startDate || filter.endDate) {
     where += ' AND date(date) BETWEEN date(?) AND date(?)';
     params.push(filter.startDate || '0001-01-01', filter.endDate || '9999-12-31');
@@ -58,7 +93,7 @@ const cashHistoryWhere = (userId: string, filter: CashHistoryFilter) => {
 export const getFilteredCashHistory = async (
   userId: string, filter: CashHistoryFilter = {}, limit = -1, offset = 0, after?: PageCursor | null
 ) => {
-  const { where, params } = cashHistoryWhere(userId, filter);
+  const { where, params } = cashHistoryWhere(await cashOwner(userId, filter.createdBy), filter);
   const db = await getDatabase();
   const rowsWhere = after ? `${where} AND ${keysetClause(CASH_KEYS)}` : where;
   const rowsParams = after ? [...params, ...keysetParams(after)] : params;
@@ -87,7 +122,7 @@ const CASH_KEYS = { date: 'date', createdAt: 'createdAt', id: 'id' } as const;
  * rows are on screen. Keyed by date(date) so legacy timestamp rows fall on their day.
  */
 export const getCashHistoryDayTotals = async (userId: string, filter: CashHistoryFilter = {}): Promise<CashDayTotal[]> => {
-  const { where, params } = cashHistoryWhere(userId, filter);
+  const { where, params } = cashHistoryWhere(await cashOwner(userId, filter.createdBy), filter);
   const db = await getDatabase();
   return db.getAllAsync<CashDayTotal>(
     `SELECT date(date) AS day,
@@ -114,7 +149,7 @@ export const createCashEntry = async (
 ): Promise<CashEntry> => {
   const id = `cash_${Date.now()}_${Math.random().toString(36).substring(2, 11)}`;
   const now = new Date().toISOString();
-  const entryDate = date || now.split('T')[0];
+  const entryDate = date || todayDate(); // local day, not UTC
 
   const data = {
     id, userId, description, amount_paisa, direction, date: entryDate,
@@ -137,7 +172,7 @@ export const createCashEntry = async (
 export const getCashEntryById = async (id: string): Promise<CashEntry | null> => {
   const db = await getDatabase();
   const result = await db.getFirstAsync<CashEntry>(
-    'SELECT * FROM cashbook WHERE id = ? AND isDeleted = 0 LIMIT 1',
+    `SELECT * FROM cashbook WHERE id = ? AND ${CASH_LIVE} LIMIT 1`,
     [id]
   );
   return result ?? null;
@@ -150,33 +185,34 @@ export const getCashEntriesByUserId = async (
 ): Promise<CashEntry[]> => {
   const db = await getDatabase();
   return db.getAllAsync<CashEntry>(
-    `SELECT * FROM cashbook 
-      WHERE (userId = ? OR userId IN (SELECT id FROM users WHERE parentId = ?) OR userId IN (SELECT id FROM users WHERE parentId IN (SELECT id FROM users WHERE parentId = ?))) 
-       AND isDeleted = 0 
-     ORDER BY date DESC, createdAt DESC 
+    `SELECT * FROM cashbook
+      WHERE userId = ? AND ${CASH_LIVE}
+     ORDER BY date DESC, createdAt DESC
      LIMIT ? OFFSET ?`,
-    [userId, userId, userId, limit, offset]
+    [userId, limit, offset]
   );
 };
 
 export const getAllCashEntries = async (): Promise<CashEntry[]> => {
   const db = await getDatabase();
   return db.getAllAsync<CashEntry>(
-    'SELECT * FROM cashbook WHERE isDeleted = 0 ORDER BY date DESC, createdAt DESC'
+    `SELECT * FROM cashbook WHERE ${CASH_LIVE} ORDER BY date DESC, createdAt DESC`
   );
 };
 
 // Returns paisa totals per direction for a user.
 export const getCashBalanceSummary = async (
-  userId: string
+  userId: string,
+  options: CreatorOption = {}
 ): Promise<{ cashIn: number; cashOut: number; cashBalance: number }> => {
+  const ownerId = await cashOwner(userId, options.createdBy);
   const db = await getDatabase();
   const rows = await db.getAllAsync<{ direction: string; total: number }>(
     `SELECT direction, SUM(amount_paisa) as total
      FROM cashbook
-      WHERE (userId = ? OR userId IN (SELECT id FROM users WHERE parentId = ?) OR userId IN (SELECT id FROM users WHERE parentId IN (SELECT id FROM users WHERE parentId = ?))) AND isDeleted = 0
+      WHERE userId = ? AND ${CASH_LIVE}
      GROUP BY direction`,
-    [userId, userId, userId]
+    [ownerId]
   );
   let cashIn = 0;
   let cashOut = 0;
@@ -194,6 +230,7 @@ export const updateCashEntry = async (
 ): Promise<void> => {
   assertAllowedUpdateFields(updates, ["description","amount_paisa","direction","date","attachment_url","category","note"]);
   if (Object.keys(updates).length === 0) return;
+  await assertOwnCashEntry(id, userId);
   await writeWithSync({
     tableName: 'cashbook',
     recordId: id,
@@ -205,6 +242,7 @@ export const updateCashEntry = async (
 };
 
 export const deleteCashEntry = async (id: string, userId: string): Promise<void> => {
+  await assertOwnCashEntry(id, userId);
   await writeWithSync({
     tableName: 'cashbook',
     recordId: id,
@@ -218,7 +256,7 @@ export const deleteCashEntry = async (id: string, userId: string): Promise<void>
 export const getPendingSyncCashEntries = async (): Promise<CashEntry[]> => {
   const db = await getDatabase();
   return db.getAllAsync<CashEntry>(
-    "SELECT * FROM cashbook WHERE syncStatus = 'pending' AND isDeleted = 0 ORDER BY createdAt ASC"
+    `SELECT * FROM cashbook WHERE syncStatus = 'pending' AND ${CASH_LIVE} ORDER BY createdAt ASC`
   );
 };
 
@@ -231,23 +269,24 @@ export type DayTotals = { cashIn: number; cashOut: number; net: number; entryCou
  * hidden when the date changes. Every past day stays queryable forever by passing
  * its date here.
  *
- * Scoped with userScope() like every other book, so an owner sees their whole tree
- * for that day and a staff sees their own branch. Previously this read `userId = ?`
- * only, so an owner's day totals silently excluded their staff's entries while the
- * "Cash in Hand" figure beside them included the whole tree.
+ * OWN-ONLY, like the whole Cash Book: the day's rows and totals are the viewer's
+ * own entries (or, in a drill-down, exactly the target's). The "Cash in Hand"
+ * figure beside them uses the same owner, so the two can never disagree.
  *
  * `date(date) = date(?)` rather than string equality: a legacy row holding a full
  * timestamp still matches its calendar day instead of silently disappearing.
  */
 export const getDayBook = async (
   userId: string,
-  date: string = todayDate()
+  date: string = todayDate(),
+  options: CreatorOption = {}
 ): Promise<{ entries: CashEntry[]; dayTotals: DayTotals }> => {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !parseDateValue(date)) {
     throw new Error('Invalid date.');
   }
-  const where = `${userScope('userId')} AND isDeleted = 0 AND date(date) = date(?)`;
-  const params = [...userScopeParams(userId), date];
+  const ownerId = await cashOwner(userId, options.createdBy);
+  const where = `userId = ? AND ${CASH_LIVE} AND date(date) = date(?)`;
+  const params = [ownerId, date];
   const db = await getDatabase();
 
   const entries = await db.getAllAsync<CashEntry>(

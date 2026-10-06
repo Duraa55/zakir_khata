@@ -1,28 +1,35 @@
 import React, { useState } from 'react';
-import {
-  View, Text, TextInput, TouchableOpacity, StyleSheet,
-  ScrollView, KeyboardAvoidingView, Platform, Alert, ActivityIndicator
-} from 'react-native';
+import { useLanguageStore } from '../../store/useLanguageStore';
+import { View, Text, TextInput, TouchableOpacity, StyleSheet, Alert } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useAuthStore } from '../../store/authStore';
 import { usePurchaseStore } from '../../store/usePurchaseStore';
 import { PurchaseOrderItem } from '../../types/purchase.types';
 import { formatCurrency } from '../../utils/calculations';
 import { ScreenContainer } from '../../components/ui/ScreenContainer';
-import { Colors } from '../../theme';
+import { Icon, AmountText, Button } from '../../components/ui/primitives';
+import { color, space, radius, hairline, touchTarget, iconSize, type as typeScale } from '../../theme/tokens';
 
+/**
+ * Record goods arriving against an order. The data layer refuses more than is still
+ * outstanding on a line and saves the lines, stock and order status in one go.
+ */
 export const ReceiveGoodsModal = ({ navigation, route }: any) => {
-  const { orderId, items = [] } = route.params as { orderId: string; items: PurchaseOrderItem[] };
+  // The ORDER's currency: a receipt is a figure of that order, not of this account.
+  const { orderId, items = [], currency } = route.params as { orderId: string; items: PurchaseOrderItem[]; currency?: string };
   const { user } = useAuthStore();
+  const { t } = useLanguageStore();
   const { receiveGoods } = usePurchaseStore();
 
-  // Local receipt qty per item (keyed by item.id)
   const [received, setReceived] = useState<Record<string, string>>(
     Object.fromEntries(items.map((i: PurchaseOrderItem) => [i.id, String(i.quantity - i.received_qty)]))
   );
   const [loading, setLoading] = useState(false);
 
   const pending = items.filter((i: PurchaseOrderItem) => i.received_qty < i.quantity);
+  const qtyOf = (id: string) => parseFloat(received[id] ?? '0') || 0;
+  const setQty = (id: string, next: number, max: number) =>
+    setReceived(p => ({ ...p, [id]: String(Math.max(0, Math.min(max, next))) }));
 
   const handleSubmit = async () => {
     if (!user) return;
@@ -31,26 +38,24 @@ export const ReceiveGoodsModal = ({ navigation, route }: any) => {
         itemId: i.id,
         stockItemId: i.stock_item_id,
         itemName: i.item_name,
-        receivedQty: parseFloat(received[i.id] ?? '0') || 0,
+        receivedQty: qtyOf(i.id),
         unitCost: i.unit_cost,
       }))
       .filter(r => r.receivedQty > 0);
 
     if (receipts.length === 0) {
-      Alert.alert('Error', 'Enter received quantity for at least one item.');
+      Alert.alert(t('rgNothingTitle'), t('rgNothingBody'));
       return;
     }
 
     setLoading(true);
     try {
       await receiveGoods(orderId, user.id, receipts);
-      Alert.alert(
-        '✅ Goods Received',
-        `${receipts.length} item(s) received. Stock has been updated automatically.`,
-        [{ text: 'Done', onPress: () => navigation.goBack() }]
-      );
-    } catch (e) {
-      Alert.alert('Error', 'Failed to record receipt. Please try again.');
+      Alert.alert(t('rgReceivedTitle'), t('rgReceivedBody', { count: receipts.length }), [
+        { text: 'Done', onPress: () => navigation.goBack() }
+      ]);
+    } catch (e: any) {
+      Alert.alert(t('commonError'), e?.message || t('rgFailed'));
     } finally {
       setLoading(false);
     }
@@ -59,155 +64,122 @@ export const ReceiveGoodsModal = ({ navigation, route }: any) => {
   return (
     <SafeAreaView style={styles.safe}>
       <View style={styles.header}>
-        <TouchableOpacity onPress={() => navigation.goBack()} style={styles.backBtn}>
-          <Text style={styles.backArrow}>←</Text>
+        <TouchableOpacity onPress={() => navigation.goBack()} style={styles.backBtn} accessibilityRole="button" accessibilityLabel={t('commonBack')}>
+          <Icon name="chevron-left" size={iconSize.lg} tint={color.textPrimary} />
         </TouchableOpacity>
-        <Text style={styles.headerTitle}>Receive Goods</Text>
-        <View style={{ width: 40 }} />
+        <Text style={styles.headerTitle} numberOfLines={1}>{t('rgTitle')}</Text>
+        <View style={styles.backBtn} />
       </View>
 
       <ScreenContainer scrollable={true} hasTabBar={true} contentContainerStyle={styles.form}>
+        <View style={styles.notice}>
+          <Icon name="package" size={iconSize.sm} tint={color.textSecondary} />
+          <Text style={styles.noticeText}>Enter what arrived for each item. Stock is updated automatically.</Text>
+        </View>
 
-          <View style={styles.notice}>
-            <Text style={styles.noticeText}>
-              📦 Enter the quantity received for each item. Stock will be updated automatically.
-            </Text>
+        {pending.length === 0 ? (
+          <View style={styles.allDone}>
+            <Icon name="check-circle" size={40} tint={color.textSecondary} />
+            <Text style={styles.allDoneText}>{t('rgAllReceived')}</Text>
           </View>
-
-          {pending.length === 0 ? (
-            <View style={styles.allReceived}>
-              <Text style={{ fontSize: 48 }}>✅</Text>
-              <Text style={styles.allReceivedText}>All items already received</Text>
-            </View>
-          ) : (
-            pending.map((item: PurchaseOrderItem) => {
-              const remaining = item.quantity - item.received_qty;
-              const qty = parseFloat(received[item.id] ?? '0');
-              const lineTotal = qty * item.unit_cost;
-              return (
-                <View key={item.id} style={styles.itemCard}>
-                  <View style={styles.itemHeader}>
-                    <Text style={styles.itemName}>{item.item_name}</Text>
-                    {item.stock_item_id && (
-                      <View style={styles.stockBadge}>
-                        <Text style={styles.stockBadgeText}>Stock ✓</Text>
-                      </View>
-                    )}
-                  </View>
-                  <Text style={styles.itemDetail}>
-                    Ordered: {item.quantity} | Previously received: {item.received_qty} | Remaining: {remaining}
-                  </Text>
-                  <Text style={styles.itemCost}>Unit Cost: {formatCurrency(item.unit_cost)}</Text>
-
-                  <View style={styles.qtyRow}>
-                    <TouchableOpacity
-                      style={styles.qtyBtn}
-                      onPress={() => setReceived(p => ({ ...p, [item.id]: String(Math.max(0, parseFloat(p[item.id] ?? '0') - 1)) }))}
-                    >
-                      <Text style={styles.qtyBtnText}>−</Text>
-                    </TouchableOpacity>
-
-                    <TextInput
-                      style={styles.qtyInput}
-                      value={received[item.id]}
-                      onChangeText={v => setReceived(p => ({ ...p, [item.id]: v }))}
-                      keyboardType="decimal-pad"
-                      selectTextOnFocus
-                      placeholderTextColor={Colors.textGray}
-                    />
-
-                    <TouchableOpacity
-                      style={styles.qtyBtn}
-                      onPress={() => setReceived(p => ({ ...p, [item.id]: String(Math.min(remaining, parseFloat(p[item.id] ?? '0') + 1)) }))}
-                    >
-                      <Text style={styles.qtyBtnText}>+</Text>
-                    </TouchableOpacity>
-
-                    <TouchableOpacity
-                      style={styles.allBtn}
-                      onPress={() => setReceived(p => ({ ...p, [item.id]: String(remaining) }))}
-                    >
-                      <Text style={styles.allBtnText}>All</Text>
-                    </TouchableOpacity>
-                  </View>
-
-                  {qty > 0 && (
-                    <Text style={styles.lineTotal}>
-                      Receiving {qty} × {formatCurrency(item.unit_cost)} = {formatCurrency(lineTotal)}
-                    </Text>
+        ) : (
+          pending.map((item: PurchaseOrderItem) => {
+            const remaining = item.quantity - item.received_qty;
+            const qty = qtyOf(item.id);
+            return (
+              <View key={item.id} style={styles.card}>
+                <View style={styles.cardTop}>
+                  <Text style={styles.itemName}>{item.item_name}</Text>
+                  {!!item.stock_item_id && (
+                    <View style={styles.stockPill}>
+                      <Icon name="package" size={12} tint={color.textSecondary} />
+                      <Text style={styles.stockPillText}>{t('rgInStockBook')}</Text>
+                    </View>
                   )}
                 </View>
-              );
-            })
-          )}
+                <Text style={styles.itemDetail}>Ordered {item.quantity} · received {item.received_qty} · {remaining} to come</Text>
+                <Text style={styles.itemDetail}>{formatCurrency(item.unit_cost, currency)} each</Text>
 
-          {pending.length > 0 && (
-            <TouchableOpacity
-              style={[styles.submitBtn, loading && { opacity: 0.6 }]}
-              onPress={handleSubmit}
-              disabled={loading}
-            >
-              {loading
-                ? <ActivityIndicator color="#fff" />
-                : <Text style={styles.submitText}>✅ CONFIRM RECEIPT & UPDATE STOCK</Text>
-              }
-            </TouchableOpacity>
-          )}
-        </ScreenContainer>
+                <View style={styles.qtyRow}>
+                  <TouchableOpacity style={styles.qtyBtn} onPress={() => setQty(item.id, qty - 1, remaining)} accessibilityLabel={t('poLess')}>
+                    <Icon name="minus" size={iconSize.sm} tint={color.accent} />
+                  </TouchableOpacity>
+                  <TextInput
+                    style={styles.qtyInput}
+                    value={received[item.id]}
+                    onChangeText={v => setReceived(p => ({ ...p, [item.id]: v }))}
+                    keyboardType="decimal-pad"
+                    selectTextOnFocus
+                  />
+                  <TouchableOpacity style={styles.qtyBtn} onPress={() => setQty(item.id, qty + 1, remaining)} accessibilityLabel={t('poMore')}>
+                    <Icon name="plus" size={iconSize.sm} tint={color.accent} />
+                  </TouchableOpacity>
+                  <TouchableOpacity style={styles.allBtn} onPress={() => setQty(item.id, remaining, remaining)}>
+                    <Text style={styles.allBtnText}>All</Text>
+                  </TouchableOpacity>
+                </View>
+
+                {qty > 0 && (
+                  <View style={styles.lineTotal}>
+                    <Text style={styles.itemDetail}>Receiving {qty} × {formatCurrency(item.unit_cost, currency)}</Text>
+                    <AmountText paisa={Math.round(qty * item.unit_cost)} size="label" currency={currency} />
+                  </View>
+                )}
+              </View>
+            );
+          })
+        )}
+
+        {pending.length > 0 && (
+          <Button label={t('rgConfirm')} icon="check" onPress={handleSubmit} loading={loading} disabled={loading} fullWidth style={styles.submit} />
+        )}
+      </ScreenContainer>
     </SafeAreaView>
   );
 };
 
 const styles = StyleSheet.create({
-  safe: { flex: 1, backgroundColor: Colors.bgPrimary },
+  safe: { flex: 1, backgroundColor: color.surface },
   header: {
     flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
-    backgroundColor: Colors.bgCard, paddingHorizontal: 16, paddingVertical: 14,
-    borderBottomWidth: 1, borderBottomColor: Colors.border,
+    paddingHorizontal: space.md, minHeight: 56, borderBottomWidth: hairline, borderBottomColor: color.border,
   },
-  backBtn: { width: 36 },
-  backArrow: { fontSize: 22, color: Colors.textWhite, fontWeight: '700' },
-  headerTitle: { fontSize: 18, fontWeight: '700', color: Colors.textWhite },
-  form: { padding: 16, paddingBottom: 40 },
+  backBtn: { width: touchTarget, height: touchTarget, alignItems: 'center', justifyContent: 'center' },
+  headerTitle: { ...typeScale.heading, fontSize: 18, color: color.textPrimary, flex: 1, textAlign: 'center' },
+  form: { padding: space.lg, paddingBottom: 40 },
   notice: {
-    backgroundColor: Colors.bgInput, borderRadius: 12, padding: 14,
-    marginBottom: 16, borderWidth: 1, borderColor: Colors.border,
+    flexDirection: 'row', gap: space.sm, alignItems: 'center', backgroundColor: color.surfaceRaised,
+    borderRadius: radius.md, padding: space.md, marginBottom: space.lg, borderWidth: hairline, borderColor: color.border,
   },
-  noticeText: { fontSize: 13, color: Colors.primaryLight, lineHeight: 20 },
-  allReceived: { alignItems: 'center', paddingVertical: 60 },
-  allReceivedText: { fontSize: 17, fontWeight: '700', color: Colors.success, marginTop: 12 },
-  itemCard: {
-    backgroundColor: Colors.bgCard, borderRadius: 14, padding: 16, marginBottom: 12,
-    borderWidth: 1, borderColor: Colors.border, shadowColor: '#000', shadowOpacity: 0.2, elevation: 2,
+  noticeText: { ...typeScale.label, color: color.textSecondary, flex: 1 },
+  allDone: { alignItems: 'center', paddingVertical: 60, gap: space.md },
+  allDoneText: { ...typeScale.heading, color: color.textSecondary, textAlign: 'center' },
+  card: {
+    backgroundColor: color.surface, borderRadius: radius.lg, padding: space.lg, marginBottom: space.md,
+    borderWidth: hairline, borderColor: color.border, gap: space.xs,
   },
-  itemHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 },
-  itemName: { fontSize: 15, fontWeight: '700', color: Colors.textWhite, flex: 1 },
-  stockBadge: { backgroundColor: Colors.bgInput, paddingHorizontal: 8, paddingVertical: 2, borderRadius: 8, borderWidth: 1, borderColor: Colors.border },
-  stockBadgeText: { fontSize: 10, fontWeight: '700', color: Colors.success },
-  itemDetail: { fontSize: 12, color: Colors.textGray, marginBottom: 2 },
-  itemCost: { fontSize: 12, color: Colors.textGray, fontWeight: '600', marginBottom: 10 },
-  qtyRow: { flexDirection: 'row', alignItems: 'center', gap: 10 },
+  cardTop: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', gap: space.md },
+  itemName: { ...typeScale.bodyMedium, fontSize: 16, color: color.textPrimary, flex: 1 },
+  stockPill: {
+    flexDirection: 'row', alignItems: 'center', gap: space.xs, paddingHorizontal: space.sm, paddingVertical: 2,
+    borderRadius: radius.pill, borderWidth: hairline, borderColor: color.border,
+  },
+  stockPillText: { ...typeScale.caption, color: color.textSecondary },
+  itemDetail: { ...typeScale.caption, color: color.textSecondary },
+  qtyRow: { flexDirection: 'row', alignItems: 'center', gap: space.sm, marginTop: space.sm },
   qtyBtn: {
-    width: 38, height: 38, backgroundColor: Colors.bgInput, borderWidth: 1, borderColor: Colors.border,
-    borderRadius: 10, justifyContent: 'center', alignItems: 'center',
+    width: touchTarget, height: touchTarget, borderWidth: hairline, borderColor: color.borderStrong,
+    borderRadius: radius.sm, alignItems: 'center', justifyContent: 'center', backgroundColor: color.surface,
   },
-  qtyBtnText: { fontSize: 20, color: Colors.primaryLight, fontWeight: '700' },
   qtyInput: {
-    flex: 1, backgroundColor: Colors.bgInput, borderWidth: 1.5, borderColor: Colors.border,
-    borderRadius: 10, textAlign: 'center', fontSize: 20, fontWeight: '800',
-    paddingVertical: 8, color: Colors.textWhite,
+    flex: 1, minHeight: touchTarget, backgroundColor: color.surfaceRaised, borderWidth: hairline, borderColor: color.border,
+    borderRadius: radius.sm, textAlign: 'center', ...typeScale.title, fontSize: 18, color: color.textPrimary,
   },
   allBtn: {
-    paddingHorizontal: 14, paddingVertical: 8, backgroundColor: Colors.bgInput, borderWidth: 1, borderColor: Colors.border,
-    borderRadius: 10,
+    minHeight: touchTarget, paddingHorizontal: space.md, borderWidth: hairline, borderColor: color.borderStrong,
+    borderRadius: radius.sm, justifyContent: 'center',
   },
-  allBtnText: { fontSize: 13, fontWeight: '700', color: Colors.primaryLight },
-  lineTotal: { fontSize: 13, fontWeight: '700', color: Colors.success, marginTop: 8, textAlign: 'right' },
-  submitBtn: {
-    backgroundColor: Colors.primary, borderRadius: 14, paddingVertical: 16,
-    alignItems: 'center', marginTop: 8,
-    shadowColor: Colors.primary, shadowOpacity: 0.4, shadowRadius: 8, elevation: 6,
-  },
-  submitText: { color: Colors.textWhite, fontWeight: '800', fontSize: 15 },
+  allBtnText: { ...typeScale.bodyMedium, color: color.accent },
+  lineTotal: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', gap: space.md, marginTop: space.sm },
+  submit: { minHeight: 52, marginTop: space.sm },
 });
-

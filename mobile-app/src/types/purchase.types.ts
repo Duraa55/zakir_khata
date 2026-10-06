@@ -1,3 +1,5 @@
+import type { CurrencyCode } from '../utils/currency';
+import type { CurrencyTotal } from '../utils/currencyTotals';
 /**
  * purchase.types.ts
  * All purchase order, invoice, and return TypeScript types.
@@ -34,6 +36,12 @@ export interface PurchaseOrder {
   notes?: string | null;
   total: number;           // integer paisa (sum of line_totals)
   received_total: number;  // integer paisa
+  /**
+   * The currency this order was ENTERED in (v41). Every figure on it — total,
+   * received_total and every line — is in this currency's minor unit. Never
+   * converted: the document records what the supplier actually quoted.
+   */
+  currency: CurrencyCode;
   items?: PurchaseOrderItem[];
   created_at: string;
   updated_at?: string | null;
@@ -70,7 +78,10 @@ export interface PurchaseInvoice {
   tax_amount: number;         // integer paisa
   total: number;              // integer paisa
   amount_paid: number;        // integer paisa
-  balance_due: number;        // integer paisa
+  balance_due: number;
+  /** Currency this invoice was ENTERED in (v41). Every figure on it is in this
+   *  currency; it is never converted. */
+  currency: CurrencyCode;        // integer paisa
   status: InvoiceStatus;
   notes?: string | null;
   items?: PurchaseInvoiceItem[];
@@ -118,7 +129,8 @@ export interface PurchaseReturn {
 export interface PurchaseSummary {
   totalOrders: number;
   pendingOrders: number;
-  totalInvoiced: number;
-  totalOutstanding: number;   // sum of balance_due across all unpaid invoices
-  totalPaidThisMonth: number;
+  /** Money figures are ONE PER CURRENCY — never summed across them. Counts stay scalars. */
+  totalInvoiced: CurrencyTotal[];
+  totalOutstanding: CurrencyTotal[];   // balance_due per currency across unpaid invoices
+  totalPaidThisMonth: CurrencyTotal[];
 }

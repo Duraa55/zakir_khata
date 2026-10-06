@@ -39,7 +39,7 @@ export const exportToExcel = async (
       throw new Error('Sharing is not available on this device');
     }
   } catch (error) {
-    console.error('Excel Export Error:', error);
+    if (__DEV__) console.error('Excel Export Error:', error);
     throw error;
   }
 };

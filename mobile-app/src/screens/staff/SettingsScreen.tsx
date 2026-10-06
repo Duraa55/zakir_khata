@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import {
   View, Text, TouchableOpacity, Alert, ScrollView,
   Image, ActivityIndicator, StyleSheet,
@@ -6,19 +6,24 @@ import {
 import { SafeAreaView } from 'react-native-safe-area-context';
 import * as ImagePicker from 'expo-image-picker';
 import { useAuthStore } from '../../store/authStore';
-import { useSettingsStore } from '../../store/useSettingsStore';
 import { useSyncStore } from '../../store/useSyncStore';
 import { useLanguageStore } from '../../store/useLanguageStore';
 import { IS_FIREBASE_CONFIGURED } from '../../services/firebase/firebaseConfig';
 import { useNavigation } from '@react-navigation/native';
-import { Colors } from '../../theme';
+import { Icon } from '../../components/ui/primitives';
+import { color, space, radius, hairline, touchTarget, iconSize, type as typeScale } from '../../theme/tokens';
 import { ScreenContainer } from '../../components/ui/ScreenContainer';
+import { persistAttachment } from '../../utils/durableFile';
+import { getOwnStaffProfile, accountPhotoUri } from '../../services/database/staffDb';
+import { StaffRecord } from '../../types/staff.types';
+import { documentLabel } from '../../utils/customerPhoto';
+import { useAttachmentOpener } from '../../components/ui/AttachmentViewer';
 
 const RadioDot = ({ active }: { active: boolean }) => (
   <View
     style={[
       styles.radioDot,
-      active && { borderColor: Colors.primary },
+      active && styles.radioDotActive,
     ]}
   >
     {active && <View style={styles.radioDotInner} />}
@@ -28,18 +33,36 @@ const RadioDot = ({ active }: { active: boolean }) => (
 export const SettingsScreen = () => {
   const navigation = useNavigation<any>();
   const { user, logout, updateProfilePicture } = useAuthStore();
-  const { nameDisplayMode, setNameDisplayMode } = useSettingsStore();
   const { isOnline, pendingCount, isSyncing, processSyncQueue } = useSyncStore();
   const { language, setLanguage, t } = useLanguageStore();
   const [uploadingPic, setUploadingPic] = useState(false);
+  // One shared opener, same as Staff Book: images preview in-app, other files go to
+  // the phone, a missing file says so.
+  const { openAttachment, attachmentViewer } = useAttachmentOpener();
+
+  // The profile an admin filled in for this account, if this account is someone's staff.
+  // It holds the photo and the documents the admin attached; `users` holds neither.
+  const [ownProfile, setOwnProfile] = useState<StaffRecord | null>(null);
+  useEffect(() => {
+    if (!user?.id) { setOwnProfile(null); return; }
+    let active = true;
+    getOwnStaffProfile(user.id)
+      .then(p => { if (active) setOwnProfile(p); })
+      .catch(e => { if (__DEV__) console.error('[Settings] own staff profile failed:', e); });
+    return () => { active = false; };
+  }, [user?.id]);
+
+  // Own picture wins; the admin's photo shows until this account sets one.
+  const avatarUri = accountPhotoUri(user?.pictureUrl, ownProfile);
+  const ownDocuments = ownProfile?.document_urls ?? [];
 
   const handlePickProfilePic = async () => {
     const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
     if (status !== 'granted') {
       Alert.alert(
-        'Permission Required',
-        'Please allow access to your photo library in Settings to change your profile picture.',
-        [{ text: 'OK' }],
+        t('setPermissionTitle'),
+        t('setPermissionBody'),
+        [{ text: t('commonOk') }],
       );
       return;
     }
@@ -58,7 +81,9 @@ export const SettingsScreen = () => {
 
     setUploadingPic(true);
     try {
-      await updateProfilePicture(user.id, uri);
+      // Durable copy first — the picker's cache path can vanish (see durableFile.ts).
+      const durable = await persistAttachment('profile', uri);
+      await updateProfilePicture(user.id, durable);
     } finally {
       setUploadingPic(false);
     }
@@ -66,21 +91,21 @@ export const SettingsScreen = () => {
 
   const handleSync = async () => {
     if (!IS_FIREBASE_CONFIGURED) {
-      Alert.alert('Sync Unavailable', 'Firebase is not configured. Data is stored locally only.');
+      Alert.alert(t('setSyncUnavailableTitle'), t('setSyncUnavailableBody'));
       return;
     }
     if (!isOnline) {
-      Alert.alert('Offline', 'Cannot sync while offline.');
+      Alert.alert(t('setOfflineTitle'), t('setOfflineBody'));
       return;
     }
     await processSyncQueue();
-    Alert.alert('Sync Triggered', 'Sync process completed.');
+    Alert.alert(t('setSyncDoneTitle'), t('setSyncDoneBody'));
   };
 
   const handleLogout = () => {
-    Alert.alert('Logout', 'Are you sure you want to logout?', [
-      { text: 'Cancel', style: 'cancel' },
-      { text: 'Logout', style: 'destructive', onPress: logout },
+    Alert.alert(t('setLogout'), t('setLogoutConfirm'), [
+      { text: t('commonCancel'), style: 'cancel' },
+      { text: t('setLogout'), style: 'destructive', onPress: logout },
     ]);
   };
 
@@ -88,28 +113,30 @@ export const SettingsScreen = () => {
     <SafeAreaView style={styles.safe}>
       {/* Header */}
       <View style={styles.header}>
-        <Text style={styles.headerTitle}>Settings</Text>
+        <Text style={styles.headerTitle}>{t('setTitle')}</Text>
       </View>
 
       <ScreenContainer scrollable={true} hasTabBar={true} contentContainerStyle={styles.scrollContent}>
 
         {/* ── Account Section ── */}
         <View style={styles.section}>
-          <Text style={styles.sectionLabel}>ACCOUNT</Text>
+          <Text style={styles.sectionLabel}>{t('setAccount')}</Text>
           <View style={styles.profileRow}>
             {/* Profile picture */}
             <TouchableOpacity
               onPress={handlePickProfilePic}
               disabled={uploadingPic}
               style={styles.avatarWrap}
+              accessibilityRole="button"
+              accessibilityLabel={t('setChangePicture')}
             >
               {uploadingPic ? (
-                <View style={[styles.avatarCircle, { justifyContent: 'center', alignItems: 'center' }]}>
-                  <ActivityIndicator size="small" color={Colors.primary} />
+                <View style={[styles.avatarCircle, styles.avatarPlaceholder]}>
+                  <ActivityIndicator size="small" color={color.accent} />
                 </View>
-              ) : user?.pictureUrl ? (
+              ) : avatarUri ? (
                 <Image
-                  source={{ uri: user.pictureUrl }}
+                  source={{ uri: avatarUri }}
                   style={styles.avatarCircle}
                 />
               ) : (
@@ -121,11 +148,11 @@ export const SettingsScreen = () => {
               )}
               {/* Camera badge */}
               <View style={styles.cameraBadge}>
-                <Text style={{ fontSize: 10 }}>📷</Text>
+                <Icon name="camera" size={12} tint={color.textInverse} />
               </View>
             </TouchableOpacity>
 
-            <View style={{ flex: 1 }}>
+            <View style={styles.profileText}>
               <Text style={styles.userName}>{user?.name}</Text>
               <Text style={styles.userPhone}>{user?.phone}</Text>
               {user?.businessName && (
@@ -138,16 +165,98 @@ export const SettingsScreen = () => {
             style={styles.changePasswordBtn}
             onPress={() => navigation.navigate('ChangePassword')}
           >
-            <Text style={styles.changePasswordText}>Change Password</Text>
+            <Icon name="lock" size={iconSize.sm} tint={color.accent} />
+            <Text style={styles.changePasswordText}>{t('setChangePassword')}</Text>
           </TouchableOpacity>
+          {/* Staff and sub-staff are added and removed in Staff Book (Add staff / Remove),
+              which creates the login and the staff profile together. */}
 
-          <TouchableOpacity
-            style={[styles.changePasswordBtn, { marginTop: 10 }]}
-            onPress={() => navigation.navigate('SubStaff')}
-          >
-            <Text style={styles.changePasswordText}>Manage Sub-Staff</Text>
-          </TouchableOpacity>
+          {/* DEV-ONLY testing tool — never rendered in a release build. */}
+          {__DEV__ && user?.role === 'admin' && (
+            <TouchableOpacity
+              style={[styles.changePasswordBtn, styles.devBtn]}
+              onPress={() => Alert.alert(
+                t('setWipeTitle'),
+                t('setWipeBody'),
+                [
+                  { text: t('commonCancel'), style: 'cancel' },
+                  {
+                    text: t('setWipe'), style: 'destructive',
+                    onPress: async () => {
+                      try {
+                        const { wipeNonAdminStaffForTesting } = await import('../../services/database/devWipe');
+                        const r = await wipeNonAdminStaffForTesting();
+                        Alert.alert(t('setWipedTitle'), t('setWipedBody', { users: r.users, records: r.staffRecords }));
+                      } catch (e: any) {
+                        Alert.alert(t('commonError'), e?.message || t('setWipeFailed'));
+                      }
+                    },
+                  },
+                ]
+              )}
+            >
+              <Icon name="alert-triangle" size={iconSize.sm} tint={color.attention} />
+              <Text style={styles.devText}>{t('setDevWipe')}</Text>
+            </TouchableOpacity>
+          )}
+
+          {/* DEV-ONLY — removes the retired sub-staff LEVEL. Their profiles survive as
+              no-login records; only the logins and the rows they wrote go. */}
+          {__DEV__ && user?.role === 'admin' && (
+            <TouchableOpacity
+              style={[styles.changePasswordBtn, styles.devBtn]}
+              onPress={() => Alert.alert(
+                t('setWipeSubTitle'),
+                t('setWipeSubBody'),
+                [
+                  { text: t('commonCancel'), style: 'cancel' },
+                  {
+                    text: t('setWipe'), style: 'destructive',
+                    onPress: async () => {
+                      try {
+                        const { wipeSubStaffLoginsForTesting } = await import('../../services/database/devWipe');
+                        const r = await wipeSubStaffLoginsForTesting();
+                        const rows = Object.entries(r.entries).reduce((sum, [, n]) => sum + n, 0);
+                        Alert.alert(
+                          t('setWipedTitle'),
+                          t('setWipedSubBody', { logins: r.logins, records: r.unlinkedRecords, rows }),
+                        );
+                      } catch (e: any) {
+                        Alert.alert(t('commonError'), e?.message || t('setWipeFailed'));
+                      }
+                    },
+                  },
+                ]
+              )}
+            >
+              <Icon name="alert-triangle" size={iconSize.sm} tint={color.attention} />
+              <Text style={styles.devText}>{t('setDevWipeSub')}</Text>
+            </TouchableOpacity>
+          )}
         </View>
+
+        {/* ── My documents ──
+            What the admin attached to this account's staff profile. Read-only: the
+            admin owns these, and this account only ever needs to open them. Hidden
+            entirely for an admin, who has no staff profile and so no documents. */}
+        {ownDocuments.length > 0 && (
+          <View style={styles.section}>
+            <Text style={styles.sectionLabel}>{t('commonAttachments')}</Text>
+            {ownDocuments.map((doc, idx) => (
+              <TouchableOpacity
+                key={idx}
+                style={[styles.docRow, idx > 0 && styles.docRowBorder]}
+                onPress={() => openAttachment(doc)}
+                accessibilityRole="button"
+                accessibilityLabel={documentLabel(doc)}
+              >
+                <Icon name="paperclip" size={iconSize.sm} tint={color.textSecondary} />
+                <Text style={styles.docText} numberOfLines={1}>{documentLabel(doc)}</Text>
+                <Icon name="chevron-right" size={iconSize.sm} tint={color.textMuted} />
+              </TouchableOpacity>
+            ))}
+          </View>
+        )}
 
         {/* ── UI Language ── */}
         <View style={styles.section}>
@@ -173,49 +282,29 @@ export const SettingsScreen = () => {
           </View>
         </View>
 
-        {/* ── Display Language ── */}
-        <View style={styles.section}>
-          <Text style={styles.sectionLabel}>{t('nameDisplayLabel')}</Text>
-          <Text style={styles.sectionSubtitle}>{t('nameDisplayHelp')}</Text>
-
-          <TouchableOpacity
-            style={styles.radioRow}
-            onPress={() => setNameDisplayMode(user!.id, 'en')}
-          >
-            <RadioDot active={nameDisplayMode === 'en'} />
-            <Text style={styles.radioLabel}>{t('english')}</Text>
-          </TouchableOpacity>
-
-          <TouchableOpacity
-            style={styles.radioRow}
-            onPress={() => setNameDisplayMode(user!.id, 'ur')}
-          >
-            <RadioDot active={nameDisplayMode === 'ur'} />
-            <Text style={styles.radioLabel}>{t('urduFallback')}</Text>
-          </TouchableOpacity>
-
-          <TouchableOpacity
-            style={styles.radioRow}
-            onPress={() => setNameDisplayMode(user!.id, 'both')}
-          >
-            <RadioDot active={nameDisplayMode === 'both'} />
-            <Text style={styles.radioLabel}>{t('bothNames')}</Text>
-          </TouchableOpacity>
-        </View>
-
         {/* ── Sync Status ── */}
         <View style={styles.section}>
-          <Text style={styles.sectionLabel}>SYNC STATUS</Text>
+          <Text style={styles.sectionLabel}>{t('setSyncStatus')}</Text>
+          {/* With no Firebase there is no backup at all, and pendingCount is 0 because
+              nothing is ever queued — so the screen used to report everything as synced.
+              That is a false assurance about data safety: a shopkeeper would believe
+              their records were safe off the phone. Say plainly that they are not. */}
           <View style={styles.syncRow}>
-            <Text style={{ fontSize: 20, marginRight: 10 }}>
-              {pendingCount === 0 ? '✅' : '🔄'}
-            </Text>
-            <View style={{ flex: 1 }}>
+            <Icon
+              name={!IS_FIREBASE_CONFIGURED ? 'alert-circle' : pendingCount === 0 ? 'check-circle' : 'refresh-cw'}
+              size={iconSize.lg}
+              tint={!IS_FIREBASE_CONFIGURED || pendingCount > 0 ? color.attention : color.textSecondary}
+            />
+            <View style={styles.syncText}>
               <Text style={styles.syncStatusText}>
-                {pendingCount === 0 ? 'All changes synced' : `${pendingCount} changes pending sync`}
+                {!IS_FIREBASE_CONFIGURED
+                  ? t('setSyncLocalOnly')
+                  : pendingCount === 0 ? t('setSyncAllSynced') : t('setSyncPending', { count: String(pendingCount) })}
               </Text>
               <Text style={styles.syncStatusSub}>
-                {pendingCount === 0 ? 'Up to date' : 'Will sync when online'}
+                {!IS_FIREBASE_CONFIGURED
+                  ? t('setSyncLocalOnlySub')
+                  : pendingCount === 0 ? t('setSyncUpToDate') : t('setSyncWillSync')}
               </Text>
             </View>
           </View>
@@ -228,243 +317,109 @@ export const SettingsScreen = () => {
             disabled={!isOnline || isSyncing}
           >
             <Text style={[styles.syncBtnText, (!isOnline || isSyncing) && styles.syncBtnTextDisabled]}>
-              {isSyncing ? 'Syncing...' : 'Sync Now'}
+              {isSyncing ? 'Syncing…' : 'Sync now'}
             </Text>
           </TouchableOpacity>
         </View>
 
         {/* ── Logout ── */}
         <TouchableOpacity style={styles.logoutBtn} onPress={handleLogout}>
-          <Text style={styles.logoutText}>Logout</Text>
+          <Icon name="log-out" size={iconSize.sm} tint={color.textPrimary} />
+          <Text style={styles.logoutText}>{t('setLogout')}</Text>
         </TouchableOpacity>
 
       </ScreenContainer>
+      {attachmentViewer}
     </SafeAreaView>
   );
 };
 
 const styles = StyleSheet.create({
-  safe: {
-    flex: 1,
-    backgroundColor: Colors.bgPrimary,
-  },
+  safe: { flex: 1, backgroundColor: color.surface },
 
   header: {
-    backgroundColor: Colors.bgCard,
-    paddingHorizontal: 16,
-    paddingVertical: 16,
-    borderBottomWidth: 1,
-    borderBottomColor: Colors.border,
+    backgroundColor: color.surface, paddingHorizontal: space.lg, minHeight: 56, justifyContent: 'center',
+    borderBottomWidth: hairline, borderBottomColor: color.border,
   },
-  headerTitle: {
-    fontSize: 20,
-    fontWeight: '800',
-    color: Colors.textWhite,
-  },
+  headerTitle: { ...typeScale.title, color: color.textPrimary },
 
-  scrollContent: {
-    paddingHorizontal: 16,
-    paddingTop: 20,
-    paddingBottom: 40,
-  },
+  scrollContent: { paddingHorizontal: space.lg, paddingTop: space.xl, paddingBottom: 40 },
 
   // ── Section ──
   section: {
-    backgroundColor: Colors.bgCard,
-    borderRadius: 16,
-    padding: 16,
-    marginBottom: 14,
-    borderWidth: 1,
-    borderColor: Colors.border,
+    backgroundColor: color.surface, borderRadius: radius.lg, padding: space.lg, marginBottom: space.md,
+    borderWidth: hairline, borderColor: color.border,
   },
-  sectionLabel: {
-    fontSize: 11,
-    fontWeight: '700',
-    color: Colors.textMuted,
-    letterSpacing: 1,
-    marginBottom: 14,
-    textTransform: 'uppercase',
-  },
-  sectionSubtitle: {
-    fontSize: 14,
-    fontWeight: '600',
-    color: Colors.textGray,
-    marginBottom: 12,
-  },
+  sectionLabel: { ...typeScale.label, color: color.textSecondary, marginBottom: space.md },
+  // Same row shape as the Staff Book document list, so an attachment looks the same
+  // wherever it is opened from.
+  docRow: { flexDirection: 'row', alignItems: 'center', gap: space.sm, paddingVertical: space.md, minHeight: touchTarget },
+  docRowBorder: { borderTopWidth: hairline, borderTopColor: color.border },
+  docText: { ...typeScale.body, color: color.textPrimary, flex: 1 },
+  sectionSubtitle: { ...typeScale.body, color: color.textSecondary, marginBottom: space.md },
 
   // ── Profile ──
-  profileRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    marginBottom: 14,
-  },
-  avatarWrap: {
-    marginRight: 16,
-    position: 'relative',
-  },
-  avatarCircle: {
-    width: 64,
-    height: 64,
-    borderRadius: 32,
-    borderWidth: 2,
-    borderColor: Colors.primary,
-  },
-  avatarPlaceholder: {
-    backgroundColor: Colors.bgInput,
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  avatarInitial: {
-    color: Colors.primary,
-    fontSize: 24,
-    fontWeight: '800',
-  },
+  profileRow: { flexDirection: 'row', alignItems: 'center', gap: space.lg, marginBottom: space.md },
+  avatarWrap: { position: 'relative' },
+  avatarCircle: { width: 64, height: 64, borderRadius: radius.pill, borderWidth: hairline, borderColor: color.border },
+  avatarPlaceholder: { backgroundColor: color.surfaceRaised, justifyContent: 'center', alignItems: 'center' },
+  avatarInitial: { ...typeScale.title, fontSize: 24, color: color.textPrimary },
   cameraBadge: {
-    position: 'absolute',
-    bottom: 0,
-    right: 0,
-    width: 22,
-    height: 22,
-    borderRadius: 11,
-    backgroundColor: Colors.primary,
-    alignItems: 'center',
-    justifyContent: 'center',
-    borderWidth: 2,
-    borderColor: Colors.bgCard,
+    position: 'absolute', bottom: 0, right: 0, width: 24, height: 24, borderRadius: radius.pill,
+    backgroundColor: color.accent, alignItems: 'center', justifyContent: 'center',
+    borderWidth: 2, borderColor: color.surface,
   },
-  userName: {
-    color: Colors.textWhite,
-    fontSize: 17,
-    fontWeight: '700',
-  },
-  userPhone: {
-    color: Colors.textGray,
-    fontSize: 13,
-    marginTop: 2,
-  },
-  userBiz: {
-    color: Colors.textMuted,
-    fontSize: 12,
-    marginTop: 2,
-  },
+  profileText: { flex: 1 },
+  userName: { ...typeScale.heading, fontSize: 17, color: color.textPrimary },
+  userPhone: { ...typeScale.label, color: color.textSecondary, marginTop: 2 },
+  userBiz: { ...typeScale.caption, color: color.textMuted, marginTop: 2 },
   changePasswordBtn: {
-    backgroundColor: Colors.bgInput,
-    paddingVertical: 12,
-    borderRadius: 12,
-    alignItems: 'center',
-    borderWidth: 1,
-    borderColor: Colors.border,
+    flexDirection: 'row', gap: space.sm, justifyContent: 'center', alignItems: 'center',
+    backgroundColor: color.surface, minHeight: touchTarget, borderRadius: radius.md,
+    borderWidth: hairline, borderColor: color.borderStrong,
   },
-  changePasswordText: {
-    color: Colors.primaryLight,
-    fontWeight: '700',
-    fontSize: 14,
-  },
+  changePasswordText: { ...typeScale.bodyMedium, color: color.accent },
+  devBtn: { marginTop: space.sm, borderColor: color.borderAttention },
+  devText: { ...typeScale.bodyMedium, color: color.attention },
 
   // ── Language ──
-  langRow: {
-    flexDirection: 'row',
-    gap: 10,
-  },
+  langRow: { flexDirection: 'row', gap: space.md },
   langBtn: {
-    flex: 1,
-    paddingVertical: 11,
-    borderRadius: 12,
-    alignItems: 'center',
-    borderWidth: 1.5,
-    borderColor: Colors.border,
-    backgroundColor: Colors.bgInput,
+    flex: 1, minHeight: touchTarget, borderRadius: radius.md, alignItems: 'center', justifyContent: 'center',
+    borderWidth: hairline, borderColor: color.borderStrong, backgroundColor: color.surface,
   },
-  langBtnActive: {
-    backgroundColor: Colors.primary,
-    borderColor: Colors.primary,
-  },
-  langBtnText: {
-    fontSize: 14,
-    fontWeight: '700',
-    color: Colors.textGray,
-  },
-  langBtnTextActive: {
-    color: Colors.textWhite,
-  },
+  langBtnActive: { backgroundColor: color.accent, borderColor: color.accent },
+  langBtnText: { ...typeScale.bodyMedium, color: color.textSecondary },
+  langBtnTextActive: { color: color.textInverse },
 
   // ── Radio ──
-  radioRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    marginBottom: 14,
-  },
+  radioRow: { flexDirection: 'row', alignItems: 'center', minHeight: touchTarget, gap: space.md },
   radioDot: {
-    width: 20,
-    height: 20,
-    borderRadius: 10,
-    borderWidth: 2,
-    borderColor: Colors.border,
-    marginRight: 12,
-    alignItems: 'center',
-    justifyContent: 'center',
+    width: 20, height: 20, borderRadius: radius.pill, borderWidth: 2, borderColor: color.borderStrong,
+    alignItems: 'center', justifyContent: 'center',
   },
-  radioDotInner: {
-    width: 10,
-    height: 10,
-    borderRadius: 5,
-    backgroundColor: Colors.primary,
-  },
-  radioLabel: {
-    color: Colors.textGray,
-    fontSize: 14,
-    fontWeight: '500',
-  },
+  radioDotActive: { borderColor: color.accent },
+  radioDotInner: { width: 10, height: 10, borderRadius: radius.pill, backgroundColor: color.accent },
+  radioLabel: { ...typeScale.body, color: color.textPrimary, flex: 1 },
 
   // ── Sync ──
-  syncRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    marginBottom: 14,
-  },
-  syncStatusText: {
-    color: Colors.textWhite,
-    fontSize: 14,
-    fontWeight: '600',
-  },
-  syncStatusSub: {
-    color: Colors.textMuted,
-    fontSize: 12,
-    marginTop: 2,
-  },
+  syncRow: { flexDirection: 'row', alignItems: 'center', gap: space.md, marginBottom: space.md },
+  syncText: { flex: 1 },
+  syncStatusText: { ...typeScale.bodyMedium, color: color.textPrimary },
+  syncStatusSub: { ...typeScale.caption, color: color.textMuted, marginTop: 2 },
   syncBtn: {
-    backgroundColor: Colors.bgInput,
-    paddingVertical: 12,
-    borderRadius: 12,
-    alignItems: 'center',
-    borderWidth: 1,
-    borderColor: Colors.primaryGlow,
+    backgroundColor: color.surface, minHeight: touchTarget, borderRadius: radius.md,
+    alignItems: 'center', justifyContent: 'center', borderWidth: hairline, borderColor: color.borderStrong,
   },
-  syncBtnDisabled: {
-    borderColor: Colors.border,
-    opacity: 0.5,
-  },
-  syncBtnText: {
-    color: Colors.primary,
-    fontWeight: '700',
-    fontSize: 14,
-  },
-  syncBtnTextDisabled: {
-    color: Colors.textMuted,
-  },
+  syncBtnDisabled: { borderColor: color.border },
+  syncBtnText: { ...typeScale.bodyMedium, color: color.accent },
+  syncBtnTextDisabled: { color: color.textMuted },
 
-  // ── Logout ──
+  // ── Logout ── (not money, so not red: a plain outlined action)
   logoutBtn: {
-    backgroundColor: 'rgba(239, 68, 68, 0.1)',
-    borderWidth: 1,
-    borderColor: 'rgba(239, 68, 68, 0.3)',
-    borderRadius: 16,
-    paddingVertical: 16,
-    alignItems: 'center',
+    flexDirection: 'row', gap: space.sm, justifyContent: 'center', alignItems: 'center',
+    backgroundColor: color.surface, borderWidth: hairline, borderColor: color.borderStrong,
+    borderRadius: radius.lg, minHeight: 52,
   },
-  logoutText: {
-    color: Colors.error,
-    fontWeight: '700',
-    fontSize: 15,
-  },
+  logoutText: { ...typeScale.bodyMedium, color: color.textPrimary },
 });

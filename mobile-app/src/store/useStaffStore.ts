@@ -2,9 +2,9 @@ import { create } from 'zustand';
 import { StaffRecord } from '../types/staff.types';
 import { 
   getStaffRecords, 
-  addStaffRecord, 
   getStaffStats 
 } from '../services/database/staffDb';
+import { createStaffMember, NewStaffInput } from '../services/database/managedAccountDb';
 
 interface StaffStore {
   staff: StaffRecord[];
@@ -13,7 +13,11 @@ interface StaffStore {
   stats: { total: number; active: number; inactive: number };
 
   fetchStaff: (userId: string) => Promise<void>;
-  addStaff: (staffData: Omit<StaffRecord, 'id' | 'created_at' | 'synced' | 'is_deleted'>) => Promise<void>;
+/**
+   * Creates the staff member's login AND their staff_record together, linked.
+   * Resolves to the created record, so the caller has its id (e.g. to file the staff photo under it).
+   */
+  addStaff: (input: NewStaffInput) => Promise<StaffRecord>;
   loadStats: (userId: string) => Promise<void>;
 }
 
@@ -34,10 +38,11 @@ export const useStaffStore = create<StaffStore>((set) => ({
     }
   },
 
-  addStaff: async (staffData) => {
+  addStaff: async (input) => {
     try {
-      const newStaff = await addStaffRecord(staffData);
+      const { staff: newStaff } = await createStaffMember(input);
       set(state => ({ staff: [newStaff, ...state.staff] }));
+      return newStaff;
     } catch (err) {
       if (__DEV__) console.error(err);
       throw err;

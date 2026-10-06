@@ -29,7 +29,7 @@ interface SupplierState {
     userId: string, supplierId: string, amount: number, paymentDate: string,
     paymentMethod: SupplierPayment['payment_method'], invoiceId?: string,
     reference?: string, notes?: string
-  ) => Promise<void>;
+  ) => Promise<SupplierPayment>;
   clearSelected: () => void;
 }
 
@@ -100,13 +100,14 @@ export const useSupplierStore = create<SupplierState>((set, get) => ({
   },
 
   recordPayment: async (userId, supplierId, amount, paymentDate, paymentMethod, invoiceId, reference, notes) => {
-    await addSupplierPayment(userId, supplierId, amount, paymentDate, paymentMethod, invoiceId, reference, notes);
+    const payment = await addSupplierPayment(userId, supplierId, amount, paymentDate, paymentMethod, invoiceId, reference, notes);
     // Reload ledger and supplier details
     await Promise.all([
       get().loadSupplierLedger(supplierId),
       get().loadSupplierById(supplierId),
       get().loadSuppliers(userId),
     ]);
+    return payment;
   },
 
   clearSelected: () => set({ selectedSupplier: null, ledger: [], payments: [] }),

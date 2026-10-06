@@ -1,20 +1,32 @@
-import React, { useState, useRef, useCallback, useMemo } from 'react';
+import React, { useState, useRef, useCallback, useMemo, useEffect } from 'react';
+import { useLanguageStore } from '../../store/useLanguageStore';
 import { View, Text, SectionList, TouchableOpacity, Alert, TextInput, StyleSheet, ActivityIndicator } from 'react-native';
 import { useFocusEffect } from '@react-navigation/native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useAuthStore } from '../../store/authStore';
-import { getFilteredKhata, getKhataDayTotals, KhataDayTotal } from '../../services/database/transactionDb';
+import { getFilteredKhata, getKhataDayTotals, getKhataGrandTotals, KhataDayTotal, PartyBalance } from '../../services/database/transactionDb';
+import { CustomerBalanceList } from '../../components/khata/CustomerBalanceList';
 import { PAGE_SIZE, PageCursor } from '../../services/database/pagination';
 import { DateRangeFilter, DateRange, describeRange } from '../../components/ui/DateRangeFilter';
 import { thisMonthRange, toDateValue, formatDisplayDate } from '../../utils/dates';
 import { TransactionItem } from '../../components/TransactionItem';
 import { Transaction } from '../../types';
-import { formatCurrency } from '../../utils/calculations';
 import { generateTransactionPDF } from '../../utils/pdfGenerator';
-import { themeColors } from '../../theme/theme';
+import { Icon, AmountText } from '../../components/ui/primitives';
+import { PdfReportButton } from '../../components/ui/PdfReportButton';
+import { ReadOnlyBanner } from '../../components/ui/ReadOnlyBanner';
+import { color, space, radius, hairline, touchTarget, iconSize, type as typeScale, chrome } from '../../theme/tokens';
 
-export const KhataScreen = ({ navigation }: any) => {
+export const KhataScreen = ({ navigation, route }: any) => {
   const { user } = useAuthStore();
+  const { t } = useLanguageStore();
+  // Khata opens on WHO OWES WHAT. The transaction list is still here under Activity —
+  // it answers "what happened today", which is a real question, just not the first one.
+  const [tab, setTab] = useState<'customers' | 'activity'>('customers');
+  // All-time, SQL, over the whole searched set — never summed from the loaded page.
+  const [grand, setGrand] = useState<{ totalLena: number; totalDena: number; netBalance: number } | null>(null);
+  // Staff Book → staff → Entries → Khata: that person's khata, read-only.
+  const viewAs: { userId: string; name: string } | undefined = route?.params?.viewAs;
   // Rows are PAGED (keyset, PAGE_SIZE at a time); Total Lena / Dena / Net and the
   // per-day subtotals are SQL aggregates over the WHOLE filtered set, fetched once
   // per filter change — never from loaded rows.
@@ -32,7 +44,10 @@ export const KhataScreen = ({ navigation }: any) => {
   const [filterType, setFilterType] = useState<'all' | 'lena' | 'dena'>('all');
   const [searchQuery, setSearchQuery] = useState('');
 
-  const activeFilter = useMemo(() => ({ ...range, type: filterType, search: searchQuery }), [range, filterType, searchQuery]);
+  const activeFilter = useMemo(
+    () => ({ ...range, type: filterType, search: searchQuery, ...(viewAs ? { createdBy: viewAs.userId } : {}) }),
+    [range, filterType, searchQuery, viewAs?.userId]
+  );
 
   const load = useCallback(async () => {
     const current = ++request.current;
@@ -95,68 +110,101 @@ export const KhataScreen = ({ navigation }: any) => {
 
   const result = summary;
   const balanceSummary = summary || { totalLena: 0, totalDena: 0, netBalance: 0 };
+  // Customers shows ALL-TIME balances, Activity shows the selected range. Both come
+  // from SQL over the whole set; neither is summed from the rows on screen.
+  const shown = tab === 'customers' ? grand : (result ? balanceSummary : null);
+
+  // The header must describe exactly the list beneath it, so it follows the same search.
+  useEffect(() => {
+    if (!user?.id || tab !== 'customers') return;
+    let live = true;
+    const id = setTimeout(() => {
+      getKhataGrandTotals(user.id, { search: searchQuery }, viewAs?.userId)
+        .then(g => { if (live) setGrand(g); })
+        .catch(e => { if (__DEV__) console.error('[Khata] grand totals failed:', e); });
+    }, 250);
+    return () => { live = false; clearTimeout(id); };
+  }, [user?.id, tab, searchQuery, viewAs?.userId]);
 
   const handleGeneratePDF = async () => {
     if (!user?.id) return;
     try {
       // The export covers the WHOLE filtered range, not just the pages loaded so far.
-      const { transactions: all } = await getFilteredKhata(user.id, activeFilter);
+      const { transactions: all, balanceSummary: totals } = await getFilteredKhata(user.id, activeFilter);
       if (all.length === 0) {
-        Alert.alert('No Data', 'No transactions to export');
+        Alert.alert(t('noData'), t('khataNothingToExport'));
         return;
       }
-      await generateTransactionPDF(all, user?.businessName || 'My Business', user?.name || 'Staff');
+      // Totals from the same SQL summary the screen shows — never re-added in JS.
+      await generateTransactionPDF(all, user?.businessName || 'My Business', viewAs?.name || user?.name || 'Staff', viewAs ? `Khata report · ${viewAs.name}` : 'Khata report', totals);
     } catch {
-      Alert.alert('Error', 'Failed to generate PDF');
+      Alert.alert(t('errorTitle'), t('khataPdfFailed'));
     }
   };
 
-  // Day header — the day's own Lena (credit given) and Dena (payment received),
-  // the ledger's vocabulary, in the summary bar's colours.
+  // Day header — the day's own Lena (credit given: money out, red) and Dena (payment
+  // taken: money in, green). The words carry it too, never colour alone.
   const renderSectionHeader = useCallback(({ section }: { section: { day: string } }) => {
-    const t = dayTotals.get(section.day);
+    const day = dayTotals.get(section.day);
     return (
       <View style={styles.dayHeader}>
-        <View style={{ flex: 1 }}>
+        <View style={styles.dayLeft}>
           <Text style={styles.dayTitle}>{formatDisplayDate(section.day)}</Text>
-          {t && <Text style={styles.dayCount}>{t.entryCount} {t.entryCount === 1 ? 'Entry' : 'Entries'}</Text>}
+          {day && <Text style={styles.dayCount}>{day.entryCount} {t(day.entryCount === 1 ? 'khataEntrySingular' : 'khataEntryPlural')}</Text>}
         </View>
-        {t && (
+        {day && (
           <View style={styles.dayRight}>
-            <View style={styles.dayCols}>
-              <Text style={[styles.dayColLabel, styles.textGreen]}>Lena</Text>
-              <Text style={[styles.dayColLabel, styles.textRed]}>Dena</Text>
+            <View style={styles.dayFigure}>
+              <Text style={styles.dayColLabel}>{t('khataLena')}</Text>
+              <AmountText paisa={day.lena} tone="out" size="label" />
             </View>
-            <View style={styles.dayCols}>
-              <Text style={[styles.dayColVal, styles.textGreen]}>{formatCurrency(t.lena)}</Text>
-              <Text style={[styles.dayColVal, styles.textRed]}>{formatCurrency(t.dena)}</Text>
+            <View style={styles.dayFigure}>
+              <Text style={styles.dayColLabel}>{t('khataDena')}</Text>
+              <AmountText paisa={day.dena} tone="in" size="label" />
             </View>
           </View>
         )}
       </View>
     );
-  }, [dayTotals]);
+  }, [dayTotals, t]);
 
   const renderTransactionItem = React.useCallback(({ item }: { item: Transaction }) => (
     <TransactionItem
       transaction={item}
-      onPress={() => navigation.navigate('EditTransaction', { transactionId: item.id })}
+      onPress={() => { if (!viewAs) navigation.navigate('EditTransaction', { transactionId: item.id }); }}
     />
-  ), [navigation]);
+  ), [navigation, viewAs]);
 
   return (
     <SafeAreaView style={styles.safe}>
-      {/* Dark Header */}
+      {viewAs && <ReadOnlyBanner name={viewAs.name} book="Khata" onBack={() => navigation.goBack()} />}
+      {/* Header */}
       <View style={styles.header}>
         <View style={styles.headerRow}>
-          <Text style={styles.headerTitle}>Khata (Ledger)</Text>
-          <TouchableOpacity onPress={handleGeneratePDF} style={styles.pdfBtn}>
-            <Text style={styles.pdfBtnText}>📄 Export PDF</Text>
-          </TouchableOpacity>
+          <Text style={styles.headerTitle}>{t('khataTitle')}</Text>
+          {tab === 'activity' && <PdfReportButton onPress={handleGeneratePDF} />}
         </View>
 
-        {/* Filter Pills */}
-        <View style={styles.filterRow}>
+        {/* Customers first, Activity second — the default answers the question a
+            shopkeeper actually opens the app with. */}
+        <View style={styles.tabRow}>
+          {(['customers', 'activity'] as const).map(key => (
+            <TouchableOpacity
+              key={key}
+              onPress={() => setTab(key)}
+              accessibilityRole="tab"
+              accessibilityState={{ selected: tab === key }}
+              style={[styles.tabBtn, tab === key && styles.tabBtnActive]}
+            >
+              <Text style={[styles.tabText, tab === key && styles.tabTextActive]} numberOfLines={1}>
+                {key === 'customers' ? t('khataTabCustomers') : t('khataTabActivity')}
+              </Text>
+            </TouchableOpacity>
+          ))}
+        </View>
+
+        {/* Filter Pills — Activity only: a balance has no type to filter by. */}
+        {tab === 'activity' && <View style={styles.filterRow}>
           {(['all', 'lena', 'dena'] as const).map(f => (
             <TouchableOpacity
               key={f}
@@ -164,60 +212,76 @@ export const KhataScreen = ({ navigation }: any) => {
               onPress={() => setFilterType(f)}
             >
               <Text style={[styles.filterText, filterType === f && styles.filterTextActive]}>
-                {f === 'all' ? 'All' : f.charAt(0).toUpperCase() + f.slice(1)}
+                {f === 'all' ? t('khataAll') : f === 'lena' ? t('khataLena') : t('khataDena')}
               </Text>
             </TouchableOpacity>
           ))}
-        </View>
+        </View>}
 
-        {/* Dark Search Input */}
-        <TextInput
-          style={styles.searchInput}
-          placeholder="Search by party name or notes..."
-          placeholderTextColor={themeColors.textSecondary}
-          value={searchQuery}
-          onChangeText={setSearchQuery}
-        />
-        <DateRangeFilter value={range} onChange={setRange}
-          fieldStyle={styles.searchInput} textStyle={styles.filterText} />
+        {/* Search */}
+        <View style={styles.searchBox}>
+          <Icon name="search" size={iconSize.sm} tint={color.textMuted} />
+          <TextInput
+            style={styles.searchInput}
+            placeholder={t('khataSearchPlaceholder')}
+            placeholderTextColor={color.textMuted}
+            value={searchQuery}
+            onChangeText={setSearchQuery}
+          />
+        </View>
+        {/* A balance is all-time, so a date range only makes sense for Activity. */}
+        {tab === 'activity' && (
+          <DateRangeFilter value={range} onChange={setRange}
+            fieldStyle={styles.rangeField} textStyle={styles.rangeText} />
+        )}
       </View>
 
-      {/* Summary Bar — for the SELECTED RANGE (this month by default) */}
+      {/* Summary Bar — for the SELECTED RANGE (this month by default). Lena (credit
+          given) red, Dena (payment taken) green; the net is a balance: neutral ink. */}
       <View style={styles.summaryBar}>
-        <View style={{ flex: 1, alignItems: 'center' }}>
-          <Text style={styles.summaryLabel}>Total Lena</Text>
-          <Text style={[styles.summaryVal, styles.textGreen]}>{result ? formatCurrency(balanceSummary.totalLena) : '—'}</Text>
+        <View style={styles.summaryItem}>
+          <Text style={styles.summaryLabel}>{t('khataTotalLena')}</Text>
+          {shown ? <AmountText paisa={shown.totalLena} tone="out" fit /> : <Text style={styles.summaryDash}>—</Text>}
         </View>
         <View style={styles.vertDivider} />
-        <View style={{ flex: 1, alignItems: 'center' }}>
-          <Text style={styles.summaryLabel}>Total Dena</Text>
-          <Text style={[styles.summaryVal, styles.textRed]}>{result ? formatCurrency(balanceSummary.totalDena) : '—'}</Text>
+        <View style={styles.summaryItem}>
+          <Text style={styles.summaryLabel}>{t('khataTotalDena')}</Text>
+          {shown ? <AmountText paisa={shown.totalDena} tone="in" fit /> : <Text style={styles.summaryDash}>—</Text>}
         </View>
         <View style={styles.vertDivider} />
-        <View style={{ flex: 1, alignItems: 'center' }}>
-          <Text style={styles.summaryLabel}>Net Balance</Text>
-          <Text style={[styles.summaryVal, balanceSummary.netBalance >= 0 ? styles.textGreen : styles.textRed]}>
-            {result ? formatCurrency(balanceSummary.netBalance) : '—'}
-          </Text>
+        <View style={styles.summaryItem}>
+          <Text style={styles.summaryLabel}>{t('khataNetBalance')}</Text>
+          {shown ? <AmountText paisa={shown.netBalance} signed fit /> : <Text style={styles.summaryDash}>—</Text>}
         </View>
       </View>
 
-      {/* What the totals above cover, and the way to ALL-TIME balances per customer */}
-      <TouchableOpacity style={styles.ledgerLink} onPress={() => navigation.navigate('CustomerLedger')} activeOpacity={0.7}>
-        <Text style={styles.ledgerLinkText} numberOfLines={1}>Totals for {describeRange(range)}</Text>
-        <Text style={styles.ledgerLinkAction}>All-time balance per customer ›</Text>
-      </TouchableOpacity>
+      {/* Activity says what range its figures cover. Customers are always all-time. */}
+      {tab === 'activity' && (
+        <View style={styles.ledgerLink}>
+          <Text style={styles.ledgerLinkText} numberOfLines={1}>{t('khataTotalsFor', { range: describeRange(range) })}</Text>
+        </View>
+      )}
 
-      {loading ? (
-        <View style={styles.emptyContainer}><ActivityIndicator color={themeColors.primary} /></View>
+      {tab === 'customers' ? (
+        <CustomerBalanceList
+          userId={user!.id}
+          search={searchQuery}
+          viewAs={viewAs}
+          onOpen={(party: PartyBalance) => navigation.navigate('CustomerDetail', {
+            partyName: party.partyName, userId: user?.id, ...(viewAs ? { viewAs } : {}),
+          })}
+        />
+      ) : loading ? (
+        <View style={styles.emptyContainer}><ActivityIndicator color={color.accent} /></View>
       ) : error ? (
         <View style={styles.emptyContainer}>
           <Text style={styles.emptyText}>{error}</Text>
-          <TouchableOpacity onPress={load} style={styles.filterBtn}><Text style={styles.filterText}>Retry</Text></TouchableOpacity>
+          <TouchableOpacity onPress={load} style={styles.retryBtn}><Text style={styles.retryText}>{t('retry')}</Text></TouchableOpacity>
         </View>
       ) : transactions.length === 0 ? (
         <View style={styles.emptyContainer}>
-          <Text style={styles.emptyText}>No transactions found</Text>
+          <Icon name="book-open" size={40} tint={color.textMuted} />
+          <Text style={styles.emptyText}>{viewAs ? `${viewAs.name} has no khata entries in this range` : t('khataNoTransactions')}</Text>
         </View>
       ) : (
         <SectionList
@@ -226,13 +290,13 @@ export const KhataScreen = ({ navigation }: any) => {
           renderSectionHeader={renderSectionHeader}
           stickySectionHeadersEnabled
           keyExtractor={item => item.id}
-          contentContainerStyle={{ paddingHorizontal: 16, paddingTop: 14, paddingBottom: 140 }}
-          SectionSeparatorComponent={() => <View style={{ height: 8 }} />}
+          contentContainerStyle={styles.listContent}
+          SectionSeparatorComponent={() => <View style={styles.gap} />}
           refreshing={loading}
           onRefresh={load}
           onEndReached={loadMore}
           onEndReachedThreshold={0.5}
-          ListFooterComponent={loadingMore ? <ActivityIndicator style={{ margin: 16 }} color={themeColors.primary} /> : null}
+          ListFooterComponent={loadingMore ? <ActivityIndicator style={styles.footerSpinner} color={color.accent} /> : null}
           initialNumToRender={10}
           maxToRenderPerBatch={10}
           windowSize={5}
@@ -244,71 +308,88 @@ export const KhataScreen = ({ navigation }: any) => {
 };
 
 const styles = StyleSheet.create({
-  safe: { flex: 1, backgroundColor: themeColors.background },
+  safe: { flex: 1, backgroundColor: color.surface },
   header: {
-    backgroundColor: themeColors.cardBg,
-    paddingHorizontal: 16,
-    paddingTop: 12,
-    paddingBottom: 16,
-    borderBottomWidth: 1,
-    borderBottomColor: themeColors.border,
+    backgroundColor: color.surface, paddingHorizontal: space.lg, paddingTop: chrome.barPadY, paddingBottom: chrome.barPadY, gap: chrome.rowGap,
+    borderBottomWidth: hairline, borderBottomColor: color.border,
   },
-  headerRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 },
-  headerTitle: { fontSize: 20, fontWeight: '800', color: '#fff' },
-  pdfBtn: { backgroundColor: themeColors.inputBg, paddingHorizontal: 12, paddingVertical: 6, borderRadius: 8, borderWidth: 1, borderColor: themeColors.borderLight },
-  pdfBtnText: { color: '#1dd1a1', fontSize: 12, fontWeight: '700' },
+  headerRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', gap: space.md },
+  headerTitle: { ...typeScale.heading, color: color.textPrimary, flex: 1 },
 
-  filterRow: { flexDirection: 'row', gap: 8, marginBottom: 12 },
+  filterRow: { flexDirection: 'row', gap: space.sm },
+  // Segmented control. Equal halves so an Urdu label (~40% longer) has the same room
+  // as its English counterpart, and the whole row stays one line.
+  tabRow: {
+    flexDirection: 'row', backgroundColor: color.surfaceRaised,
+    borderRadius: radius.md, padding: space.xs, gap: space.xs,
+  },
+  tabBtn: {
+    flex: 1, minHeight: touchTarget - space.sm, borderRadius: radius.sm,
+    alignItems: 'center', justifyContent: 'center', paddingHorizontal: space.sm,
+  },
+  tabBtnActive: { backgroundColor: color.surface, borderWidth: hairline, borderColor: color.border },
+  tabText: { ...typeScale.label, color: color.textSecondary },
+  tabTextActive: { ...typeScale.bodyMedium, color: color.textPrimary },
   filterBtn: {
-    flex: 1, paddingVertical: 8, borderRadius: 10,
-    backgroundColor: themeColors.inputBg, borderWidth: 1, borderColor: themeColors.borderLight,
-    alignItems: 'center',
+    flex: 1, minHeight: chrome.barMinHeight, borderRadius: radius.pill, paddingHorizontal: space.sm,
+    backgroundColor: color.surface, borderWidth: hairline, borderColor: color.borderStrong,
+    alignItems: 'center', justifyContent: 'center',
   },
-  filterBtnActive: { backgroundColor: themeColors.primary, borderColor: '#1dd1a1' },
-  filterText: { fontSize: 13, fontWeight: '600', color: themeColors.textSecondary },
-  filterTextActive: { color: '#fff', fontWeight: '800' },
+  filterBtnActive: { backgroundColor: color.accent, borderColor: color.accent },
+  filterText: { ...typeScale.label, color: color.textSecondary },
+  filterTextActive: { color: color.textInverse, fontWeight: typeScale.bodyMedium.fontWeight },
 
-  searchInput: {
-    backgroundColor: themeColors.inputBg, borderWidth: 1, borderColor: themeColors.borderLight,
-    borderRadius: 12, paddingHorizontal: 16, paddingVertical: 10,
-    fontSize: 14, color: '#fff', minHeight: 44,
+  searchBox: {
+    flexDirection: 'row', alignItems: 'center', gap: space.sm,
+    backgroundColor: color.surfaceRaised, borderWidth: hairline, borderColor: color.border,
+    borderRadius: radius.md, paddingHorizontal: space.md, minHeight: chrome.barMinHeight,
   },
+  searchInput: { ...typeScale.body, flex: 1, color: color.textPrimary, paddingVertical: space.sm },
+  rangeField: {
+    backgroundColor: color.surfaceRaised, borderWidth: hairline, borderColor: color.border,
+    borderRadius: radius.md, paddingHorizontal: space.md, minHeight: touchTarget,
+  },
+  rangeText: { ...typeScale.label, color: color.textPrimary },
 
   summaryBar: {
-    flexDirection: 'row', justifyContent: 'space-around', alignItems: 'center',
-    backgroundColor: themeColors.cardBg, paddingVertical: 12, paddingHorizontal: 16,
-    borderBottomWidth: 1, borderBottomColor: themeColors.border,
-    shadowColor: '#000', shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.2, shadowRadius: 4, elevation: 3,
+    flexDirection: 'row', alignItems: 'center',
+    backgroundColor: color.surfaceRaised, paddingVertical: chrome.cardPadY, paddingHorizontal: space.sm,
+    borderBottomWidth: hairline, borderBottomColor: color.border,
   },
-  vertDivider: { width: 1, height: 28, backgroundColor: themeColors.border },
-  summaryLabel: { color: themeColors.textSecondary, fontSize: 11, fontWeight: '600' },
-  summaryVal: { fontSize: 15, fontWeight: '800', marginTop: 2 },
+  summaryItem: { flex: 1, alignItems: 'center', paddingHorizontal: space.xs },
+  vertDivider: { width: hairline, height: 28, backgroundColor: color.border },
+  summaryLabel: { ...typeScale.caption, color: color.textSecondary, marginBottom: 2 },
+  summaryDash: { ...typeScale.bodyMedium, color: color.textMuted },
 
-  textGreen: { color: themeColors.success },
-  textRed: { color: themeColors.error },
-
-  // Range caption + Customer Ledger link: the summary bar's surface, one slim row.
+  // Range caption + Customer Ledger link: one slim row under the summary.
   ledgerLink: {
-    flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', gap: 12,
-    backgroundColor: themeColors.cardBg, paddingVertical: 8, paddingHorizontal: 16,
-    borderBottomWidth: 1, borderBottomColor: themeColors.border,
+    flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', gap: space.md,
+    backgroundColor: color.surface, minHeight: chrome.barMinHeight, paddingHorizontal: space.lg,
+    borderBottomWidth: hairline, borderBottomColor: color.border,
   },
-  ledgerLinkText: { flex: 1, fontSize: 11, fontWeight: '600', color: themeColors.textSecondary },
-  ledgerLinkAction: { fontSize: 12, fontWeight: '800', color: '#1dd1a1', flexShrink: 0 },
+  ledgerLinkText: { ...typeScale.caption, flex: 1, color: color.textSecondary },
+  ledgerLinkActionWrap: { flexDirection: 'row', alignItems: 'center', gap: 2, flexShrink: 1 },
+  ledgerLinkAction: { ...typeScale.label, color: color.accent, flexShrink: 1 },
 
-  // Day header — the Cash Book day-header banner, with the ledger's Lena/Dena columns.
+  // Day header — a raised band with the day's Lena / Dena.
   dayHeader: {
-    flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center',
-    backgroundColor: themeColors.cardBg, borderRadius: 12, paddingVertical: 12, paddingHorizontal: 14,
-    borderWidth: 1, borderColor: themeColors.border, marginBottom: 8,
+    flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', gap: space.md,
+    backgroundColor: color.surfaceRaised, borderRadius: radius.md, paddingVertical: chrome.dayPadY, paddingHorizontal: space.md,
+    borderWidth: hairline, borderColor: color.border, marginBottom: chrome.cardMarginY,
   },
-  dayTitle: { fontSize: 13, fontWeight: '800', color: '#fff', letterSpacing: 0.5 },
-  dayCount: { fontSize: 12, color: themeColors.textSecondary, marginTop: 2 },
-  dayRight: { alignItems: 'flex-end' },
-  dayCols: { flexDirection: 'row', gap: 16 },
-  dayColLabel: { fontSize: 12, fontWeight: '700', minWidth: 60, textAlign: 'right', marginBottom: 2 },
-  dayColVal: { fontSize: 13, fontWeight: '800', minWidth: 60, textAlign: 'right', flexShrink: 0 },
+  dayLeft: { flex: 1 },
+  dayTitle: { ...typeScale.caption, color: color.textSecondary },
+  dayCount: { ...typeScale.caption, color: color.textSecondary, marginTop: 2 },
+  dayRight: { flexDirection: 'row', gap: space.lg, flexShrink: 0 },
+  dayFigure: { alignItems: 'flex-end' },
+  dayColLabel: { ...typeScale.caption, color: color.textSecondary, marginBottom: 2 },
 
-  emptyContainer: { flex: 1, justifyContent: 'center', alignItems: 'center', padding: 24 },
-  emptyText: { color: themeColors.textSecondary, fontSize: 15, fontWeight: '500' },
+  listContent: { paddingHorizontal: space.lg, paddingTop: space.md, paddingBottom: chrome.listBottom },
+  gap: { height: space.sm },
+  footerSpinner: { margin: space.lg },
+
+  emptyContainer: { flex: 1, justifyContent: 'center', alignItems: 'center', padding: space.xxl, gap: space.sm },
+  emptyText: { ...typeScale.body, color: color.textSecondary, textAlign: 'center' },
+  retryBtn: { minHeight: touchTarget, paddingHorizontal: space.lg, justifyContent: 'center' },
+  retryText: { ...typeScale.bodyMedium, color: color.accent },
 });

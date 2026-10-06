@@ -1,6 +1,6 @@
 {
   "expo": {
-    "name": "DigiKhata",
+    "name": "AL-REEF",
     "slug": "digikhata-app",
     "version": "1.0.0",
     "entryPoint": "./index.js",
@@ -13,7 +13,7 @@
       "backgroundColor": "#0B1015"
     },
     "android": {
-      "package": "com.digikhata.app"
+      "package": "com.alreef.app"
     },
     "extra": {
       "eas": {

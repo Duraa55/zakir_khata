@@ -1,308 +1,313 @@
-import React, { useEffect, useState } from 'react';
-import { View, Text, ScrollView, TouchableOpacity, FlatList, Image, StyleSheet } from 'react-native';
+import React, { useCallback, useEffect, useState } from 'react';
+import { View, Text, Pressable, StyleSheet } from 'react-native';
 import { LinearGradient } from 'expo-linear-gradient';
 import { useAuthStore } from '../../store/authStore';
-import { getUsersInScope, ScopedUser } from '../../services/database/userDb';
-import { getAllStaffMetricsAggregate } from '../../services/database/transactionDb';
-import { User } from '../../types';
-import { formatCurrency } from '../../utils/calculations';
+import { useLanguageStore } from '../../store/useLanguageStore';
+import type { TKey } from '../../i18n/en';
 import { useDashboardStore } from '../../store/useDashboardStore';
-import { themeColors } from '../../theme/theme';
-import { TopHeaderWithBooks } from '../../components/TopHeaderWithBooks';
+import { getDayBook } from '../../services/database/cashbookDb';
+import { getVisibleEntryAudit } from '../../services/database/entryAuditDb';
+import { getOwnStaffProfile, accountPhotoUri } from '../../services/database/staffDb';
+import type { StaffRecord } from '../../types/staff.types';
+import { todayDate, localDate } from '../../utils/dates';
+import { color, brandGradient, space, radius, type as typeScale, hairline, iconSize, touchTarget } from '../../theme/tokens';
+import { Screen, Card, Row, SectionHeader, Button, AmountText, Icon, IconName } from '../../components/ui/primitives';
+import { CustomerAvatar } from '../../components/ui/CustomerAvatar';
+
+/**
+ * Every book reachable without scrolling — this replaces the horizontally-scrolling
+ * chip bar, where anything past the screen edge was permanently hidden.
+ *
+ * Khata is deliberately absent: it has its own tab in the bottom bar, and listing it
+ * twice would make the grid look like the complete set when it isn't.
+ *
+ * Order follows how often a shopkeeper reaches for each one, so the two heaviest
+ * (cash, then stock) sit first.
+ */
+const BOOKS: { key: string; label: TKey; icon: IconName; route: string }[] = [
+  { key: 'cash',     label: 'cashBook',     icon: 'dollar-sign',   route: 'CashBook' },
+  { key: 'stock',    label: 'stockBook',    icon: 'package',       route: 'StockBook' },
+  { key: 'bill',     label: 'billBook',     icon: 'file-text',     route: 'BillBook' },
+  { key: 'expense',  label: 'expenseBook',  icon: 'credit-card',   route: 'ExpensesTab' },
+  { key: 'purchase', label: 'purchaseBook', icon: 'shopping-cart', route: 'PurchaseBook' },
+  { key: 'staff',    label: 'staffBook',    icon: 'users',         route: 'StaffBook' },
+  { key: 'customer', label: 'customerBook', icon: 'user',          route: 'CustomerBook' },
+];
+
+const initialsOf = (name?: string | null) =>
+  (name || '?')
+    .trim()
+    .split(/\s+/)
+    .slice(0, 2)
+    .map(part => part[0]?.toUpperCase() ?? '')
+    .join('') || '?';
 
 export const AdminDashboard = ({ navigation }: any) => {
+  const { t } = useLanguageStore();
   const user = useAuthStore(state => state.user);
   const metrics = useDashboardStore(state => state.metrics);
   const refreshDashboard = useDashboardStore(state => state.refreshDashboard);
-  
-  const [staffList, setStaffList] = useState<ScopedUser[]>([]);
-  const [staffMetricsMap, setStaffMetricsMap] = useState<Record<string, { totalLena: number; totalDena: number; netBalance: number }>>({});
 
-  useEffect(() => {
-    if (user) {
-      loadStaffData();
-      refreshDashboard(user.id);
-    }
-  }, [user]);
+  const [today, setToday] = useState({ cashIn: 0, cashOut: 0 });
+  const [edits, setEdits] = useState<{ count: number; actor: string } | null>(null);
+  // The profile an admin filled in for this account. Settings reads the same pair so the
+  // header photo and the Settings photo can never disagree.
+  const [ownProfile, setOwnProfile] = useState<StaffRecord | null>(null);
 
-  const loadStaffData = async () => {
+  const load = useCallback(async () => {
     if (!user) return;
+    refreshDashboard(user.id);
+    // Deliberately not awaited inside the try below: a missing staff profile is normal
+    // for an owner, and it must never stop the day totals from loading.
+    getOwnStaffProfile(user.id)
+      .then(setOwnProfile)
+      .catch(e => { if (__DEV__) console.error('[Home] own staff profile failed:', e); });
     try {
-      const users = await getUsersInScope(user.id);
-      const staffUsers = users.filter(u => u.role === 'staff');
-      setStaffList(staffUsers);
+      const day = todayDate();
+      const { dayTotals } = await getDayBook(user.id, day);
+      setToday({ cashIn: dayTotals.cashIn, cashOut: dayTotals.cashOut });
 
-      const metricsMap = await getAllStaffMetricsAggregate(user.id);
-      setStaffMetricsMap(metricsMap);
-    } catch (error) {
-      if (__DEV__) console.error('Error loading staff:', error);
+      // entry_audit is field-level and grouped by change_group_id, so one edited
+      // entry can be several rows — count the groups, not the rows.
+      const audit = await getVisibleEntryAudit();
+      const groupsToday = new Set<string>();
+      let latestActor = '';
+      let latestAt = '';
+      for (const row of audit) {
+        if (localDate(new Date(row.changed_at)) !== day) continue;
+        groupsToday.add(row.change_group_id);
+        if (!latestAt || row.changed_at > latestAt) {
+          latestAt = row.changed_at;
+          latestActor = row.actor_name;
+        }
+      }
+      setEdits(groupsToday.size ? { count: groupsToday.size, actor: latestActor } : null);
+    } catch (err) {
+      if (__DEV__) console.error('[Home] load failed:', err);
     }
-  };
+  }, [user, refreshDashboard]);
 
-  const handleStaffPress = (staff: User) => {
-    navigation.navigate('StaffDetail', { staff });
-  };
+  useEffect(() => { load(); }, [load]);
+  useEffect(() => navigation.addListener('focus', load), [navigation, load]);
 
-  const renderStaffItem = ({ item }: { item: ScopedUser }) => {
-    const stMetrics = staffMetricsMap[item.id] || { totalLena: 0, totalDena: 0, netBalance: 0 };
-    
-    return (
-      <TouchableOpacity
-        onPress={() => handleStaffPress(item)}
-        style={styles.staffCard}
-        activeOpacity={0.7}
-      >
-        <View style={styles.staffRow}>
-          <View style={{ flex: 1 }}>
-            <Text style={styles.staffName}>{item.name}</Text>
-            <Text style={styles.staffPhone}>{item.phone}</Text>
-            <Text style={styles.staffBiz}>{item.businessName || 'No business name'}</Text>
-            {item.account_level === 'substaff' && !!item.parentName && (
-              <Text style={styles.staffBiz}>Sub-staff of {item.parentName}</Text>
-            )}
-          </View>
-          <View style={{ alignItems: 'flex-end' }}>
-            <Text style={styles.textGreen}>
-              Lena: {formatCurrency(stMetrics.totalLena)}
-            </Text>
-            <Text style={styles.textRed}>
-              Dena: {formatCurrency(stMetrics.totalDena)}
-            </Text>
-            <Text style={[styles.netBalanceText, stMetrics.netBalance >= 0 ? styles.textGreen : styles.textRed]}>
-              Net: {formatCurrency(stMetrics.netBalance)}
-            </Text>
-          </View>
-        </View>
-      </TouchableOpacity>
-    );
-  };
-
-  const netBalance = metrics.totalLena - metrics.totalDena;
+  const receivable = metrics.totalLena;
+  // Grouped per currency now, so "is anything owed" is a question about every line.
+  const unpaidBills = metrics.pendingPayments.some(t => t.amount > 0);
+  const nothingToAct = receivable <= 0 && !edits;
 
   return (
-    <View style={styles.container}>
-      {/* Header with Profile & Books Bar */}
-      <TopHeaderWithBooks navigation={navigation} />
-
-      <ScrollView style={styles.scroll} contentContainerStyle={{ paddingHorizontal: 16, paddingTop: 16, paddingBottom: 110 }}>
-
-        {/* Global Search Bar */}
-        <TouchableOpacity 
+    <Screen padded={false}>
+      {/* Header */}
+      <View style={styles.header}>
+        <CustomerAvatar
+          name={user?.businessName || user?.name || '?'}
+          initials={initialsOf(user?.businessName || user?.name)}
+          uri={accountPhotoUri(user?.pictureUrl, ownProfile)}
+          style={styles.avatar}
+          textStyle={styles.avatarText}
+        />
+        <Text style={styles.businessName} numberOfLines={1}>
+          {user?.businessName || user?.name || 'My business'}
+        </Text>
+        <Pressable
           onPress={() => navigation.navigate('GlobalSearch')}
-          style={styles.searchBar}
-          activeOpacity={0.8}
+          style={styles.headerAction}
+          accessibilityRole="button"
+          accessibilityLabel={t('dashSearch')}
         >
-          <Text style={{ fontSize: 18, marginRight: 10 }}>🔍</Text>
-          <Text style={styles.searchPlaceholder}>Search customers, bills, products...</Text>
-        </TouchableOpacity>
-
-        {/* Balance Card with Gradient & Glowing Effect */}
-        <LinearGradient
-          colors={['#17202b', '#2d3748']}
-          start={{ x: 0, y: 0 }}
-          end={{ x: 1, y: 1 }}
-          style={styles.balanceCard}
+          <Icon name="search" size={iconSize.md} tint={color.textSecondary} />
+        </Pressable>
+        <Pressable
+          onPress={() => navigation.navigate('SyncCenter')}
+          style={styles.headerAction}
+          accessibilityRole="button"
+          accessibilityLabel={t('dashSync')}
         >
-          <Text style={styles.cardHeaderTitle}>Overall Business Balance</Text>
-          <Text style={[styles.mainBalanceAmount, netBalance >= 0 ? styles.textGreen : styles.textRed]}>
-            {formatCurrency(netBalance)}
-          </Text>
-          <Text style={styles.netLabelText}>Net Business Cash Flow</Text>
+          <Icon name="refresh-cw" size={iconSize.md} tint={color.textSecondary} />
+        </Pressable>
+        <Pressable
+          onPress={() => navigation.navigate('RemindersCenter')}
+          style={styles.headerAction}
+          accessibilityRole="button"
+          accessibilityLabel={t('dashReminders')}
+        >
+          <Icon name="bell" size={iconSize.md} tint={color.textSecondary} />
+        </Pressable>
+      </View>
 
-          <View style={styles.statsDivider} />
+      {/* Hero — the one gradient surface in the app */}
+      <LinearGradient
+        colors={brandGradient}
+        start={{ x: 0, y: 0 }}
+        end={{ x: 1, y: 1 }}
+        style={styles.hero}
+      >
+        <Text style={styles.heroLabel}>{t('dashCashInHand')}</Text>
+        <AmountText paisa={metrics.cashInDrawer} size="hero" style={styles.heroFigure} />
 
-          <View style={styles.statsRow}>
-            <View style={{ alignItems: 'center', flex: 1 }}>
-              <Text style={styles.statLabel}>Total Staff</Text>
-              <Text style={styles.statValueWhite}>{staffList.length}</Text>
-            </View>
-            <View style={styles.verticalBorder} />
-            <View style={{ alignItems: 'center', flex: 1 }}>
-              <Text style={styles.statLabel}>Total Lena</Text>
-              <Text style={[styles.statValue, styles.textGreen]}>{formatCurrency(metrics.totalLena)}</Text>
-            </View>
-            <View style={styles.verticalBorder} />
-            <View style={{ alignItems: 'center', flex: 1 }}>
-              <Text style={styles.statLabel}>Total Dena</Text>
-              <Text style={[styles.statValue, styles.textRed]}>{formatCurrency(metrics.totalDena)}</Text>
-            </View>
+        <View style={styles.heroTodayRow}>
+          <View style={styles.heroTodayItem}>
+            <Icon name="arrow-down-left" size={iconSize.sm} tint={color.onBrand} />
+            <Text style={styles.heroTodayLabel}>{t('dashIn')}</Text>
+            <AmountText paisa={today.cashIn} size="label" style={styles.heroTodayFigure} />
           </View>
-        </LinearGradient>
+          <View style={styles.heroTodayItem}>
+            <Icon name="arrow-up-right" size={iconSize.sm} tint={color.onBrand} />
+            <Text style={styles.heroTodayLabel}>{t('dashOut')}</Text>
+            <AmountText paisa={today.cashOut} size="label" style={styles.heroTodayFigure} />
+          </View>
+          <Text style={styles.heroTodayWhen}>{t('dashToday')}</Text>
+        </View>
 
-        {/* Quick Action Cards Grid */}
-        <View style={styles.quickGrid}>
-          <TouchableOpacity 
-            onPress={() => navigation.navigate('ReportsDashboard')}
-            style={styles.quickCard}
-          >
-            <Text style={{ fontSize: 24, marginBottom: 4 }}>📊</Text>
-            <Text style={styles.quickCardText}>Reports</Text>
-          </TouchableOpacity>
+        <View style={styles.heroActions}>
+          <Button
+            label={t('dashCashIn')}
+            variant="onBrand"
+            style={styles.heroButton}
+            onPress={() => navigation.navigate('CashInModal', { mode: 'in', date: todayDate() })}
+          />
+          <Button
+            label={t('dashCashOut')}
+            variant="onBrandQuiet"
+            style={styles.heroButton}
+            onPress={() => navigation.navigate('CashOutModal', { mode: 'out', date: todayDate() })}
+          />
+        </View>
+      </LinearGradient>
 
-          <TouchableOpacity 
+      {/* Books — 4 × 2, nothing hidden off-screen */}
+      <View style={styles.section}>
+        <SectionHeader title={t('dashBooks')} />
+        <View style={styles.grid}>
+          {BOOKS.map(book => (
+            <Pressable
+              key={book.key}
+              onPress={() => navigation.navigate(book.route)}
+              style={styles.gridCell}
+              accessibilityRole="button"
+              accessibilityLabel={t(book.label)}
+            >
+              {({ pressed }) => (
+                <>
+                  <View style={[styles.tile, pressed && styles.tilePressed]}>
+                    <Icon name={book.icon} size={iconSize.lg} tint={color.textSecondary} />
+                  </View>
+                  <Text style={styles.tileLabel} numberOfLines={2}>{t(book.label)}</Text>
+                </>
+              )}
+            </Pressable>
+          ))}
+        </View>
+      </View>
+
+      {/* Needs attention — things to act on, not a chronological log */}
+      <View style={styles.section}>
+        <SectionHeader title={t('dashNeedsAttention')} />
+
+        {receivable > 0 && (
+          <Row
+            title={t('dashReceivable')}
+            detail={unpaidBills ? t('dashOwedWithBills') : t('dashOwedToYou')}
+            icon="clock"
+            attention
+            // Neutral, not red: red means money out / owed by us. What customers
+            // owe is not a loss — the amber outline is what says "act on this".
+            trailing={<AmountText paisa={receivable} />}
+            onPress={() => navigation.navigate('Khata')}
+            style={styles.attentionRow}
+          />
+        )}
+
+        {!!edits && (
+          <Row
+            title={t(edits.count === 1 ? 'dashEntryEdited' : 'dashEntriesEdited', { count: edits.count })}
+            detail={t('dashEditedBy', { name: edits.actor })}
+            icon="edit-2"
             onPress={() => navigation.navigate('ActivityLog')}
-            style={styles.quickCard}
-          >
-            <Text style={{ fontSize: 24, marginBottom: 4 }}>📋</Text>
-            <Text style={styles.quickCardText}>Activity Log</Text>
-          </TouchableOpacity>
+            style={styles.attentionRow}
+          />
+        )}
 
-          <TouchableOpacity 
-            onPress={() => navigation.navigate('RemindersCenter')}
-            style={styles.quickCard}
-          >
-            <Text style={{ fontSize: 24, marginBottom: 4 }}>🔔</Text>
-            <Text style={styles.quickCardText}>Reminders</Text>
-          </TouchableOpacity>
-
-          <TouchableOpacity 
-            onPress={() => navigation.navigate('SyncCenter')}
-            style={styles.quickCard}
-          >
-            <Text style={{ fontSize: 24, marginBottom: 4 }}>🔄</Text>
-            <Text style={styles.quickCardText}>Sync</Text>
-          </TouchableOpacity>
-        </View>
-
-        {/* Staff Members Section */}
-        <View style={{ marginBottom: 40 }}>
-          <View style={styles.sectionHeader}>
-            <Text style={styles.sectionTitle}>Staff Members ({staffList.length})</Text>
-            <TouchableOpacity onPress={loadStaffData}>
-              <Text style={styles.refreshText}>Refresh 🔄</Text>
-            </TouchableOpacity>
-          </View>
-          
-          {staffList.length === 0 ? (
-            <View style={styles.emptyCard}>
-              <Text style={styles.emptyText}>No staff members registered</Text>
-            </View>
-          ) : (
-            <FlatList
-              data={staffList}
-              renderItem={renderStaffItem}
-              keyExtractor={(item) => item.id}
-              scrollEnabled={false}
-            />
-          )}
-        </View>
-      </ScrollView>
-    </View>
+        {nothingToAct && (
+          <Card tone="outlined">
+            <Text style={styles.emptyText}>{t('dashNothingToAct')}</Text>
+          </Card>
+        )}
+      </View>
+    </Screen>
   );
 };
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: themeColors.background },
   header: {
-    backgroundColor: themeColors.cardBg,
-    paddingHorizontal: 16,
-    paddingTop: 44,
-    paddingBottom: 16,
-    borderBottomWidth: 1,
-    borderBottomColor: themeColors.border,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: space.md,
+    paddingHorizontal: space.lg,
+    paddingTop: space.md,
+    paddingBottom: space.lg,
   },
-  headerRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
-  headerTitle: { fontSize: 22, fontWeight: '800', color: '#fff' },
-  headerSub: { fontSize: 13, color: themeColors.textSecondary, marginTop: 2 },
-  headerIconBtn: {
-    width: 40, height: 40, borderRadius: 20,
-    backgroundColor: themeColors.inputBg,
-    alignItems: 'center', justifyContent: 'center',
-    borderWidth: 1, borderColor: themeColors.borderLight,
-  },
-  avatarImg: { width: 44, height: 44, borderRadius: 22, borderWidth: 2, borderColor: '#1dd1a1' },
-  avatarPlaceholder: {
-    width: 44, height: 44, borderRadius: 22,
-    backgroundColor: themeColors.primary,
-    alignItems: 'center', justifyContent: 'center',
-    shadowColor: '#1dd1a1', shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.5, shadowRadius: 4, elevation: 3,
-  },
-  avatarText: { color: '#fff', fontSize: 18, fontWeight: '800' },
-
-  scroll: { flex: 1 },
-  searchBar: {
-    backgroundColor: themeColors.cardBg,
-    flexDirection: 'row', alignItems: 'center',
-    paddingHorizontal: 16, paddingVertical: 12,
-    borderRadius: 14, borderWidth: 1, borderColor: themeColors.border,
-    marginBottom: 16,
-    shadowColor: '#000', shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.2, shadowRadius: 4, elevation: 3,
-  },
-  searchPlaceholder: { color: themeColors.textSecondary, fontSize: 14, fontWeight: '500' },
-
-  balanceCard: {
-    borderRadius: 18, padding: 20, marginBottom: 20,
-    borderWidth: 1, borderColor: themeColors.border,
-    shadowColor: '#5f27cd', shadowOffset: { width: 0, height: 6 }, shadowOpacity: 0.35, shadowRadius: 10, elevation: 6,
-  },
-  cardHeaderTitle: { color: themeColors.textSecondary, fontSize: 13, fontWeight: '600', textTransform: 'uppercase', letterSpacing: 1 },
-  mainBalanceAmount: { fontSize: 30, fontWeight: '900', marginTop: 4 },
-  netLabelText: { color: themeColors.textMuted, fontSize: 12, marginTop: 2 },
-  statsDivider: { height: 1, backgroundColor: themeColors.border, marginVertical: 16 },
-  statsRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
-  verticalBorder: { width: 1, height: 32, backgroundColor: themeColors.border },
-  statLabel: { color: themeColors.textSecondary, fontSize: 11, fontWeight: '500', marginBottom: 2 },
-  statValueWhite: { color: '#fff', fontSize: 17, fontWeight: '800' },
-  statValue: { fontSize: 16, fontWeight: '800' },
-
-  quickGrid: { flexDirection: 'row', gap: 10, marginBottom: 24 },
-  quickCard: {
-    flex: 1, backgroundColor: themeColors.cardBg, borderRadius: 14, paddingVertical: 14,
-    alignItems: 'center', justifyContent: 'center',
-    borderWidth: 1, borderColor: themeColors.border,
-    shadowColor: '#000', shadowOffset: { width: 0, height: 3 }, shadowOpacity: 0.2, shadowRadius: 6, elevation: 3,
-  },
-  quickCardText: { color: '#fff', fontSize: 12, fontWeight: '700', marginTop: 2 },
-
-  sectionHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 },
-  sectionTitle: { color: '#fff', fontSize: 18, fontWeight: '800' },
-  refreshText: { color: '#1dd1a1', fontSize: 13, fontWeight: '700' },
-
-  staffCard: {
-    backgroundColor: themeColors.cardBg, borderRadius: 14, padding: 16, marginBottom: 10,
-    borderWidth: 1, borderColor: themeColors.border,
-    shadowColor: '#000', shadowOffset: { width: 0, height: 3 }, shadowOpacity: 0.25, shadowRadius: 6, elevation: 3,
-  },
-  staffRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
-  staffName: { color: '#fff', fontSize: 16, fontWeight: '700' },
-  staffPhone: { color: themeColors.textSecondary, fontSize: 13, marginTop: 2 },
-  staffBiz: { color: themeColors.textMuted, fontSize: 11, marginTop: 2 },
-  netBalanceText: { fontSize: 14, fontWeight: '800', marginTop: 2 },
-
-  textGreen: { color: themeColors.success, fontWeight: '700' },
-  textRed: { color: themeColors.error, fontWeight: '700' },
-
-  emptyCard: { backgroundColor: themeColors.cardBg, borderRadius: 14, padding: 24, alignItems: 'center', borderWidth: 1, borderColor: themeColors.border },
-  emptyText: { color: themeColors.textSecondary, fontSize: 14 },
-
-  headerBookCard: {
-    width: 88,
-    backgroundColor: themeColors.cardBg,
-    borderRadius: 16,
-    paddingVertical: 12,
-    paddingHorizontal: 6,
+  avatar: {
+    width: 36,
+    height: 36,
+    borderRadius: radius.pill,
+    backgroundColor: color.surfaceRaised,
+    borderWidth: hairline,
+    borderColor: color.border,
     alignItems: 'center',
     justifyContent: 'center',
-    borderWidth: 1,
-    borderColor: themeColors.border,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 3 },
-    shadowOpacity: 0.25,
-    shadowRadius: 6,
-    elevation: 3,
   },
-  headerBookIconCircle: {
-    width: 44,
-    height: 44,
-    borderRadius: 22,
+  avatarText: { ...typeScale.label, color: color.textSecondary },
+  // flex: 1 so a long Urdu business name takes the room rather than shoving the bell off.
+  businessName: { ...typeScale.bodyMedium, color: color.textPrimary, flex: 1 },
+  headerAction: {
+    width: touchTarget,
+    height: touchTarget,
+    alignItems: 'flex-end',
+    justifyContent: 'center',
+  },
+
+  hero: {
+    marginHorizontal: space.lg,
+    borderRadius: radius.lg,
+    padding: space.xl,
+  },
+  heroLabel: { ...typeScale.label, color: color.onBrandMuted },
+  heroFigure: { color: color.onBrand, marginTop: space.xs },
+  heroTodayRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    flexWrap: 'wrap',
+    gap: space.md,
+    marginTop: space.sm,
+  },
+  heroTodayItem: { flexDirection: 'row', alignItems: 'center', gap: space.xs },
+  heroTodayLabel: { ...typeScale.caption, color: color.onBrandMuted },
+  heroTodayFigure: { color: color.onBrand },
+  heroTodayWhen: { ...typeScale.caption, color: color.onBrandMuted },
+  heroActions: { flexDirection: 'row', gap: space.md, marginTop: space.xl },
+  heroButton: { flex: 1 },
+
+  section: { paddingHorizontal: space.lg, paddingTop: space.xxl },
+
+  grid: { flexDirection: 'row', flexWrap: 'wrap' },
+  // A quarter each, with breathing room applied inside — avoids gap rounding
+  // leaving a fifth tile half-wrapped onto the next line.
+  gridCell: { width: '25%', paddingHorizontal: space.xs, paddingBottom: space.lg, alignItems: 'center' },
+  tile: {
+    alignSelf: 'stretch',
+    height: 56,
+    borderRadius: radius.md,
+    backgroundColor: color.surfaceRaised,
+    borderWidth: hairline,
+    borderColor: color.border,
     alignItems: 'center',
     justifyContent: 'center',
-    marginBottom: 8,
   },
-  headerBookText: {
-    color: '#fff',
-    fontSize: 11,
-    fontWeight: '700',
-    textAlign: 'center',
-  },
+  tilePressed: { backgroundColor: color.surfacePressed },
+  // No fixed width and two lines allowed: Urdu book names run far longer.
+  tileLabel: { ...typeScale.caption, color: color.textSecondary, marginTop: space.sm, textAlign: 'center' },
+
+  attentionRow: { marginBottom: space.sm },
+  emptyText: { ...typeScale.body, color: color.textMuted },
 });
