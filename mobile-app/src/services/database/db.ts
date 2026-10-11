@@ -1998,6 +1998,30 @@ async function migrateFrom(database: SQLite.SQLiteDatabase): Promise<void> {
     await database.execAsync('PRAGMA user_version = 50');
     version = 50;
   }
+
+  if (version < 51) {
+    // WHEN THIS ROW WAS PROVED TO BE A CLOUD IDENTITY (2026-10-12).
+    //
+    // The publish gate asks "could a cloud profile still replace this row?", and until now it
+    // answered with "has this account authored anything?" — a PROXY for "this is a real
+    // account and not an untouched seed". The proxy is false for a row that has JUST been
+    // adopted on a second device: it is unmistakably the cloud identity, and it has no local
+    // rows at all because pull has not run. So a freshly adopted device was judged an
+    // unadopted seed and never refreshed its own profile.
+    //
+    // Worse, it would have fixed itself for the WRONG REASON once pull landed: pulled rows
+    // would make the proxy accidentally true. A gate that opens incidentally is not a gate.
+    //
+    // This records the fact itself. `applyCloudProfile` stamps it on BOTH routes — a row
+    // materialised from nothing and a seeded admin adopted in place — because both are the
+    // identity the profile describes, and both are known to be so at that moment, since the
+    // profile had just been read. A FAILED adoption writes nothing, so the gate stays shut on
+    // the untouched seed it was built for.
+    await addColumnIfNotExists(database, 'users', 'adopted_at', 'TEXT');
+
+    await database.execAsync('PRAGMA user_version = 51');
+    version = 51;
+  }
 }
 
 export const closeDatabase = async (): Promise<void> => {

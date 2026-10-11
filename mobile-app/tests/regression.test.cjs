@@ -6211,6 +6211,44 @@ check(158,'HOW A SECOND DEVICE BECOMES THE SAME PERSON: one identity document pe
  assert.equal(await ad.mayBeAdoptable(sqlite,seedId,seedPhone),false,'a staff row on the bootstrap number would be rewritten');
  assert.deepEqual(plain(await apply()),{status:'conflict'});
 
+ // ── A ROW PROVED TO BE A CLOUD IDENTITY IS NOT AN UNADOPTED SEED (v51) ──────────────
+ // The gate used to ask "has this account authored anything?" - a proxy for "real account,
+ // not an untouched seed" - and the proxy is FALSE for a row just adopted on a second
+ // device: unmistakably the cloud identity, and with no local rows at all because pull has
+ // not run. So a freshly adopted device was judged a seed and never refreshed its profile.
+ // Worse, pull would later have made the proxy accidentally true, and a gate that opens
+ // incidentally is not a gate.
+ seedId=await seeded();
+ assert.equal(await ad.mayBeAdoptable(sqlite,seedId,seedPhone),true,'the untouched seed is not adoptable to begin with');
+ assert.equal((await apply()).status,'adopted');
+ assert.ok(h.one('SELECT adopted_at FROM users WHERE id=?','shared_id').adopted_at,
+  'adoption did not record itself, so the gate has only a proxy to go on');
+ assert.equal(await ad.mayBeAdoptable(sqlite,'shared_id',seedPhone),false,
+  'a freshly adopted row is still judged an unadopted seed, so a second device would never publish its own profile again');
+ // With no local rows at all - which is exactly the state pull has not yet fixed.
+ for(const [table,spec] of Object.entries(sp.SYNC_PATHS)){
+  if(spec.author.kind!=='column') continue;
+  assert.equal(h.one('SELECT COUNT(*) c FROM '+table+' WHERE '+spec.author.column+' = ?','shared_id').c,0,
+   table+' has rows for the adopted account, so this case is not testing what it claims');
+ }
+
+ // A MATERIALISED row is equally the cloud identity, by the other route.
+ h.sqlite.prepare('DELETE FROM users WHERE phone=?').run(seedPhone);
+ assert.equal((await apply()).status,'materialised');
+ assert.ok(h.one('SELECT adopted_at FROM users WHERE id=?','shared_id').adopted_at,'materialising did not record itself');
+ assert.equal(await ad.mayBeAdoptable(sqlite,'shared_id',seedPhone),false);
+
+ // A FAILED adoption records NOTHING, so the gate stays shut on the seed it exists for -
+ // which is the pollution incident, and the one case that must not regress.
+ seedId=await seeded();
+ h.insert('expenses',{id:'e_real',user_id:seedId});
+ assert.deepEqual(plain(await apply()),{status:'conflict'},'a real account was merged over');
+ assert.equal(h.one('SELECT adopted_at FROM users WHERE id=?',seedId).adopted_at,null,
+  'a refused adoption still stamped the row as a proved identity');
+ h.sqlite.prepare('DELETE FROM expenses WHERE id=?').run('e_real');
+ assert.equal(await ad.mayBeAdoptable(sqlite,seedId,seedPhone),true,
+  'the gate no longer protects an untouched seed whose adoption failed - the exact pollution case');
+
  // ── THE LOCAL HALF MUST STAY LOCAL ───────────────────────────────────────────────────
  const adSrc=read('src/services/database/accountAdoption.ts');
  // The IMPORTS, not the word: the comments explain what the password was proved against,

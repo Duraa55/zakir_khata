@@ -85,10 +85,13 @@ export const mayBeAdoptable = async (
   e164Phone: string
 ): Promise<boolean> => {
   if (e164Phone !== normalisePhone(ADMIN_SEED_PHONE)) return false;
-  const row = await db.getFirstAsync<{ role: string }>(
-    'SELECT role FROM users WHERE id = ? AND is_deleted = 0', [localUserId]
+  const row = await db.getFirstAsync<{ role: string; adopted_at: string | null }>(
+    'SELECT role, adopted_at FROM users WHERE id = ? AND is_deleted = 0', [localUserId]
   );
   if (row?.role !== 'admin') return false;
+  // ALREADY PROVED TO BE A CLOUD IDENTITY, so nothing can replace it — and asked before the
+  // table sweep, so the common case costs one indexed lookup instead of nineteen counts.
+  if (row.adopted_at) return false;
   return !(await hasAuthoredAnything(db, localUserId));
 };
 
@@ -124,25 +127,26 @@ export const applyCloudProfile = async (
     await db.runAsync(
       `UPDATE users SET id = ?, name = ?, name_ur = ?, role = ?, account_level = ?,
          businessName = ?, businessType = ?, area = ?, pictureUrl = ?, parentId = ?,
-         default_currency = COALESCE(?, default_currency), passwordHash = ?
+         default_currency = COALESCE(?, default_currency), passwordHash = ?,
+         adopted_at = ?
        WHERE id = ?`,
       [profile.id, profile.name, profile.name_ur ?? null, profile.role, profile.account_level ?? null,
        profile.businessName ?? null, profile.businessType ?? null, profile.area ?? null,
        profile.pictureUrl ?? null, profile.parentId ?? null, profile.default_currency ?? null,
-       await hashPassword(password), existing.id]
+       await hashPassword(password), new Date().toISOString(), existing.id]
     );
     if (__DEV__) console.log('[Adopt] seeded admin ' + existing.id + ' is now ' + profile.id);
     return { status: 'adopted', localId: profile.id };
   }
 
   await db.runAsync(
-    `INSERT INTO users (id, name, name_ur, phone, passwordHash, role, account_level, businessName, businessType, area, pictureUrl, parentId, default_currency, createdAt, updatedAt)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO users (id, name, name_ur, phone, passwordHash, role, account_level, businessName, businessType, area, pictureUrl, parentId, default_currency, createdAt, updatedAt, adopted_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [profile.id, profile.name, profile.name_ur ?? null, phone, await hashPassword(password),
      profile.role, profile.account_level ?? null, profile.businessName ?? null,
      profile.businessType ?? null, profile.area ?? null, profile.pictureUrl ?? null,
      profile.parentId ?? null, profile.default_currency ?? null,
-     profile.createdAt ?? new Date().toISOString(), new Date().toISOString()]
+     profile.createdAt ?? new Date().toISOString(), new Date().toISOString(), new Date().toISOString()]
   );
   if (__DEV__) console.log('[Adopt] materialised ' + profile.id + ' from the cloud profile');
   return { status: 'materialised', localId: profile.id };
