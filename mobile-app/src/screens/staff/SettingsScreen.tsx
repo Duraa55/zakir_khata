@@ -252,6 +252,53 @@ export const SettingsScreen = () => {
               <Text style={styles.devText}>{t('setDevWipeSub')}</Text>
             </TouchableOpacity>
           )}
+
+          {/* DEV-ONLY — THE INITIAL UPLOAD. Not destructive: it writes sync_queue rows and
+              its own cursor, never a book row. It asks the dry run FIRST and puts the real
+              number in the confirmation, because the whole point of the plan is that the
+              size of a run is seen before it happens. Safe to press twice — the cursor makes
+              a second press a no-op, and a merge-set makes a re-upload harmless anyway. */}
+          {__DEV__ && user?.role === 'admin' && (
+            <TouchableOpacity
+              style={[styles.changePasswordBtn, styles.devBtn]}
+              onPress={async () => {
+                try {
+                  const { getDatabase } = await import('../../services/database/db');
+                  const { planBackfill, runBackfill } = await import('../../services/database/syncBackfill');
+                  const db = await getDatabase();
+                  const me = user.id;
+                  const plan = await planBackfill(db, me);
+                  if (!plan.totalEnqueue) {
+                    Alert.alert(t('setBackfilledTitle'), t('setBackfillNone'));
+                    return;
+                  }
+                  Alert.alert(
+                    t('setBackfillTitle'),
+                    t('setBackfillBody', { rows: plan.totalEnqueue }),
+                    [
+                      { text: t('commonCancel'), style: 'cancel' },
+                      {
+                        text: t('setBackfillQueue'),
+                        onPress: async () => {
+                          try {
+                            const result = await runBackfill(db, me);
+                            Alert.alert(t('setBackfilledTitle'), t('setBackfilledBody', { rows: result.enqueued }));
+                          } catch (e: any) {
+                            Alert.alert(t('commonError'), e?.message || t('setBackfillFailed'));
+                          }
+                        },
+                      },
+                    ]
+                  );
+                } catch (e: any) {
+                  Alert.alert(t('commonError'), e?.message || t('setBackfillFailed'));
+                }
+              }}
+            >
+              <Icon name="upload-cloud" size={iconSize.sm} tint={color.attention} />
+              <Text style={styles.devText}>{t('setDevBackfill')}</Text>
+            </TouchableOpacity>
+          )}
         </View>
 
         {/* ── My documents ──
