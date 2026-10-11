@@ -146,11 +146,31 @@ export const addStockMovementIn = async (
     firestorePath,
     userId: movement.user_id,
   });
-  // Update the item's quantity and updated_at
-  await db.runAsync(
-    `UPDATE stock_items SET quantity = quantity + ?, updated_at = ?, synced = 0 WHERE id = ?`,
-    [movement.change, now, movement.item_id]
+  // THE NEW COUNT GOES UP TOO (2026-10-11). This was a raw UPDATE that set `synced = 0`
+  // and enqueued nothing, so once the movements themselves began syncing a second device
+  // would have received the full ledger and a STALE quantity — and the app reads
+  // `stock_items.quantity` directly rather than recomputing it from the movements, so the
+  // wrong number is what a user would see. `stock_items` only ever enqueued on create and
+  // on an explicit edit; a movement is the third way its quantity changes.
+  //
+  // An ABSOLUTE value, read inside this transaction and written as one: the queue payload
+  // is a document, not a delta, so `quantity + ?` has nothing to send. The read is safe
+  // because every caller is inside a transaction and withWriteTransaction serialises them.
+  const current = await db.getFirstAsync<{ quantity: number }>(
+    'SELECT quantity FROM stock_items WHERE id = ?', [movement.item_id]
   );
+  // assertOwnStockItemIn above already proved the item exists and belongs to this account,
+  // so its user_id is movement.user_id and the path can be built from that.
+  const itemPath = await pathForRow(db, 'stock_items', { id: movement.item_id, user_id: movement.user_id });
+  if (!itemPath) throw new Error('Stock item has no account to file it under.');
+  await writeRowWithSyncIn(db, {
+    tableName: 'stock_items',
+    recordId: movement.item_id,
+    operation: 'update',
+    data: { quantity: (current?.quantity ?? 0) + movement.change, updated_at: now },
+    firestorePath: itemPath,
+    userId: movement.user_id,
+  });
   return { ...movement, id, synced: 0, is_deleted: 0 };
 };
 

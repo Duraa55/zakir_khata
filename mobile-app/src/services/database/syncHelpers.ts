@@ -25,11 +25,73 @@ export const LOCAL_ONLY_FIELDS: Readonly<Record<string, readonly string[]>> = {
   users: ['passwordHash'],
 };
 
-/** The row as it may be queued for upload: every local-only column removed. */
+/**
+ * Columns stored as a JSON STRING locally that must travel as a REAL ARRAY, under a
+ * different field name. Keyed by table: column -> document field.
+ *
+ * `activities.visible_to` is the one case, and the rename is the point of it. It holds a
+ * JSON string of LOCAL ids — the Activity Log's own per-entry audience — while
+ * `visibleTo`, stamped on every document by `syncAuthorisation`, is a real array of
+ * FIREBASE uids that the security rules test. Two fields differing by one underscore,
+ * with opposite shapes and different id spaces, in the same document.
+ *
+ * Nothing broke on the way up, which is exactly the danger: a pull query written as
+ * `where('visible_to', 'array-contains', uid)` is wrong on all three counts and would
+ * return NOTHING rather than failing. Renaming it `activityAudience` makes the mistake
+ * unavailable instead of merely unlikely.
+ *
+ * PULL USES THIS MAP INVERTED — see `columnForPayloadField`. Documents written before this
+ * rename still carry the old string `visible_to`; it is a real column, so a pull that
+ * whitelists columns will accept it unchanged and no repair is needed.
+ */
+export const JSON_ARRAY_FIELDS: Readonly<Record<string, Readonly<Record<string, string>>>> = {
+  activities: { visible_to: 'activityAudience' },
+};
+
+/** Total by construction: a malformed stored value becomes an empty list, never a throw. */
+const asArray = (value: unknown): unknown[] => {
+  if (Array.isArray(value)) return value;
+  if (typeof value !== 'string' || !value) return [];
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+};
+
+/** For PULL: the column a document field belongs in, or null when it is not a reshaped one. */
+export const columnForPayloadField = (tableName: string, field: string): string | null => {
+  const renames = JSON_ARRAY_FIELDS[tableName];
+  if (!renames) return null;
+  for (const [column, documentField] of Object.entries(renames)) if (documentField === field) return column;
+  return null;
+};
+
+/** For PULL: that field's value back in the column's shape. */
+export const columnValueForPayloadField = (value: unknown): string => JSON.stringify(asArray(value));
+
+/**
+ * The row as it may be queued for upload: every local-only column removed, and every
+ * JSON-string list turned into a real array under its document field name.
+ */
 export const syncPayloadFor = (tableName: string, data: Record<string, any>): Record<string, any> => {
   const hidden = LOCAL_ONLY_FIELDS[tableName];
-  if (!hidden?.length) return data;
-  return Object.fromEntries(Object.entries(data).filter(([key]) => !hidden.includes(key)));
+  const renames = JSON_ARRAY_FIELDS[tableName];
+  if (!hidden?.length && !renames) return data;
+
+  let out = hidden?.length
+    ? Object.fromEntries(Object.entries(data).filter(([key]) => !hidden.includes(key)))
+    : { ...data };
+  if (renames) {
+    for (const [column, documentField] of Object.entries(renames)) {
+      if (!Object.prototype.hasOwnProperty.call(out, column)) continue;
+      const stored = out[column];
+      delete out[column];
+      out[documentField] = asArray(stored);
+    }
+  }
+  return out;
 };
 
 export async function writeWithSync(options: WriteOptions): Promise<void> {
