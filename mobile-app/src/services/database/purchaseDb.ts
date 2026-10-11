@@ -1,5 +1,6 @@
 import { getDatabase } from './db';
 import { writeWithSync, writeRowWithSyncIn, afterSyncedWrite } from './syncHelpers';
+import { pathForRow } from './syncPaths';
 import { withWriteTransaction } from './writeTransaction';
 import { generateId, nowISO } from './queryHelpers';
 import { addStockMovement, addStockMovementIn, getStockItemsByUserId } from './stockDb';
@@ -80,18 +81,36 @@ export const createPurchaseOrder = async (
     userId
   });
 
-  // Insert items
+  // Insert items. `savedItems` collects the rows AS WRITTEN: this used to return
+  // `poi_${idx}` placeholder ids instead of the real ones, so a caller holding the returned
+  // order could not address a line it had just created.
+  const savedItems: PurchaseOrderItem[] = [];
   for (const item of items) {
     const itemId = generateId('poi');
-    const itemData = { ...item, id: itemId, po_id: id, received_qty: 0, is_deleted: 0 };
-    await db.runAsync(
-      `INSERT INTO purchase_order_items (id, po_id, stock_item_id, item_name, quantity, unit_cost, line_total, received_qty, is_deleted)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0)`,
-      [itemId, id, item.stock_item_id || null, item.item_name, item.quantity, item.unit_cost, item.line_total]
-    );
+    const itemData = {
+      id: itemId, po_id: id,
+      stock_item_id: item.stock_item_id || null,
+      item_name: item.item_name,
+      quantity: item.quantity,
+      unit_cost: item.unit_cost,
+      line_total: item.line_total,
+      received_qty: 0, is_deleted: 0,
+    };
+    // The author lives on the PARENT order, which the writeWithSync above has already
+    // written, so pathForRow can resolve it. An order line carries no user_id of its own.
+    const firestorePath = await pathForRow(db, 'purchase_order_items', itemData);
+    if (!firestorePath) throw new Error('Order line has no account to file it under.');
+    await writeWithSync({
+      tableName: 'purchase_order_items',
+      recordId: itemId,
+      operation: 'create',
+      data: itemData,
+      firestorePath,
+      userId
+    });
+    savedItems.push(itemData as unknown as PurchaseOrderItem);
   }
 
-  const savedItems = items.map((i, idx) => ({ ...i, id: `poi_${idx}`, po_id: id, received_qty: 0, is_deleted: 0 as const }));
   return { ...data, items: savedItems, created_at: now, updated_at: now, synced: 0 } as PurchaseOrder;
 };
 
@@ -363,11 +382,27 @@ export const createPurchaseInvoice = async (
   // Insert invoice items + update stock
   for (const item of items) {
     const itemId = generateId('piitem');
-    await db.runAsync(
-      `INSERT INTO purchase_invoice_items (id, invoice_id, stock_item_id, item_name, quantity, unit_cost, line_total, is_deleted)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 0)`,
-      [itemId, id, item.stock_item_id || null, item.item_name, item.quantity, item.unit_cost, item.line_total]
-    );
+    const itemData = {
+      id: itemId, invoice_id: id,
+      stock_item_id: item.stock_item_id || null,
+      item_name: item.item_name,
+      quantity: item.quantity,
+      unit_cost: item.unit_cost,
+      line_total: item.line_total,
+      is_deleted: 0,
+    };
+    // The author lives on the parent invoice, written just above; an invoice line has no
+    // user_id of its own.
+    const firestorePath = await pathForRow(db, 'purchase_invoice_items', itemData);
+    if (!firestorePath) throw new Error('Invoice line has no account to file it under.');
+    await writeWithSync({
+      tableName: 'purchase_invoice_items',
+      recordId: itemId,
+      operation: 'create',
+      data: itemData,
+      firestorePath,
+      userId
+    });
 
     // Auto-increase stock
     if (item.stock_item_id) {
@@ -485,11 +520,29 @@ export const createPurchaseReturn = async (
       firestorePath: `users/${userId}/purchase_returns/${id}`, userId
     });
     for (const item of lines) {
-      await db.runAsync(
-        `INSERT INTO purchase_return_items (id, return_id, stock_item_id, item_name, quantity, unit_cost, line_total)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
-        [generateId('pritem'), id, item.stock_item_id || null, item.item_name, item.quantity, item.unit_cost, item.line_total]
-      );
+      const itemId = generateId('pritem');
+      const itemData = {
+        id: itemId, return_id: id,
+        stock_item_id: item.stock_item_id || null,
+        item_name: item.item_name,
+        quantity: item.quantity,
+        unit_cost: item.unit_cost,
+        line_total: item.line_total,
+        is_deleted: 0,
+      };
+      // The author lives on the parent return, written just above by writeRowWithSyncIn.
+      const firestorePath = await pathForRow(db, 'purchase_return_items', itemData);
+      if (!firestorePath) throw new Error('Return line has no account to file it under.');
+      // writeRowWithSyncIn, not writeWithSync: this whole block is already inside
+      // withWriteTransaction, and opening a second one would deadlock on the same queue.
+      await writeRowWithSyncIn(db, {
+        tableName: 'purchase_return_items',
+        recordId: itemId,
+        operation: 'create',
+        data: itemData,
+        firestorePath,
+        userId
+      });
       if (item.stock_item_id) {
         await addStockMovementIn(db, {
           item_id: item.stock_item_id,

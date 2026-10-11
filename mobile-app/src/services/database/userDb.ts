@@ -3,6 +3,7 @@ import { getDatabase } from './db';
 import { AccountLevel, assertConsistentLevel } from './accountLevel';
 import { User } from '../../types';
 import { resolveCurrency, type CurrencyCode } from '../../utils/currency';
+import { internationalPhone, MAX_NATIONAL_DIGITS } from '../../utils/phone';
 
 // Internal DB record — includes the hash, never returned to callers outside this file.
 interface UserRecord {
@@ -134,25 +135,43 @@ export const createUser = async (
 };
 
 /**
- * Normalises a phone to the local 0XXXXXXXXXX format.
- * Strips country code (+92, 0092) if present.
+ * THE canonical spelling of a login phone: E.164, e.g. "+923001234567".
+ *
+ * Every write and every lookup goes through this, so a number is stored one way and
+ * found one way. A local number with no country code takes the shop's default country
+ * (utils/phone.DEFAULT_COUNTRY_CODE); anything already international is trusted as given.
  */
 export function normalisePhone(raw: string): string {
-  let p = raw.replace(/\s+/g, '');
-  if (p.startsWith('00')) p = p.slice(2);
-  else if (p.startsWith('+')) p = p.slice(1);
-  
-  // Remove 92 country code
-  if (p.startsWith('92')) {
-    p = p.slice(2);
-  }
-  
-  // Ensure it starts with 0
-  if (!p.startsWith('0')) {
-    p = '0' + p;
-  }
-  
-  return p;
+  // E.164: '+' then country code then the subscriber number — ONE canonical spelling,
+  // so the same person typing "0300 1234567", "+92 300 1234567" or "0092 3001234567"
+  // always resolves to the same login.
+  //
+  // This used to strip only '92' and force a leading '0' onto everything else, which
+  // mangled every non-Pakistani number: a Dubai +971501234567 was stored as
+  // 0971501234567 and a US +12125551234 as 012125551234. It was self-consistent, so
+  // login still worked — but the stored value was not a phone number, and you cannot
+  // recover the real one from it. That matters now: this value is about to become the
+  // Firebase Auth identifier, and once it is, it is frozen.
+  //
+  // The country logic is NOT re-implemented here. utils/phone.internationalPhone already
+  // resolves the four shapes this field accepts (and documents why a hardcoded country
+  // list sent Saudi numbers to Pakistani strangers). A second copy of that rule is how
+  // the two would drift.
+  // A LOGIN FIELD IS TYPED, and people leave the trunk '0' off: "3001234567" is the same
+  // number as "03001234567". internationalPhone reads a number with no leading 0 as
+  // "already carries a country code" — correct for a stored contact number, wrong here,
+  // and it produced '+3000000000', an account only reachable by typing it that same way.
+  // Restore the trunk 0 first, so the shared helper sees the shape it documents.
+  const typed = raw.trim();
+  const bare = typed.replace(/\D/g, '');
+  const looksNational =
+    !typed.startsWith('+') && !bare.startsWith('00') && !bare.startsWith('0') &&
+    bare.length === MAX_NATIONAL_DIGITS;
+  const digits = internationalPhone(looksNational ? '0' + bare : raw);
+  // Too short to be a number at all (a half-typed field). Return the bare digits so the
+  // lookup simply finds nobody, rather than throwing inside a login attempt.
+  if (!digits) return bare;
+  return '+' + digits;
 }
 
 // Used by login: verifies password and returns the public user, or null on failure.
@@ -213,6 +232,40 @@ export const changeOwnPassword = async (userId: string, currentPassword: string,
   const problem = accountPasswordProblem(newPassword);
   if (problem) throw new Error(problem + '.');
   if (currentPassword === newPassword) throw new Error('The new password must be different from the current one.');
+
+  // FIREBASE MOVES FIRST, and the local hash only follows if it succeeded.
+  //
+  // A local hash never syncs (syncHelpers.LOCAL_ONLY_FIELDS), so it is per device, while
+  // the Firebase credential is shared. If the local hash moved first and Firebase then
+  // refused, the two would be permanently out of step and this phone could never upload
+  // again. Failing before anything changes is the only ordering with no broken state.
+  // Loading the Firebase layer must not be able to break a local password change: the
+  // module pulls in the web SDK, and if that fails to load for any reason the right
+  // outcome is "there is no sync to keep in step", not a refused change.
+  const firebaseConfigured = await (async () => {
+    try {
+      const { IS_FIREBASE_CONFIGURED } = await import('../firebase/firebaseConfig');
+      return IS_FIREBASE_CONFIGURED;
+    } catch {
+      return false;
+    }
+  })();
+  if (firebaseConfigured) {
+    // CHANGING A PASSWORD REQUIRES CONNECTIVITY, and that is a deliberate trade. It is
+    // rare and intentional, unlike writing a transaction, which must keep working offline
+    // and still does — nothing else in this app asks for a network.
+    const { useSyncStore } = await import('../../store/useSyncStore');
+    if (!useSyncStore.getState().isOnline) throw new Error('PASSWORD_CHANGE_NEEDS_ONLINE');
+
+    const { changeFirebasePassword } = await import('../firebase/firebaseAuth');
+    const result = await changeFirebasePassword(record.phone, currentPassword, newPassword);
+    if (result.status === 'failed') {
+      throw new Error(result.code === 'password-divergence'
+        ? 'PASSWORD_DIVERGED'
+        : 'PASSWORD_CHANGE_FAILED');
+    }
+  }
+
   await changePassword(userId, newPassword);
 };
 

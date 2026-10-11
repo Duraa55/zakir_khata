@@ -307,7 +307,7 @@ check(25,'removing a staff member never changes anyone else\'s figures',at('src/
  assert.equal(h.one("SELECT is_deleted FROM users WHERE id='subA'").is_deleted,1,'the login is soft-deleted, never dropped');
 }));
 check(26,'correct password works before removal and fails after removal',at('src/services/database/userDb.ts','export const verifyUserLogin'),()=>isolated(async h=>{
- seedPeople(h);const api=users(h);const hash=await api.hashPassword('FixturePass1');h.sqlite.prepare("UPDATE users SET passwordHash=?,phone=? WHERE id='subA'").run(hash,'03101111111');
+ seedPeople(h);const api=users(h);const hash=await api.hashPassword('FixturePass1');h.sqlite.prepare("UPDATE users SET passwordHash=?,phone=? WHERE id='subA'").run(hash,'+923101111111');
  assert.equal((await api.verifyUserLogin('03101111111','FixturePass1')).id,'subA');await api.deactivateUser('subA');assert.equal(await api.verifyUserLogin('03101111111','FixturePass1'),null);
 }));
 check(27,'people lists stay within their owner/staff branch',at('src/services/database/userDb.ts','export const getUsersInScope'),()=>isolated(async h=>{
@@ -2408,10 +2408,18 @@ check(94,'Add Staff creates the login and the staff_record together, linked; the
  const row=h.one('SELECT * FROM staff_records WHERE id=?',a.staff.id),login=h.one('SELECT * FROM users WHERE id=?',a.user.id);
  assert.equal(row.linked_user_id,login.id);assert.equal(row.user_id,'owner','profile is scoped to its creator, as before');
  assert.equal(login.parentId,'owner');assert.equal(login.role,'staff');assert.equal(login.account_level,'staff');
- assert.equal(login.phone,'03105550001','phone stored in the form login looks up');assert.equal(row.phone,login.phone,'profile and login agree on phone');
+ // E.164 since the normalisePhone fix: ONE canonical spelling, because this value is
+ // about to become the Firebase Auth identifier.
+ assert.equal(login.phone,'+923105550001','phone stored in the form login looks up');assert.equal(row.phone,login.phone,'profile and login agree on phone');
  assert.equal(row.role,'Driver','job title stays in staff_records.role');assert.equal(row.monthly_salary,3000000);
  // Phone is the username: typed with spacing / country code, it still logs in.
  assert.equal((await users(h).verifyUserLogin('0310 5550001','FixturePass1')).id,a.user.id);
+ // A NON-Pakistani number keeps its own country code. It used to be flattened to
+ // '0971501234567' — self-consistent, so login worked, but not a phone number and not
+ // recoverable into one. This field becomes the auth key, so it has to be real.
+ const uae=await api.createStaffMember(form('Dubai Staff','+971 50 1234567'));
+ assert.equal(h.one('SELECT phone FROM users WHERE id=?',uae.user.id).phone,'+971501234567','a UAE number was mangled into the local shape');
+ assert.equal((await users(h).verifyUserLogin('+971501234567','FixturePass1')).id,uae.user.id,'and it must still log in');
  // The link survives a reopen.
  await h.boot();api=h.load('src/services/database/managedAccountDb.ts');h.login('owner');
  assert.equal(h.one('SELECT u.id FROM staff_records s JOIN users u ON u.id=s.linked_user_id WHERE s.id=?',a.staff.id).id,a.user.id,'link survives reopen');
@@ -2751,7 +2759,7 @@ check(99,'overpayment carries forward as an advance: closing a month snapshots i
 check(100,'upgrading an EXISTING database reaches the latest version: v38 creates salary_month_closings on a v37 database and every pre-existing row survives',at(dbPath,'if (version < 38)'),()=>isolated(async h=>{
  seedPeople(h);
  // A device that has been in use since before the salary work.
- h.insert('staff_records',{id:'staff_live',user_id:'staffA',name_en:'In Use',phone:'03006660001',role:'Driver',joining_date:'2026-01-01',area:'Khuzdar',business_type:'Retail',monthly_salary:300000,created_at:'2026-01-01T00:00:00.000Z'});
+ h.insert('staff_records',{id:'staff_live',user_id:'staffA',name_en:'In Use',phone:'+923006660001',role:'Driver',joining_date:'2026-01-01',area:'Khuzdar',business_type:'Retail',monthly_salary:300000,created_at:'2026-01-01T00:00:00.000Z'});
  h.insert('staff_salary_transactions',{id:'sal_live',staff_id:'staff_live',user_id:'staffA',type:'cash_out',amount:150000,date:'2026-09-05',month:'2026-09',created_at:'2026-09-05T00:00:00.000Z',is_deleted:0});
  // Exactly the device's state: a v37 database with no salary_month_closings.
  h.sqlite.exec('DROP TABLE IF EXISTS salary_month_closings');
@@ -2783,7 +2791,7 @@ check(101,'a migration never aborts the chain over a column it does not recognis
  // A real device accumulates columns no test fixture has. Before the fix, ONE of these
  // made v37 throw, which stopped v38 — the "no such table: salary_month_closings" crash.
  h.sqlite.exec("ALTER TABLE staff_records ADD COLUMN legacy_note TEXT");
- h.insert('staff_records',{id:'staff_odd',user_id:'staffA',name_en:'Odd Columns',phone:'03007770001',role:'Driver',joining_date:'2026-01-01',area:'Khuzdar',business_type:'Retail',monthly_salary:250000,legacy_note:'keep me',created_at:'2026-01-01T00:00:00.000Z'});
+ h.insert('staff_records',{id:'staff_odd',user_id:'staffA',name_en:'Odd Columns',phone:'+923007770001',role:'Driver',joining_date:'2026-01-01',area:'Khuzdar',business_type:'Retail',monthly_salary:250000,legacy_note:'keep me',created_at:'2026-01-01T00:00:00.000Z'});
  const before=plain(h.all('SELECT * FROM staff_records ORDER BY id'));
 
  await h.boot();
@@ -3506,6 +3514,16 @@ check(113,'batch 3: search finds real customers and treats % and _ literally; un
  const sc=read('src/screens/sync/SyncCenterScreen.tsx');
  assert.ok(!/DELETE FROM sync_queue/i.test(sc),'Sync Center must not hard-delete the queue');
  assert.ok(/SET status = 'dismissed' WHERE status = 'failed'/.test(sc));
+ // ...and stopping is REVERSIBLE. It is offered on a card labelled FAILED, at the moment
+ // someone is most likely to press anything at all, and nothing in the app could undo it:
+ // the rows were loaded by no query and shown in no section, so a reinstall was the only
+ // way back. That is the one unrecoverable state this queue has, and it is now two-way.
+ assert.ok(sc.includes("status IN ('pending', 'failed', 'dismissed')"),
+  'the Sync Centre does not LOAD the stopped rows, so nothing on screen can offer them back');
+ assert.ok(sc.includes("SET status = 'pending' WHERE status = 'dismissed'"),
+  'there is no way back from \"Stop retrying\"');
+ assert.ok(sc.includes('syncResumeUploading')&&sc.includes('syncStopped'),
+  'the undo exists in the data layer but no section offers it');
  for(const m of read('src/services/syncProcessor.ts').match(/SELECT COUNT\(\*\) as count FROM sync_queue[^`]*/g)||[])assert.ok(/status IN \('pending', 'failed'\)/.test(m),'count: '+m);
 
  // Batch 3 screens: tokens only, no emoji, two weights.
@@ -5117,6 +5135,728 @@ check(138,'SUB-STAFF HAVE NO LOGIN, enforced at the door: a legacy account_level
   'the login gate is gone');
 }));
 
+check(139,'v44 clears the sync backlog on an EXISTING database and nothing else: every queued row goes whatever its status, pending_count follows, entries/customers/audit history are untouched, it is idempotent, and a database with no sync_queue still advances instead of stranding every later migration',at(dbPath,'user_version = 44'),()=>isolated(async h=>{
+ // An existing, populated v43 device — NOT a fresh install. That is the case that matters.
+ assert.equal(h.one('PRAGMA user_version').user_version,43,'fixture must start at 43');
+ seedPeople(h);h.login('owner');
+
+ // Business data that must survive, written through the real paths so the queue fills
+ // exactly the way a real device filled it.
+ const cust=await customerDb(h).addCustomer({user_id:'owner',name:'Keep Me',cnic:'12345-6789012-3'});
+ const txn=await khata(h).createTransaction('owner','Keep Me',25000,'lena','note',date);
+ await khata(h).updateTransaction(txn.id,'owner',{amount_paisa:26000});
+ const survivors={
+  customers:h.one('SELECT COUNT(*) AS n FROM customers').n,
+  transactions:h.one('SELECT COUNT(*) AS n FROM transactions').n,
+  entry_audit:h.one('SELECT COUNT(*) AS n FROM entry_audit').n,
+  users:h.one('SELECT COUNT(*) AS n FROM users').n,
+ };
+ assert.ok(survivors.entry_audit>0,'fixture: the edit must have written audit history');
+
+ // Rows in every status, including the 'dismissed' ones the Sync Centre hides but keeps.
+ for(const st of ['pending','failed','syncing','dismissed'])
+  h.insert('sync_queue',{id:'q_'+st,table_name:'bills',record_id:'b1',operation:'create',
+   payload:'{}',firestore_path:'users/owner/bills/b1',status:st,created_at:date});
+ h.insert('sync_metadata',{table_name:'bills',pending_count:7});
+ const queued=h.one('SELECT COUNT(*) AS n FROM sync_queue').n;
+ assert.ok(queued>=4,'fixture must have a real backlog, got '+queued);
+
+ // ── Run v44 ────────────────────────────────────────────────────────────────
+ await h.boot();
+ assert.equal(h.one('PRAGMA user_version').user_version,latest,'the chain must reach the latest version');
+ assert.equal(h.one('SELECT COUNT(*) AS n FROM sync_queue').n,0,
+  'the backlog survived — enabling Firebase would attempt to upload it, including customer payloads that predate LOCAL_ONLY_FIELDS and still carry a cnic');
+ assert.equal(h.one("SELECT COUNT(*) AS n FROM sync_metadata WHERE pending_count != 0").n,0,
+  'pending_count still reports a backlog that no longer exists');
+
+ // NOTHING ELSE went. Every queued row was a copy of committed SQLite state.
+ for(const [table,n] of Object.entries(survivors))
+  assert.equal(h.one('SELECT COUNT(*) AS n FROM '+table).n,n,'v44 deleted rows from '+table+' — it must only clear the queue');
+ assert.equal(h.one('SELECT name FROM customers WHERE id=?',cust.id).name,'Keep Me','a customer was altered');
+ assert.equal(h.one('SELECT amount_paisa FROM transactions WHERE id=?',txn.id).amount_paisa,26000,'the edited entry lost its edit');
+ assert.equal(h.one('SELECT cnic FROM customers WHERE id=?',cust.id).cnic,'12345-6789012-3','the cnic is LOCAL data and stays on the phone');
+
+ // ── Idempotent ─────────────────────────────────────────────────────────────
+ h.insert('sync_queue',{id:'q_after',table_name:'bills',record_id:'b2',operation:'create',
+  payload:'{}',firestore_path:'users/owner/bills/b2',status:'pending',created_at:date});
+ await h.boot();
+ assert.equal(h.one('SELECT COUNT(*) AS n FROM sync_queue').n,1,
+  'v44 re-ran on an already-migrated database and cleared a queue it had no business touching');
+},43));
+
+check(140,'a database with NO sync_queue still advances past v44 rather than stranding every later migration (the v43 lesson)',at(dbPath,'user_version = 44'),()=>isolated(async h=>{
+ assert.equal(h.one('PRAGMA user_version').user_version,43);
+ // The entryAudit suite builds its own minimal schema; a partial database must not abort
+ // the chain. v43 proved what that costs: one throw strands every later migration.
+ h.sqlite.exec('DROP TABLE sync_queue');
+ await h.boot();
+ assert.equal(h.one('PRAGMA user_version').user_version,latest,
+  'the migration chain stalled on a database with no sync_queue');
+},43));
+
+check(141,'v45 upgrades an EXISTING database to E.164 instead of crashing it: stored phones are re-normalised so logins still resolve, a foreign number recovers its real country code, a would-be duplicate is skipped rather than aborting the chain, the second seeded admin is retired, and startup seeding no longer collides',at(dbPath,'user_version = 45'),()=>isolated(async h=>{
+ assert.equal(h.one('PRAGMA user_version').user_version,44,'fixture must start pre-E.164');
+ // Exactly what a real device holds after the OLD normalisePhone: local shape for
+ // everything, including a Dubai number flattened to 0971...
+ h.insert('users',{id:'u_pk',name:'Pak',phone:'03001234567',passwordHash:'x',role:'admin',account_level:'admin'});
+ h.insert('users',{id:'u_ae',name:'Dubai',phone:'0971501234567',passwordHash:'x',role:'staff',account_level:'staff',parentId:'u_pk'});
+ h.insert('users',{id:'test-admin-001',name:'AL-REEF Admin',phone:'03339999999',passwordHash:'x',role:'admin',account_level:'admin'});
+ // The seeded admin, in the old spelling — this is the row the startup guard must find.
+ h.insert('users',{id:'u_seed',name:'Admin',phone:'03000000000',passwordHash:'x',role:'admin',account_level:'admin'});
+ // A staff PROFILE copy of the login phone; it must move with it.
+ h.insert('staff_records',{id:'sr1',user_id:'u_pk',name_en:'Dubai',phone:'0971501234567',role:'Driver',joining_date:date,area:'Dubai',created_at:date});
+
+ await h.boot();
+ assert.equal(h.one('PRAGMA user_version').user_version,latest);
+
+ const phoneOf=id=>h.one('SELECT phone FROM users WHERE id=?',id).phone;
+ assert.equal(phoneOf('u_pk'),'+923001234567','a local number did not reach E.164 — every existing login would stop resolving');
+ assert.equal(phoneOf('u_ae'),'+971501234567','the flattened Dubai number must recover its real country code, not become +92971...');
+ assert.equal(h.one('SELECT phone FROM staff_records WHERE id=?','sr1').phone,'+971501234567','the profile copy drifted from its login');
+
+ // The login path and the stored value must agree — that is the whole point.
+ const udb=users(h);
+ assert.equal(udb.normalisePhone('03001234567'),'+923001234567');
+ assert.equal(udb.normalisePhone('0300 1234567'),'+923001234567','spacing must not make a different account');
+
+ // The second seeded admin is retired, not erased.
+ const legacy=h.one('SELECT is_deleted, deleted_at FROM users WHERE id=?','test-admin-001');
+ assert.equal(legacy.is_deleted,1,'the weak second admin still has a live login');
+ assert.ok(legacy.deleted_at,'soft delete must record when');
+ assert.ok(h.one('SELECT COUNT(*) AS n FROM users WHERE id=?','test-admin-001').n===1,'it is soft-deleted, never dropped');
+
+ // THE CRASH: startup seeding ran again after the rename and hit a hardcoded id.
+ // seedTestUsers is gone, and seedDatabase's guard now matches the normalised row.
+ const seed=h.load('src/services/database/seedData.ts');
+ assert.equal(seed.seedTestUsers,undefined,'seedTestUsers is back — it ships a weak admin and survives every wipe');
+ const before=h.one('SELECT COUNT(*) AS n FROM users').n;
+ await seed.seedDatabase();
+ assert.equal(h.one('SELECT COUNT(*) AS n FROM users').n,before,'seedDatabase re-seeded over an existing admin — this is the UNIQUE constraint crash');
+},44));
+
+check(142,'v45 refuses to merge two accounts that normalise to the same number, and does not abort the chain doing it',at(dbPath,'is already taken'),()=>isolated(async h=>{
+ // Two spellings of ONE number is a duplicate account the owner has to resolve. Rewriting
+ // both would hit users.phone UNIQUE; guessing a merge would silently join two ledgers.
+ h.insert('users',{id:'u_a',name:'A',phone:'+923001234567',passwordHash:'x',role:'admin',account_level:'admin'});
+ h.insert('users',{id:'u_b',name:'B',phone:'03001234567',passwordHash:'x',role:'staff',account_level:'staff',parentId:'u_a'});
+ await h.boot();
+ assert.equal(h.one('PRAGMA user_version').user_version,latest,'a collision aborted the migration chain');
+ assert.equal(h.one('SELECT phone FROM users WHERE id=?','u_a').phone,'+923001234567','the already-correct row must be left alone');
+ assert.equal(h.one('SELECT phone FROM users WHERE id=?','u_b').phone,'03001234567','the colliding row stays as it was rather than being merged away');
+ assert.equal(h.one('SELECT COUNT(*) AS n FROM users').n,2,'no account was dropped');
+},44));
+
+check(143,'v46 adds users.firebase_uid as the local-id-to-Firebase-uid MAPPING: it upgrades an existing database without touching a row, starts NULL for everyone, is UNIQUE so two accounts can never claim one identity while many NULLs coexist, and the document path stays the LOCAL id',at(dbPath,'user_version = 46'),()=>isolated(async h=>{
+ assert.equal(h.one('PRAGMA user_version').user_version,45,'fixture must start before v46');
+ seedPeople(h);
+ const before=plain(h.all('SELECT id, name, phone, role, parentId FROM users ORDER BY id'));
+
+ await h.boot();
+ assert.equal(h.one('PRAGMA user_version').user_version,latest);
+
+ const cols=h.all('PRAGMA table_info(users)').map(c=>c.name);
+ assert.ok(cols.includes('firebase_uid'),'the mapping column is missing — Auth would have nowhere to record the uid');
+ // An upgrade must not disturb a single existing account.
+ assert.deepEqual(plain(h.all('SELECT id, name, phone, role, parentId FROM users ORDER BY id')),before,'v46 altered existing accounts');
+ assert.equal(h.one('SELECT COUNT(*) AS n FROM users WHERE firebase_uid IS NOT NULL').n,0,
+  'every account must start unmapped: we hold a password HASH, not a password, so no Firebase account can exist yet');
+
+ // MANY NULLs are fine under the unique index — that is the normal state for every row.
+ assert.ok(h.one('SELECT COUNT(*) AS n FROM users').n>=4,'fixture needs several unmapped accounts');
+
+ // ...but two accounts may never claim ONE Firebase identity: that would let one
+ // person's writes pass the rules as another's.
+ h.sqlite.prepare("UPDATE users SET firebase_uid='fb_same' WHERE id='owner'").run();
+ assert.throws(()=>h.sqlite.prepare("UPDATE users SET firebase_uid='fb_same' WHERE id='staffA'").run(),
+  /UNIQUE|constraint/i,'two local accounts were allowed to share one Firebase uid');
+ // A different uid is fine.
+ h.sqlite.prepare("UPDATE users SET firebase_uid='fb_other' WHERE id='staffA'").run();
+ assert.equal(h.one("SELECT firebase_uid FROM users WHERE id='staffA'").firebase_uid,'fb_other');
+
+ // Re-running is a no-op: the column and the index are both IF NOT EXISTS.
+ await h.boot();
+ assert.equal(h.one("SELECT firebase_uid FROM users WHERE id='owner'").firebase_uid,'fb_same','a reopen wiped the mapping');
+
+ // The PATH KEY is unchanged: documents are still addressed by the LOCAL id, because an
+ // owner must be able to read a staff member's books and those sit under the staff
+ // member's identity. Authorisation rides on the document, not the path.
+ const helpers=read('src/services/database/syncHelpers.ts');
+ assert.ok(!/firebase_uid/.test(helpers),'the write path should not key documents on the Firebase uid yet — that is step 6, and it goes on the payload, not the path');
+},45));
+
+check(144,'startup seeding can never leave the app unreachable: a SOFT-DELETED row holding the bootstrap number is revived rather than silently skipped, a live admin is left exactly as it is, and the password is never reset',at('src/services/database/seedData.ts','was soft-deleted'),()=>isolated(async h=>{
+ const udb=users(h);
+ const seed=h.load('src/services/database/seedData.ts');
+ const hash=await udb.hashPassword('Admin@12345');
+ const phone=udb.normalisePhone(seed.ADMIN_SEED_PHONE);
+
+ // ── The lockout: the bootstrap number is held by a REMOVED row ───────────────
+ // The old guard counted it, skipped creation, and login then found no live account.
+ // It cannot be repaired by creating a second row either: users.phone is UNIQUE.
+ h.sqlite.prepare('INSERT INTO users (id,name,phone,passwordHash,role,account_level,is_deleted,createdAt,updatedAt) VALUES (?,?,?,?,?,?,1,?,?)')
+  .run('u_removed','Admin',phone,hash,'admin','admin',date,date);
+ assert.equal(await udb.verifyUserLogin(seed.ADMIN_SEED_PHONE,'Admin@12345'),null,'fixture: locked out to begin with');
+
+ await seed.seedDatabase();
+ assert.equal(h.one('SELECT COUNT(*) AS n FROM users').n,1,'a second row was created on a UNIQUE phone');
+ const revived=h.one('SELECT is_deleted, deleted_at, role, passwordHash FROM users WHERE id=?','u_removed');
+ assert.equal(revived.is_deleted,0,'the only account holding the bootstrap number is still removed — the app is unreachable');
+ assert.equal(revived.deleted_at,null,'a revived account must not keep a removal date');
+ assert.equal(revived.role,'admin','the bootstrap account must come back as an admin');
+ assert.equal(revived.passwordHash,hash,'seeding must never reset an existing password');
+ assert.ok(await udb.verifyUserLogin(seed.ADMIN_SEED_PHONE,'Admin@12345'),'still cannot log in after seeding');
+ // Typing it either way works, since both normalise to the stored spelling.
+ assert.ok(await udb.verifyUserLogin(phone,'Admin@12345'),'the E.164 spelling must resolve too');
+
+ // ── A LIVE admin is left completely alone ────────────────────────────────────
+ const before=plain(h.all('SELECT * FROM users ORDER BY id'));
+ await seed.seedDatabase();
+ assert.deepEqual(plain(h.all('SELECT * FROM users ORDER BY id')),before,'seeding touched an account that was already fine');
+}));
+
+check(145,'EVERY accepted spelling of one number resolves to the SAME account: the trunk zero may be present or absent, the country code written +92, 0092 or omitted, and spacing anywhere — all of them are one login, and a foreign number is never folded into the local one',at('src/services/database/userDb.ts','export function normalisePhone'),()=>isolated(async h=>{
+ const udb=users(h);
+ // The bare national form is the one that broke: internationalPhone reads "no leading 0"
+ // as "already carries a country code", which is right for a stored contact number and
+ // wrong for a TYPED login — it produced '+3000000000', an account reachable only by
+ // typing it back that same way.
+ const SPELLINGS=['03000000000','3000000000','+923000000000','00923000000000','+92 300 0000000','0300 0000000','0092-300-0000000'];
+ const canonical='+923000000000';
+ for(const f of SPELLINGS) assert.equal(udb.normalisePhone(f),canonical,JSON.stringify(f)+' must be the same number as '+canonical);
+
+ // ...and it is one ACCOUNT, not merely one string.
+ seedPeople(h);h.login('owner');
+ const api=h.load('src/services/database/managedAccountDb.ts');
+ const made=await api.createStaffMember({name_en:'One Person',phone:'03000000000',password:'FixturePass1',
+  role:'Driver',joining_date:date,area:'Khuzdar',business_type:'Retail'});
+ assert.equal(h.one('SELECT phone FROM users WHERE id=?',made.user.id).phone,canonical,'stored in the canonical spelling');
+ for(const f of SPELLINGS){
+  const got=await udb.verifyUserLogin(f,'FixturePass1');
+  assert.ok(got&&got.id===made.user.id,'typing '+JSON.stringify(f)+' did not reach the account');
+ }
+ // A second account cannot be created from another spelling of the same number.
+ await assert.rejects(api.createStaffMember({name_en:'Twin',phone:'3000000000',password:'FixturePass1',
+  role:'Driver',joining_date:date,area:'Khuzdar',business_type:'Retail'}),/already has a login/,
+  'a second spelling created a DUPLICATE account for one person');
+
+ // A foreign number keeps its own country code — the fix must not swallow everything.
+ assert.equal(udb.normalisePhone('+971501234567'),'+971501234567');
+ assert.equal(udb.normalisePhone('00971501234567'),'+971501234567');
+ assert.equal(udb.normalisePhone('0971501234567'),'+971501234567','the legacy flattened shape still recovers');
+ assert.notEqual(udb.normalisePhone('+12125551234'),canonical);
+}));
+
+check(146,'v47 repairs a phone that v45 normalised with the broken rule, and is narrow enough that it cannot touch a real number',at(dbPath,'MIS_NORMALISED'),()=>isolated(async h=>{
+ const udb=users(h);
+ const hash=await udb.hashPassword('Admin@12345');
+ // '+' plus exactly 10 digits is not valid E.164 for any currency this app supports
+ // (PK 12 digits, AE 12, US 11, CN 13), so it can only be the old bug's output.
+ h.sqlite.prepare('INSERT INTO users (id,name,phone,passwordHash,role,account_level,createdAt,updatedAt) VALUES (?,?,?,?,?,?,?,?)')
+  .run('u_broken','Admin','+3000000000',hash,'admin','admin',date,date);
+ // Real numbers of every supported shape must come through untouched.
+ const untouched={u_pk:'+923001234567',u_ae:'+971501234567',u_us:'+12125551234',u_cn:'+8613812345678'};
+ for(const [id,phone] of Object.entries(untouched))
+  h.sqlite.prepare('INSERT INTO users (id,name,phone,passwordHash,role,account_level,createdAt,updatedAt) VALUES (?,?,?,?,?,?,?,?)')
+   .run(id,id,phone,hash,'staff','staff',date,date);
+ h.insert('staff_records',{id:'sr_broken',user_id:'u_broken',name_en:'X',phone:'+3000000000',role:'Driver',joining_date:date,area:'K',created_at:date});
+
+ await h.boot();
+ assert.equal(h.one('PRAGMA user_version').user_version,latest);
+ assert.equal(h.one('SELECT phone FROM users WHERE id=?','u_broken').phone,'+923000000000','the unreachable account was not repaired');
+ assert.equal(h.one('SELECT phone FROM staff_records WHERE id=?','sr_broken').phone,'+923000000000','the profile copy must move with it');
+ for(const [id,phone] of Object.entries(untouched))
+  assert.equal(h.one('SELECT phone FROM users WHERE id=?',id).phone,phone,'v47 rewrote a REAL number: '+id);
+ // And the account is reachable the way a Pakistani writes it.
+ assert.ok(await h.load('src/services/database/userDb.ts').verifyUserLogin('03000000000','Admin@12345'),'still locked out after the repair');
+},46));
+
+check(147,'Firebase Auth is a SIDE-EFFECT of a login that already succeeded: it is never awaited, never throws, is tried only after the local password was accepted, signs in BEFORE creating so email-enumeration protection cannot stop it creating anyone, and records the uid by direct SQL so no user row can ever sync',at('src/services/firebase/firebaseAuth.ts','ensureFirebaseAccount'),()=>isolated(async h=>{
+ const fa=read('src/services/firebase/firebaseAuth.ts');
+ const store=read('src/store/authStore.ts');
+
+ // ── Never a precondition for logging in ──────────────────────────────────────
+ assert.ok(/void ensureFirebaseAccount\(/.test(store),
+  'login AWAITS the Firebase step — a hanging network call would hold the user out of their own books');
+ // It runs only after the local check passed and the session was written.
+ const callAt=store.indexOf('ensureFirebaseAccount(user.id');
+ const sessionAt=store.indexOf('set(authData)');
+ const verifyAt=store.indexOf('await verifyUserLogin');
+ assert.ok(verifyAt>=0&&sessionAt>verifyAt&&callAt>sessionAt,
+  'the Firebase step must come AFTER the local password check and the session write');
+ assert.ok(/return 'ok';/.test(store.slice(callAt)),"login must still return 'ok' regardless of the Firebase result");
+
+ // ── Never throws: every exit is a returned status ────────────────────────────
+ const body=fa.slice(fa.indexOf('export const ensureFirebaseAccount'));
+ assert.ok(!/\bthrow\b/.test(body),'ensureFirebaseAccount throws somewhere — it is called fire-and-forget and must not');
+ assert.ok(/status: 'skipped', code: 'not-configured'/.test(body),'it must no-op when Firebase is not configured');
+ assert.ok(body.indexOf("IS_FIREBASE_CONFIGURED")<body.indexOf('signInWithEmailAndPassword'),
+  'the configured check must come before any network call');
+
+ // ── Sign in BEFORE create ────────────────────────────────────────────────────
+ // With email-enumeration protection on, an unknown account returns
+ // auth/invalid-credential rather than auth/user-not-found, so "create on not-found"
+ // silently stops creating anyone. Only this order distinguishes new from wrong-password.
+ assert.ok(body.indexOf('signInWithEmailAndPassword')<body.indexOf('createUserWithEmailAndPassword'),
+  'create is attempted before sign-in — that order misreads Firebase and stops creating accounts');
+ assert.ok(body.includes('auth/email-already-in-use')&&body.includes('password-divergence')
+  &&body.indexOf('auth/email-already-in-use')<body.indexOf("return { status: 'failed', code: 'password-divergence' }"),
+  'an existing account with a different password must be reported as divergence, not as a generic failure');
+ for(const transient of ['auth/network-request-failed','auth/too-many-requests'])
+  assert.ok(body.includes(transient),'a transient failure ('+transient+') must be told apart from divergence');
+
+ // ── The uid is LOCAL mapping and must never leave the phone ──────────────────
+ assert.ok(/UPDATE users SET firebase_uid = \? WHERE id = \?/.test(fa),'the uid is recorded by direct SQL');
+ assert.ok(!/writeWithSync|writeRowWithSyncIn/.test(fa),
+  'the uid write must NOT go through the sync path — a queued users row would carry the password hash');
+ // And the hash is still barred from any payload.
+ const helpers=h.load('src/services/database/syncHelpers.ts');
+ assert.ok((helpers.LOCAL_ONLY_FIELDS.users||[]).includes('passwordHash'),'users.passwordHash left LOCAL_ONLY_FIELDS');
+ assert.equal(helpers.syncPayloadFor('users',{id:'u1',phone:'+92300',passwordHash:'secret'}).passwordHash,undefined,
+  'a users payload still carries the password hash');
+
+ // ── The login identity is derived from the canonical phone ───────────────────
+ assert.ok(/authEmailFor[\s\S]*replace\(/.test(fa)&&fa.includes("@${AUTH_EMAIL_DOMAIN}"),
+  'the synthetic email must be built from the DIGITS of the E.164 phone plus the synthetic domain');
+ assert.ok(/digikhata\.internal/.test(fa),'the synthetic domain is missing');
+}));
+
+check(148,'changing a password moves FIREBASE FIRST and refuses offline, so the shared credential and the per-device local hash can never drift apart; a divergence is explained in the user’s own language and resolved with Firebase as the tiebreaker',at('src/services/database/userDb.ts','PASSWORD_CHANGE_NEEDS_ONLINE'),()=>isolated(async h=>{
+ const udbSrc=read('src/services/database/userDb.ts');
+ const fn=udbSrc.slice(udbSrc.indexOf('export const changeOwnPassword'),udbSrc.indexOf('export const changePassword'));
+
+ // ── Ordering is the whole guarantee ──────────────────────────────────────────
+ // A local hash never syncs, so it is per device; the Firebase credential is shared. If
+ // the local hash moved first and Firebase then refused, this phone could never upload
+ // again. Failing before anything changes is the only ordering with no broken state.
+ assert.ok(fn.indexOf('changeFirebasePassword')<fn.indexOf('await changePassword(userId, newPassword)'),
+  'the local hash moves BEFORE Firebase — a Firebase refusal would then leave the two permanently out of step');
+ assert.ok(fn.indexOf('isOnline')<fn.indexOf('changeFirebasePassword'),
+  'connectivity must be checked before any network call');
+ assert.ok(/PASSWORD_CHANGE_NEEDS_ONLINE/.test(fn),'refusing offline must say WHY, not fail generically');
+ assert.ok(/IS_FIREBASE_CONFIGURED/.test(fn)&&/firebaseConfigured/.test(fn),
+  'with Firebase unconfigured there is nothing to keep in step and the change must still work');
+
+ // ── Every message reaches the user translated ────────────────────────────────
+ const dicts=(()=>{const g=harness();try{return {en:g.load('src/i18n/en.ts').en,ur:g.load('src/i18n/ur.ts').ur};}finally{g.dispose();}})();
+ const mapped=read('src/i18n/messageLabel.ts');
+ for(const sentinel of ['PASSWORD_CHANGE_NEEDS_ONLINE','PASSWORD_DIVERGED','PASSWORD_CHANGE_FAILED'])
+  assert.ok(mapped.includes(sentinel),sentinel+' is thrown but never mapped — the shopkeeper would read a raw sentinel');
+ for(const k of ['pwNeedsOnline','pwDiverged','pwChangeFailed','pwDivergedTitle','pwDivergedBody','pwDivergedAction','pwDivergedWrong','pwDivergedDone','pwDivergedPlaceholder']){
+  assert.ok(dicts.en[k]&&dicts.en[k].trim(),'missing en '+k);
+  assert.ok(dicts.ur[k]&&dicts.ur[k].trim(),'missing ur '+k);
+  assert.notEqual(dicts.ur[k],dicts.en[k],k+' is not actually translated');
+ }
+ // The offline refusal has to explain the reason, not just the rule.
+ assert.ok(/online/i.test(dicts.en.pwNeedsOnline)&&dicts.en.pwNeedsOnline.length>60,
+  'the offline message must tell the user WHY a password change needs a connection');
+
+ // ── Firebase is the tiebreaker, and the local hash follows IT ────────────────
+ const fa=read('src/services/firebase/firebaseAuth.ts');
+ const resolve=fa.slice(fa.indexOf('export const resolvePasswordDivergence'));
+ assert.ok(resolve.indexOf('signInWithEmailAndPassword')<resolve.indexOf('changePassword'),
+  'the local hash must only be updated AFTER Firebase accepts the password — otherwise the stale side wins');
+ assert.ok(/password-divergence/.test(read('src/store/authStore.ts')),'login must surface divergence to the UI');
+ const settings=read('src/screens/staff/SettingsScreen.tsx');
+ assert.ok(/passwordDiverged/.test(settings)&&/resolvePasswordDivergence/.test(settings),
+  'there is no way for the user to resolve a divergence');
+ // The CALL, not the word: the comment explaining why it is avoided mentions it too.
+ assert.ok(!/Alert\.prompt\s*\(/.test(settings),'Alert.prompt is iOS-only; the prompt must work on Android too');
+ // Divergence belongs to the account that hit it.
+ assert.ok(/passwordDiverged: false/.test(read('src/store/authStore.ts')),'the flag must be cleared on logout');
+}));
+
+check(149,'Firestore rules are IN THE REPO and are the PUBLISHED ones: read is gated on visibleTo, create pins ownerId to the caller, ownerId is immutable on update, and sane() refuses a document with no usable audience. Every allow line is WALKED, so no later edit can slip an any-signed-in-user rule past this the way the console-only one did',' firestore.rules',()=>{
+ const at=f=>path.join(root,'..',f);
+ for(const f of ['firestore.rules','firebase.json','.firebaserc','firestore.indexes.json'])
+  assert.ok(fs.existsSync(at(f)),f+' is missing — rules living only in the Firebase console cannot be reviewed, and nobody can tell when one changed');
+
+ const rules=fs.readFileSync(at('firestore.rules'),'utf8');
+ assert.ok(/rules_version = '2'/.test(rules),'rules_version 2 is required for the recursive wildcard used here');
+ // The ACTIVE text only. A commented example is fine; an active rule is not.
+ const active=rules.split('\n').filter(l=>!l.trim().startsWith('//')).join('\n');
+ assert.ok(/match \/users\/\{\w+\}\/\{document=\*\*\}/.test(active),
+  'the per-user match is gone — authorisation rides on the DOCUMENT, and nothing outside /users may match a rule at all');
+
+ // HELPERS ARE INLINED BEFORE ANYTHING IS ASSERTED. Matching `owner() == request.auth.uid`
+ // literally would pin the SPELLING rather than the guarantee: renaming a helper, or
+ // pointing it at a different field, would leave every assertion below still passing.
+ const helpers=[...active.matchAll(/function\s+(\w+)\s*\(\)\s*\{\s*return([\s\S]*?);\s*\}/g)]
+  .map(m=>[m[1],m[2].trim()]);
+ let resolved=active;
+ // Helpers call helpers (sane -> audience, owner), so substitute to a fixed point.
+ for(let pass=0;pass<=helpers.length;pass++)
+  for(const [name,body] of helpers) resolved=resolved.split(name+'()').join(body);
+ assert.ok(!/\bsane\(\)|\bowner\(\)|\baudience\(\)/.test(resolved),'a rule helper was left unresolved, so the assertions below would test nothing');
+
+ const norm=s=>s.replace(/\s+/g,' ').trim();
+ const blocks=[...resolved.matchAll(/allow\s+([a-z, ]+?)\s*:\s*if([\s\S]*?);/g)]
+  .map(m=>({ops:m[1].split(',').map(s=>s.trim()),body:norm(m[2])}));
+ const ops=blocks.flatMap(b=>b.ops).sort();
+ // No `allow write`, and NO `allow delete`: a removal is a soft delete, i.e. an UPDATE
+ // setting is_deleted, so a hard delete is refused by having no rule to match.
+ assert.deepEqual(ops,['create','read','update'],'the published rules grant read, create and update only — got: '+ops.join(','));
+
+ // THE WALK. This replaces a literal `!/if request\.auth != null;/`, which leaned on the
+ // trailing semicolon and so would have missed `if request.auth != null && true;` and
+ // every other spelling. Account creation is open to anyone holding the API key that
+ // ships in the APK, so a rule that asks only for a caller grants the whole database.
+ for(const b of blocks){
+  assert.ok(/request\.auth != null/.test(b.body),'an allow rule does not require a caller at all: '+b.body);
+  assert.ok(/ownerId|visibleTo/.test(b.body),
+   'an allow rule lets any signed-in caller through without testing ownerId or visibleTo: '+b.body);
+ }
+ assert.ok(!/if true/.test(active),'an unconditional allow is live');
+ assert.ok(!/allow read, write: if false;/.test(active),
+  'the deny-all of step 8a is still here, so this file is NOT what is published and a deploy would close the database');
+
+ const bodyOf=op=>{
+  const b=blocks.find(x=>x.ops.includes(op));
+  assert.ok(b,'there is no allow '+op+' rule');
+  return b.body;
+ };
+ // Read: the audience list, not the path. The path key is the LOCAL id, and an owner must
+ // be able to read a staff member’s books, which live under the staff member’s own id.
+ assert.ok(bodyOf('read').includes('request.auth.uid in resource.data.visibleTo'),
+  'read is not gated on the audience list: either an owner cannot read staff books, or everyone can read everyone’s');
+ // Create: the caller owns what they write.
+ assert.ok(bodyOf('create').includes('request.resource.data.ownerId == request.auth.uid'),
+  'create does not pin ownerId to the caller, so one business could write documents owned by another');
+ // Update: the EXISTING owner is the only editor, and ownerId cannot move.
+ assert.ok(bodyOf('update').includes('resource.data.ownerId == request.auth.uid'),
+  'update does not check the existing owner, so anyone merely in visibleTo could edit a document they may only read');
+ assert.ok(bodyOf('update').includes('request.resource.data.ownerId == resource.data.ownerId'),
+  'ownerId is not immutable on update — that is what stops a document being MOVED into another business’s view');
+ // sane(), on BOTH writes: a document whose owner cannot read it back must be unwritable.
+ // This is also what makes the "no visibleTo" state unreachable through the rules, so the
+ // read side needs no null guard (a bare document errors rather than denying, but it can
+ // only be made by hand in the console).
+ for(const op of ['create','update']){
+  assert.ok(bodyOf(op).includes('request.resource.data.visibleTo is list'),op+' does not require visibleTo to be a list');
+  assert.ok(bodyOf(op).includes('request.resource.data.ownerId in request.resource.data.visibleTo'),
+   op+' allows a document whose own owner is not in its audience, so the author could not read it back');
+ }
+
+ // The deploy target must be the project the app actually talks to.
+ const rc=JSON.parse(fs.readFileSync(at('.firebaserc'),'utf8'));
+ const gs=JSON.parse(fs.readFileSync(path.join(root,'google-services.json'),'utf8'));
+ assert.equal(rc.projects.default,gs.project_info.project_id,
+  '.firebaserc points at a different project from the one the app uses — rules would deploy somewhere harmless and the real database would stay open');
+ assert.equal(JSON.parse(fs.readFileSync(at('firebase.json'),'utf8')).firestore.rules,'firestore.rules');
+});
+
+check(150,'every uploaded document carries ownerId and visibleTo in FIREBASE uids, computed at UPLOAD time from the current tree: an owner can read their staff’s books, another business can read neither, a row whose author has no Firebase identity yet stays PENDING rather than failing, and a removed ancestor stops seeing anything',at('src/services/database/syncAuthorisation.ts','authorisationFor'),()=>isolated(async h=>{
+ const sa=h.load('src/services/database/syncAuthorisation.ts');
+ const db=h.load('src/services/database/db.ts');
+ const sqlite=await db.getDatabase();
+
+ // ── The author comes from the document PATH ─────────────────────────────────
+ assert.equal(sa.authorLocalIdFrom('users/owner/bills/b1'),'owner');
+ assert.equal(sa.authorLocalIdFrom('users/staffA/entry_audit/a1'),'staffA','audit rows must be authorised too');
+ for(const junk of ['','bills/b1','/users/x',null]) assert.equal(sa.authorLocalIdFrom(junk),null,'bad path: '+String(junk));
+
+ seedPeople(h);
+ const setUid=(id,uid)=>h.sqlite.prepare('UPDATE users SET firebase_uid=? WHERE id=?').run(uid,id);
+ setUid('owner','fb_owner');
+ setUid('staffA','fb_staffA');
+ setUid('otherOwner','fb_other');
+
+ // ── A staff member's row is visible to them AND to their owner ──────────────
+ const staff=await sa.authorisationFor(sqlite,'staffA');
+ assert.equal(staff.ownerId,'fb_staffA','the document belongs to its AUTHOR, not to the owner');
+ assert.deepEqual(sorted(staff.visibleTo),sorted(['fb_staffA','fb_owner']),
+  'an owner must be able to read a staff member’s books — that is the product');
+ // ...and to nobody else. This is the cross-business guarantee.
+ assert.ok(!staff.visibleTo.includes('fb_other'),'another business can see a staff member’s books');
+
+ // ── The owner's own rows are not visible to their staff ─────────────────────
+ const owner=await sa.authorisationFor(sqlite,'owner');
+ assert.equal(owner.ownerId,'fb_owner');
+ // plain(): the harness loads modules in their own realm, so an array built INSIDE one
+ // has a different Array.prototype and assert/strict rejects it on prototype alone.
+ assert.deepEqual(plain(owner.visibleTo),['fb_owner'],'visibility flows DOWNWARD only; staff must not read the owner’s books');
+
+ // ── No Firebase identity yet => do not upload, do not fail ──────────────────
+ assert.equal(await sa.authorisationFor(sqlite,'staffB'),null,
+  'a row whose author has never logged in since Auth landed must not be uploaded without an ownerId');
+ setUid('staffB','fb_staffB');
+ assert.ok(await sa.authorisationFor(sqlite,'staffB'),'once they log in, the same row becomes uploadable');
+
+ // ── A removed account stops seeing anything ────────────────────────────────
+ assert.equal(await sa.authorisationFor(sqlite,'u_missing'),null,'an unknown author cannot be authorised');
+ h.sqlite.prepare("UPDATE users SET is_deleted=1 WHERE id='owner'").run();
+ const afterRemoval=await sa.authorisationFor(sqlite,'staffA');
+ assert.deepEqual(plain(afterRemoval.visibleTo),['fb_staffA'],'a REMOVED owner must stop reading their old team’s books');
+ h.sqlite.prepare("UPDATE users SET is_deleted=0 WHERE id='owner'").run();
+
+ // ── A cycle must not hang the uploader ─────────────────────────────────────
+ h.sqlite.prepare("UPDATE users SET parentId='staffA' WHERE id='owner'").run();
+ const cyclic=await sa.authorisationFor(sqlite,'staffA');
+ assert.ok(cyclic&&cyclic.visibleTo.length<=3,'a parentId cycle must terminate, not spin');
+
+ // ── The payload is stamped, never stored as columns ────────────────────────
+ const stamped=sa.authorisedPayload({id:'b1',total:500},{ownerId:'fb_x',visibleTo:['fb_x','fb_y']});
+ assert.equal(stamped.ownerId,'fb_x');assert.deepEqual(plain(stamped.visibleTo),['fb_x','fb_y']);
+ assert.equal(stamped.total,500,'the row itself must survive the stamping');
+ for(const t of ['bills','customers','expenses','transactions'])
+  assert.ok(!h.all('PRAGMA table_info('+t+')').some(c=>c.name==='ownerId'||c.name==='visibleTo'),
+   t+' grew an ownerId/visibleTo COLUMN — these are computed at upload, not stored');
+
+ // ── Both uploaders stamp, and neither buries an unauthorised row ───────────
+ const proc=read('src/services/syncProcessor.ts');
+ assert.ok(/authorisedPayload\(payload, authorisation\)/.test(proc),'the single uploader must stamp the payload');
+ assert.equal((proc.match(/authorisationFor\(db, authorId\)/g)||[]).length,2,'BOTH uploaders must authorise, or one of them bypasses the rules');
+ assert.ok(/status='pending' WHERE id=\?/.test(proc),'an unauthorised row must stay PENDING, never be marked failed');
+ assert.ok(/batched\.push\(item\)/.test(proc)&&/for \(const item of batched\)/.test(proc),
+  'the batch must mark synced only what it actually sent — otherwise a skipped row is deleted unsent');
+}));
+
+check(151,'a cold start RESTORES the Firebase session before anything can reach Firestore, a logout drops it, and a row is only ever offered under its OWN author’s identity — so once the real rules land, a denial can only mean the rules',at('src/services/firebase/firebaseAuth.ts','currentFirebaseUid'),()=>{
+ const fa=read('src/services/firebase/firebaseAuth.ts');
+ const boot=read('src/navigation/AppNavigator.tsx');
+ const store=read('src/store/authStore.ts');
+ const proc=read('src/services/syncProcessor.ts');
+
+ // ── The persisted session is read back, and the read WAITS for it ───────────
+ const uid=fa.slice(fa.indexOf('export const currentFirebaseUid'));
+ assert.ok(uid.includes('authStateReady()')&&uid.indexOf('authStateReady()')<uid.indexOf('currentUser'),
+  'currentUser is read before the restore has landed — it reports "signed out" for someone who is about to be signed in');
+ assert.ok(!uid.includes('throw'),'the uid lookup is asked on every sync run and at boot; it must never fail its caller');
+
+ // ── Boot asks BEFORE Firestore can instantiate auth in memory ─────────────
+ assert.ok(boot.includes('currentFirebaseUid()'),
+  'nothing restores the Firebase session at launch: a restart without a fresh login uploads as nobody, and every row is refused for a reason that is not the rules');
+ assert.ok(boot.indexOf('currentFirebaseUid()')<boot.indexOf('await getDatabase()'),
+  'the restore must come before the database, whose seeding and migrations can already queue a write');
+
+ // ── Logging out leaves FIREBASE too ──────────────────────────────
+ assert.ok(store.includes('await signOutFirebase()'),
+  'logout keeps the Firebase credential, so the NEXT person on a shared phone has their rows offered as the last one');
+ const out=fa.slice(fa.indexOf('export const signOutFirebase'));
+ assert.ok(out.includes('catch'),'a Firebase failure must not be able to hold a logout up');
+
+ // ── Both workers resolve the caller BEFORE Firestore, and gate every row on it ──
+ assert.equal(proc.split('const signedInUid = await currentFirebaseUid();').length-1,2,
+  'both uploaders must know who they are — one that does not writes unauthenticated');
+ for(const worker of proc.split('export async function').slice(1)){
+  assert.ok(worker.indexOf('currentFirebaseUid()')<worker.indexOf('getFirestoreDB()'),
+   'Firestore is asked for FIRST, so it instantiates auth with in-memory persistence and the saved session is never read back');
+  assert.ok(worker.includes('authorisation.ownerId !== signedInUid'),
+   'a row is offered under whatever session happens to be open; the rules compare the stamped ownerId to the CALLER');
+  assert.ok(worker.includes('if (!signedInUid)'),'a signed-out run must send nothing rather than write unauthenticated');
+ }
+});
+check(152,'ONE map from table to Firestore path, checked against the MIGRATED SCHEMA and against every path literal in src: the two camelCase author columns, the five tables with no author column at all, a leaf collection that cannot be ambiguous for a collection-group pull, an always-even document path, and no table left silently unaccounted for',at('src/services/database/syncPaths.ts','SYNC_PATHS'),()=>isolated(async h=>{
+ const sp=h.load('src/services/database/syncPaths.ts');
+ const db=h.load('src/services/database/db.ts');
+ const sqlite=await db.getDatabase();
+ const columnsOf=t=>new Set(h.all('PRAGMA table_info('+t+')').map(c=>c.name));
+ const specs=Object.entries(sp.SYNC_PATHS);
+ assert.ok(specs.length>20,'the map is empty or did not load, so everything below would pass vacuously');
+
+ // ── Every spec addresses a DOCUMENT, not a collection ──────────────────────────────────
+ // users + author + segments + id must come out even. An even segments length would build a
+ // path Firestore rejects outright, and the row would fail on its first attempt for good.
+ for(const [table,spec] of specs){
+  assert.equal(spec.segments.length%2,1,table+': '+spec.segments.length+' segments makes the full path odd, which addresses a collection and can never be written');
+  for(const s of spec.segments) assert.ok(/^(\{\w+\}|[a-z_]+)$/.test(s),table+': segment "'+s+'" is neither a fixed name nor a {column} placeholder');
+ }
+
+ // ── The map agrees with the real schema ────────────────────────────────────────────────
+ // The author resolved here becomes the users/{…} path key, which syncAuthorisation reads
+ // back to stamp ownerId — so a wrong column name is not a typo, it is a row filed under the
+ // wrong account or refused by the rules.
+ for(const [table,spec] of specs){
+  const cols=columnsOf(table);
+  assert.ok(cols.size,table+' is in the map but has no table in the migrated schema');
+  assert.ok(cols.has('id'),table+' has no id column, so its documents cannot be keyed');
+  if(spec.author.kind==='column'){
+   assert.ok(cols.has(spec.author.column),table+'.'+spec.author.column+' does not exist — that column is where the path key, and so the authorisation, comes from');
+  }else{
+   assert.ok(cols.has(spec.author.fk),table+'.'+spec.author.fk+' does not exist, so the parent row cannot be found');
+   assert.ok(sp.SYNC_PATHS[spec.author.parentTable],table+' resolves its author through '+spec.author.parentTable+', which is not itself in the map');
+   assert.ok(columnsOf(spec.author.parentTable).has(spec.author.parentColumn),spec.author.parentTable+'.'+spec.author.parentColumn+' does not exist');
+  }
+  for(const s of spec.segments){
+   const m=/^\{(\w+)\}$/.exec(s);
+   if(m) assert.ok(cols.has(m[1]),table+'.'+m[1]+' does not exist, so the nested path cannot be built');
+  }
+ }
+ // The three nothing else in the schema would lead you to guess.
+ assert.equal(sp.SYNC_PATHS.transactions.author.column,'userId','transactions is one of the two camelCase tables');
+ assert.equal(sp.SYNC_PATHS.cashbook.author.column,'userId','cashbook is the other');
+ assert.equal(sp.SYNC_PATHS.entry_audit.author.column,'entry_owner_id','an audit row belongs to the ENTRY owner, never to the actor who edited it');
+
+ // ── A leaf collection must identify exactly ONE table ──────────────────────────────────
+ // Pull reaches a nested collection with a collection-group query, which names the leaf and
+ // nothing else. Two tables sharing one leaf come back as a single stream nobody can split.
+ const leaves=Object.keys(sp.SYNC_PATHS).map(t=>sp.leafCollectionOf(t));
+ const dupes=leaves.filter((l,i)=>leaves.indexOf(l)!==i);
+ assert.equal(dupes.length,0,'tables share a leaf collection, so a collection-group pull could not tell them apart: '+dupes.join(', '));
+ for(const t of Object.keys(sp.SYNC_PATHS)) assert.equal(sp.tableForLeafCollection(sp.leafCollectionOf(t)),t,t+' does not round-trip through its own leaf');
+ assert.equal(sp.tableForLeafCollection('nothing_like_this'),null);
+
+ // ── Nothing carrying a firestore_path may be unaccounted for ──────────────────────────
+ // The silence is the bug: stock_movements had no path and no mention anywhere, so there was
+ // nothing for anyone to notice it against.
+ for(const r of h.all("SELECT name FROM sqlite_master WHERE type='table'")){
+  if(!columnsOf(r.name).has('firestore_path')) continue;
+  const inMap=!!sp.SYNC_PATHS[r.name], localOnly=!!sp.LOCAL_ONLY_TABLES[r.name];
+  assert.ok(inMap||localOnly,r.name+' carries a firestore_path column but appears in neither SYNC_PATHS nor LOCAL_ONLY_TABLES');
+  assert.ok(!(inMap&&localOnly),r.name+' is listed as both synced and local-only');
+ }
+ for(const [t,why] of Object.entries(sp.LOCAL_ONLY_TABLES)) assert.ok(typeof why==='string'&&why.length>20,t+' is excluded from sync without a stated reason');
+
+ // ── pending means NOTHING ENQUEUES IT, and that is checked against src ────────────────
+ const enqueued=new Set(['entry_audit']);  // entryAuditDb enqueues directly, not via writeWithSync
+ const literals=[];
+ for(const file of sourceFiles(path.join(root,'src'))){
+  const src=fs.readFileSync(file,'utf8');
+  for(const m of src.matchAll(/tableName:\s*'([a-z_]+)'/g)) enqueued.add(m[1]);
+  for(const m of src.matchAll(/`users\/\$\{[^}]+\}\/([^`]+)`/g)) literals.push(m[1]);
+ }
+ for(const t of enqueued) assert.ok(sp.SYNC_PATHS[t],t+' is written through the sync writer but has no entry in SYNC_PATHS');
+ for(const [table,spec] of specs){
+  if(spec.pending) assert.ok(!enqueued.has(table),table+' is marked pending but something already enqueues it — clear the flag in the change that wires push');
+  else assert.ok(enqueued.has(table),table+' is in the map as live, but nothing in src ever enqueues it');
+ }
+
+ // ── Every path literal in src still agrees with the map ───────────────────────────────
+ assert.ok(literals.length>20,'the path literals could not be found, so this assertion would pass vacuously');
+ let matched=0;
+ for(const tail of literals){
+  const fixed=tail.split('/').slice(0,-1);   // drop the trailing ${id}
+  // entryAuditDb builds the audited book's own path with a DYNAMIC collection name, and the
+  // dead pullSyncService interpolates a whole collection. Neither can be matched statically.
+  if(!fixed.length||/^\$\{/.test(fixed[0])) continue;
+  const table=Object.keys(sp.SYNC_PATHS).find(t=>{
+   const segs=sp.SYNC_PATHS[t].segments;
+   return segs.length===fixed.length&&segs.every((s,i)=>/^\{\w+\}$/.test(s)?/^\$\{[^}]+\}$/.test(fixed[i]):s===fixed[i]);
+  });
+  assert.ok(table,'a path literal in src matches no entry in the map: users/${…}/'+tail);
+  matched++;
+ }
+ assert.ok(matched>20,'only '+matched+' literals were actually compared');
+
+ // ── pathForRow ────────────────────────────────────────────────────────────────────────
+ h.insert('users',{id:'owner',name:'Owner'});
+ h.insert('bills',{id:'b1',user_id:'owner'});
+ assert.equal(await sp.pathForRow(sqlite,'expenses',{id:'e1',user_id:'owner'}),'users/owner/expenses/e1');
+ assert.equal(await sp.pathForRow(sqlite,'transactions',{id:'t1',userId:'owner'}),'users/owner/transactions/t1','transactions keys on userId');
+ assert.equal(await sp.pathForRow(sqlite,'transactions',{id:'t1',user_id:'owner'}),null,'a snake_case author must not resolve for transactions, or the row goes up with no author');
+ // The parent lookup: a bill item carries no author of its own.
+ assert.equal(await sp.pathForRow(sqlite,'bill_items',{id:'i1',bill_id:'b1'}),'users/owner/bills/b1/items/i1');
+ assert.equal(await sp.pathForRow(sqlite,'bill_items',{id:'i1',bill_id:'gone'}),null,'an unknown parent must not produce a path');
+ assert.equal(await sp.pathForRow(sqlite,'bill_items',{id:'i1'}),null,'no parent key, no path');
+ assert.equal(await sp.pathForRow(sqlite,'expenses',{user_id:'owner'}),null,'a row with no id cannot address a document');
+ assert.equal(await sp.pathForRow(sqlite,'expenses',{id:'e1'}),null,'no author, no path — never a path with a blank segment');
+ assert.equal(await sp.pathForRow(sqlite,'not_a_table',{id:'x',user_id:'owner'}),null);
+ assert.equal(await sp.authorLocalIdForRow(sqlite,'bill_items',{bill_id:'b1'}),'owner');
+ // Whatever it does produce addresses a document, and carries no empty segment.
+ for(const p of [await sp.pathForRow(sqlite,'expenses',{id:'e1',user_id:'owner'}),await sp.pathForRow(sqlite,'bill_items',{id:'i1',bill_id:'b1'})]){
+  assert.equal(p.split('/').length%2,0,'odd-segment path: '+p);
+  assert.ok(!p.split('/').some(s=>!s),'empty segment in: '+p);
+ }
+ // The author is what syncAuthorisation will read back off the path, so the two must agree.
+ const sa=h.load('src/services/database/syncAuthorisation.ts');
+ assert.equal(sa.authorLocalIdFrom(await sp.pathForRow(sqlite,'bill_items',{id:'i1',bill_id:'b1'})),'owner',
+  'the path this map builds must hand the same author back to syncAuthorisation, or a row is authorised as somebody else');
+}));
+check(153,'the four tables that never reached Firestore now go through the SHARED WRITER with their path taken from syncPaths — a stock movement, and every line of a purchase order, invoice and return, each queue a document under the PARENT account and under its own leaf collection — and v48 adds the columns that makes it possible to an existing database while SKIPPING one too old to have the tables at all, rather than stranding the chain',at('src/services/database/purchaseDb.ts','purchase_order_items'),()=>isolated(async h=>{
+ seedPeople(h);h.login('owner');
+ const pur=h.load('src/services/database/purchaseDb.ts');
+ const stock=h.load('src/services/database/stockDb.ts');
+ const sp=h.load('src/services/database/syncPaths.ts');
+ const sa=h.load('src/services/database/syncAuthorisation.ts');
+ h.insert('suppliers',{id:'sup1',user_id:'owner',name:'Gulf Trading'});
+ h.insert('stock_items',{id:'st1',user_id:'owner',name_en:'Rice',purchase_price:123456,sale_price:123456,quantity:50});
+ const queued=table=>h.all('SELECT record_id,firestore_path,operation FROM sync_queue WHERE table_name=? ORDER BY rowid',table);
+
+ // ── stock_movements: the ledger stock value and its reports are built on ──────────────
+ await stock.addStockMovement({item_id:'st1',change:5,reason:'purchase',date:'2026-10-11',user_id:'owner'});
+ const movs=queued('stock_movements');
+ assert.equal(movs.length,1,'a stock movement still never reaches Firestore, so a second device would show counts with no history under them');
+ assert.equal(movs[0].firestore_path,'users/owner/stock_movements/'+movs[0].record_id);
+ assert.equal(h.one('SELECT COUNT(*) c FROM stock_movements').c,1,'the row must still be written locally — the shared writer replaces the INSERT, it does not skip it');
+
+ // ── purchase_order_items ──────────────────────────────────────────────────────────────
+ const lines=[{stock_item_id:null,item_name:'Pipe',quantity:2,unit_cost:1000,line_total:2000},
+              {stock_item_id:null,item_name:'Valve',quantity:1,unit_cost:500,line_total:500}];
+ const po=await pur.createPurchaseOrder('owner','sup1',lines,'2026-10-11');
+ const poItems=queued('purchase_order_items');
+ assert.equal(poItems.length,2,'an order still uploads as a header with no lines');
+ for(const r of poItems) assert.equal(r.firestore_path,'users/owner/purchase_orders/'+po.id+'/order_items/'+r.record_id);
+ // The returned order used to report `poi_0`, `poi_1` — ids that address nothing.
+ assert.deepEqual(sorted(po.items.map(i=>i.id)),sorted(poItems.map(r=>r.record_id)),
+  'the returned order reports placeholder line ids, so a caller cannot address a line it just created');
+
+ // ── purchase_invoice_items ────────────────────────────────────────────────────────────
+ const inv=await pur.createPurchaseInvoice('owner','sup1',[{stock_item_id:'st1',item_name:'Rice',quantity:3,unit_cost:4000,line_total:12000}],'2026-10-11');
+ const invItems=queued('purchase_invoice_items');
+ assert.equal(invItems.length,1,'an invoice still uploads with no lines');
+ assert.equal(invItems[0].firestore_path,'users/owner/purchase_invoices/'+inv.id+'/invoice_items/'+invItems[0].record_id);
+
+ // ── purchase_return_items, written from INSIDE withWriteTransaction ───────────────────
+ const ret=await pur.createPurchaseReturn('owner',inv.id,'sup1',[{stock_item_id:'st1',item_name:'Rice',quantity:1,unit_cost:4000,line_total:4000}],'2026-10-12');
+ const retItems=queued('purchase_return_items');
+ assert.equal(retItems.length,1,'a return still uploads with no lines');
+ assert.equal(retItems[0].firestore_path,'users/owner/purchase_returns/'+ret.id+'/return_items/'+retItems[0].record_id);
+ // v48's doing: without is_deleted a returned line could only be HARD deleted, which the
+ // rules refuse and pull could never learn about.
+ assert.ok(h.all('PRAGMA table_info(purchase_return_items)').some(c=>c.name==='is_deleted'),
+  'a returned line still cannot be soft-deleted');
+
+ // ── THE THREE LEAVES ARE DISTINCT, end to end ────────────────────────────────────────
+ // Four child tables sharing `items` is what a collection-group pull cannot untangle; this
+ // asserts the real queued paths, not just the map's intention.
+ const leafOf=p=>p.split('/').slice(-2)[0];
+ assert.deepEqual(sorted([leafOf(poItems[0].firestore_path),leafOf(invItems[0].firestore_path),leafOf(retItems[0].firestore_path)]),
+  ['invoice_items','order_items','return_items']);
+
+ // ── Every queued path agrees with the map AND with syncAuthorisation ─────────────────
+ const all=h.all('SELECT table_name,firestore_path FROM sync_queue');
+ assert.ok(all.length>=6,'nothing was queued, so the assertions above proved little');
+ for(const r of all){
+  assert.equal(r.firestore_path.split('/').length%2,0,'odd-segment path cannot address a document: '+r.firestore_path);
+  assert.ok(!r.firestore_path.split('/').some(s=>!s),'empty path segment: '+r.firestore_path);
+  // The author the rules will authorise on is read straight back off the path.
+  assert.equal(sa.authorLocalIdFrom(r.firestore_path),'owner',
+   r.table_name+' filed a row under the wrong account: '+r.firestore_path);
+  assert.equal(sp.tableForLeafCollection(leafOf(r.firestore_path)),r.table_name,
+   r.table_name+' queued a path whose leaf the map maps to a different table: '+r.firestore_path);
+ }
+}));
+
+check(154,'v48 upgrades an EXISTING database without touching a row, is idempotent, and a database too old to have the purchase tables still advances past it instead of stalling the whole chain at v47 with "no such table" (the v43 lesson, and what the entryAudit suite boots from)',at('src/services/database/db.ts','if (version < 48)'),()=>isolated(async h=>{
+ // At v47 the three line tables exist WITHOUT the sync columns. Seed them, then migrate.
+ const seed=(table,row)=>h.insert(table,row);
+ seed('purchase_invoice_items',{id:'pii1',invoice_id:'inv1',item_name:'Rice',quantity:3,unit_cost:4000,line_total:12000});
+ seed('purchase_order_items',{id:'poi1',po_id:'po1',item_name:'Pipe',quantity:2,unit_cost:1000,line_total:2000});
+ seed('purchase_return_items',{id:'pri1',return_id:'ret1',item_name:'Rice',quantity:1,unit_cost:4000,line_total:4000});
+ const before=Object.fromEntries(['purchase_invoice_items','purchase_order_items','purchase_return_items']
+  .map(t=>[t,plain(h.all('SELECT id,item_name,quantity,unit_cost,line_total FROM '+t+' ORDER BY id'))]));
+
+ await h.boot();
+ assert.ok(h.one('PRAGMA user_version').user_version>=48,'v48 never ran');
+ for(const t of Object.keys(before)){
+  const cols=new Set(h.all('PRAGMA table_info('+t+')').map(c=>c.name));
+  for(const c of ['is_deleted','synced','deleted_at','created_at','updated_at','firestore_path'])
+   assert.ok(cols.has(c),t+'.'+c+' was not added, so writeRowWithSyncIn would fail on a missing column');
+  assert.deepEqual(plain(h.all('SELECT id,item_name,quantity,unit_cost,line_total FROM '+t+' ORDER BY id')),before[t],t+' lost or changed a row');
+ }
+ // Idempotent across a real reopen.
+ await h.boot();
+ for(const t of Object.keys(before))
+  assert.deepEqual(plain(h.all('SELECT id,item_name,quantity,unit_cost,line_total FROM '+t+' ORDER BY id')),before[t],t+' changed on the second run');
+
+ // ── A database that has NO purchase tables must still get through ────────────────────
+ // addColumnIfNotExists only inspects COLUMNS, so on a missing table its ALTER throws and
+ // every later migration is stranded behind it.
+ for(const t of Object.keys(before)) h.sqlite.exec('DROP TABLE '+t);
+ h.sqlite.exec('PRAGMA user_version = 47');
+ await h.boot();
+ assert.ok(h.one('PRAGMA user_version').user_version>=48,
+  'the chain stalled at v47 on a database without the purchase tables — exactly how the entryAudit fixture broke');
+},47));
 (async()=>{
  const originals=new Map(sourceFiles().map(p=>[p,crypto.createHash('sha256').update(fs.readFileSync(p)).digest('hex')]));
  let passed=0;const failures=[];

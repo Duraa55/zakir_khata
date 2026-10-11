@@ -19,3 +19,17 @@ The same files were also why `npx expo start` from this directory reported
 
 DO NOT re-enable them. If you need them back for some reason, they are intact in git
 history and a rename restores them. Run every expo / eas command from `mobile-app/`.
+
+## What DOES belong here (added 2026-10-07)
+
+`firebase.json`, `.firebaserc`, `firestore.rules` and `firestore.indexes.json` are
+legitimately root-level and must NOT be swept up as more stray config. They configure the
+Firebase **project**, which backs the whole repo, not the Expo app — and unlike a root
+`package.json`, they are invisible to EAS Build and cannot confuse it.
+
+Deploy rules from HERE, not from `mobile-app/`:
+
+    firebase deploy --only firestore:rules
+
+The rules were previously edited only in the Firebase console, unversioned, where nobody
+could review a change or tell when one happened. That is why they are in git now.

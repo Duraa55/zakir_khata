@@ -7,9 +7,10 @@ import { useAuthStore } from '../store/authStore';
 import { AuthNavigator } from './AuthNavigator';
 import { AdminNavigator } from './AdminNavigator';
 import { getDatabase } from '../services/database/db';
-import { seedDatabase, seedTestUsers } from '../services/database/seedData';
+import { seedDatabase } from '../services/database/seedData';
 import { initializeOfflineSync, stopOfflineSync } from '../services/firebase/offlineSync';
 import { IS_FIREBASE_CONFIGURED } from '../services/firebase/firebaseConfig';
+import { currentFirebaseUid } from '../services/firebase/firebaseAuth';
 import { AmbientBackground } from '../components/AmbientBackground';
 import { Icon } from '../components/ui/primitives';
 import { color, space, iconSize, touchTarget, hairline, type as typeScale } from '../theme/tokens';
@@ -40,11 +41,19 @@ export const AppNavigator = () => {
       if (__DEV__) console.log('[DB] Starting database initialization...');
       try {
         await loadLanguage();
+
+        // Read back the Firebase session a previous run persisted, BEFORE anything can
+        // ask for Firestore. Nothing used to do this: getFirebaseAuth was reached only
+        // from a login, so a restart that restored the local session from SecureStore
+        // left the credential unread and every upload went out as nobody. It is also
+        // what makes Auth initialise with its AsyncStorage persistence instead of being
+        // created in-memory on Firestore’s behalf, which is what kept it unread.
+        // Never blocks the boot: it reports a null uid rather than failing.
+        const firebaseUid = await currentFirebaseUid();
+        if (__DEV__) console.log('[Auth] Firebase session:', firebaseUid ?? 'nobody signed in');
+
         const db = await getDatabase();
         if (__DEV__) console.log('[DB] Database ready.');
-        
-        await seedTestUsers();
-        if (__DEV__) console.log('[DB] Seed users complete.');
         
         await seedDatabase();
         if (__DEV__) console.log('[DB] Seed database complete.');

@@ -5,13 +5,24 @@ import { WriteOptions } from '../../types/sync.types';
 import { useSyncStore } from '../../store/useSyncStore';
 
 /**
- * Columns that are written to SQLite but must NEVER leave the phone while sync is
- * unauthenticated. Keyed by table so a caller cannot forget: the queue payload is
- * built from the row minus these, and the SQLite write is untouched.
- *   customers.cnic — national ID data.
+ * Columns written to SQLite that must NEVER leave the phone. Keyed by table so a caller
+ * cannot forget: the queue payload is the row MINUS these, and the SQLite write itself is
+ * untouched, so the app keeps full local use of them.
+ *
+ *   customers.cnic    — national ID data.
+ *   users.passwordHash — a credential.
+ *
+ * NOT "until sync is authenticated". Authentication changes who can read the project; it
+ * does not make a password hash or a national ID safe to store in it.
  */
 export const LOCAL_ONLY_FIELDS: Readonly<Record<string, readonly string[]>> = {
   customers: ['cnic'],
+  // `users` rows do not sync today — createUser writes direct SQL, not writeWithSync —
+  // but this is listed NOW, before the step that makes them sync, because the cost of
+  // remembering it late is every password hash in the project's Firestore. A hash is a
+  // credential: it is offline-attackable, and this one is a homegrown 10k-iteration
+  // SHA-256 with the salt applied only at iteration 0, which is weaker than it looks.
+  users: ['passwordHash'],
 };
 
 /** The row as it may be queued for upload: every local-only column removed. */

@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import {
   View, Text, TouchableOpacity, Alert, ScrollView,
-  Image, ActivityIndicator, StyleSheet,
+  Image, ActivityIndicator, StyleSheet, TextInput,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import * as ImagePicker from 'expo-image-picker';
@@ -34,6 +34,25 @@ export const SettingsScreen = () => {
   const navigation = useNavigation<any>();
   const { user, logout, updateProfilePicture } = useAuthStore();
   const { isOnline, pendingCount, isSyncing, processSyncQueue } = useSyncStore();
+  // This phone's local password is out of step with the shared Firebase credential, so
+  // nothing can upload. Firebase is the tiebreaker: if it accepts what the user types,
+  // that password is the current one and the local hash is brought up to match.
+  const passwordDiverged = useAuthStore(s => s.passwordDiverged);
+  const resolvePasswordDivergence = useAuthStore(s => s.resolvePasswordDivergence);
+  const [divergedPassword, setDivergedPassword] = useState('');
+  const [resolvingDivergence, setResolvingDivergence] = useState(false);
+
+  const handleResolveDivergence = async () => {
+    if (!divergedPassword.trim() || resolvingDivergence) return;
+    setResolvingDivergence(true);
+    try {
+      const ok = await resolvePasswordDivergence(divergedPassword);
+      setDivergedPassword('');
+      Alert.alert(ok ? t('commonSuccess') : t('commonError'), ok ? t('pwDivergedDone') : t('pwDivergedWrong'));
+    } finally {
+      setResolvingDivergence(false);
+    }
+  };
   const { language, setLanguage, t } = useLanguageStore();
   const [uploadingPic, setUploadingPic] = useState(false);
   // One shared opener, same as Staff Book: images preview in-app, other files go to
@@ -308,6 +327,33 @@ export const SettingsScreen = () => {
               </Text>
             </View>
           </View>
+          {/* Shown ONLY on divergence. Inline rather than a modal: Alert.prompt is
+              iOS-only, and this needs a password field on both platforms. */}
+          {passwordDiverged && (
+            <View style={styles.divergedBox}>
+              <Text style={styles.divergedTitle}>{t('pwDivergedTitle')}</Text>
+              <Text style={styles.divergedBody}>{t('pwDivergedBody')}</Text>
+              <TextInput
+                style={styles.divergedInput}
+                placeholder={t('pwDivergedPlaceholder')}
+                placeholderTextColor={color.textMuted}
+                secureTextEntry
+                autoCapitalize="none"
+                value={divergedPassword}
+                onChangeText={setDivergedPassword}
+              />
+              <TouchableOpacity
+                style={[styles.syncBtn, (!divergedPassword.trim() || resolvingDivergence) && styles.syncBtnDisabled]}
+                onPress={handleResolveDivergence}
+                disabled={!divergedPassword.trim() || resolvingDivergence}
+              >
+                <Text style={[styles.syncBtnText, (!divergedPassword.trim() || resolvingDivergence) && styles.syncBtnTextDisabled]}>
+                  {t('pwDivergedAction')}
+                </Text>
+              </TouchableOpacity>
+            </View>
+          )}
+
           <TouchableOpacity
             style={[
               styles.syncBtn,
@@ -406,6 +452,17 @@ const styles = StyleSheet.create({
   syncRow: { flexDirection: 'row', alignItems: 'center', gap: space.md, marginBottom: space.md },
   syncText: { flex: 1 },
   syncStatusText: { ...typeScale.bodyMedium, color: color.textPrimary },
+  divergedBox: {
+    borderWidth: hairline, borderColor: color.borderAttention, borderRadius: radius.md,
+    padding: space.md, marginTop: space.md, gap: space.sm,
+  },
+  divergedTitle: { ...typeScale.bodyMedium, color: color.attention },
+  divergedBody: { ...typeScale.caption, color: color.textSecondary },
+  divergedInput: {
+    ...typeScale.body, color: color.textPrimary, borderWidth: hairline, borderColor: color.border,
+    borderRadius: radius.md, backgroundColor: color.surfaceRaised,
+    paddingHorizontal: space.md, minHeight: touchTarget,
+  },
   syncStatusSub: { ...typeScale.caption, color: color.textMuted, marginTop: 2 },
   syncBtn: {
     backgroundColor: color.surface, minHeight: touchTarget, borderRadius: radius.md,

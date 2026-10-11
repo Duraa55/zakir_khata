@@ -3,7 +3,8 @@ import { getDatabase } from './db';
 import { parseDateValue } from '../../utils/dates';
 import { keysetClause, keysetParams, nextCursorOf, PageCursor } from './pagination';
 import { StockItem, StockMovement } from '../../types/stock.types';
-import { writeWithSync } from './syncHelpers';
+import { writeWithSync, writeRowWithSyncIn, afterSyncedWrite } from './syncHelpers';
+import { pathForRow } from './syncPaths';
 import { entryOwner } from './entryScope';
 
 export const createStockItem = async (
@@ -95,6 +96,9 @@ export const addStockMovement = async (
   const db = await getDatabase();
   let saved!: StockMovement;
   await db.withTransactionAsync(async () => { saved = await addStockMovementIn(db, movement); });
+  // After the commit, never inside it: the uploader must not see a row the transaction
+  // could still roll back.
+  afterSyncedWrite();
   return saved;
 };
 
@@ -110,23 +114,38 @@ export const addStockMovementIn = async (
   await assertOwnStockItemIn(db, movement.item_id, movement.user_id);
   const id = `mov_${Date.now()}_${Math.random().toString(36).substring(2, 11)}`;
   const now = new Date().toISOString();
-  // Insert the movement record
-  await db.runAsync(
-    `INSERT INTO stock_movements
-       (id, item_id, change, reason, date, cost_per_unit, sale_price_unit, user_id, note, synced, is_deleted)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0)`,
-    [
-      id,
-      movement.item_id,
-      movement.change,
-      movement.reason,
-      movement.date,
-      movement.cost_per_unit ?? null,
-      movement.sale_price_unit ?? null,
-      movement.user_id,
-      movement.note ?? null,
-    ]
-  );
+
+  // THROUGH THE SHARED WRITER, not a raw INSERT (2026-10-11). This row used to be the only
+  // stock write that never reached Firestore: stock value and every report behind it are
+  // built on the movement ledger, so a second device would show item counts with no history
+  // under them and look like pull was broken. The path comes from `syncPaths`, so the table
+  // cannot be wired here and forgotten on the pull side.
+  const data = {
+    id,
+    item_id: movement.item_id,
+    change: movement.change,
+    reason: movement.reason,
+    date: movement.date,
+    cost_per_unit: movement.cost_per_unit ?? null,
+    sale_price_unit: movement.sale_price_unit ?? null,
+    user_id: movement.user_id,
+    note: movement.note ?? null,
+    is_deleted: 0,
+  };
+  const firestorePath = await pathForRow(db, 'stock_movements', data);
+  if (!firestorePath) throw new Error('Stock movement has no account to file it under.');
+  // writeRowWithSyncIn, not writeWithSync: every caller is already inside a transaction —
+  // the wrapper above, a bill edit, or a purchase return — and writeWithSync would open a
+  // second one on the same serialised queue and deadlock. The nudge is the caller's job,
+  // after its own commit.
+  await writeRowWithSyncIn(db, {
+    tableName: 'stock_movements',
+    recordId: id,
+    operation: 'create',
+    data,
+    firestorePath,
+    userId: movement.user_id,
+  });
   // Update the item's quantity and updated_at
   await db.runAsync(
     `UPDATE stock_items SET quantity = quantity + ?, updated_at = ?, synced = 0 WHERE id = ?`,

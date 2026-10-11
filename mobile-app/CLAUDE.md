@@ -176,6 +176,109 @@ scoping.
 > in `useDashboardStore.ts` including the one telling readers never to render
 > `pendingPayments`.
 
+> **PHONE NUMBERS ARE E.164 (2026-10-07).** `userDb.normalisePhone` returns `+<cc><number>`
+> and delegates the country logic to `utils/phone.internationalPhone` — do not write a
+> second copy of that rule.
+>
+> **It restores the trunk '0' FIRST, and that line is load-bearing — do not "simplify" it
+> away.** `internationalPhone` reads a number with no leading zero as "already carries a
+> country code". That is correct for a STORED contact number (its documented job: SMS and
+> WhatsApp) and wrong for a TYPED login, where "3001234567" is someone omitting the trunk
+> zero, not the country code. Without that line, `3001234567` normalised to `+3000000000`
+> — a real account, reachable only by typing it back in that exact shape, which locked the
+> owner out of the seeded admin. Migration **v47** repairs rows v45 wrote that way; its
+> rule is `'+' + exactly 10 digits`, which is not valid E.164 for any supported currency
+> (PK 12 digits, AE 12, US 11, CN 13) and so cannot touch a real number. Check 145 pins
+> that every spelling of one number is one account; check 146 pins the repair. It previously stripped only `92` and forced a leading `0`, so a
+> Dubai `+971501234567` was stored as `0971501234567` and a US number as `012...`:
+> self-consistent, so login worked, but not a phone number and not recoverable into one.
+> It had to be fixed before the phone becomes the Firebase Auth identifier, because after
+> that it is frozen.
+>
+> **Migration v45** re-normalises existing `users.phone` and `staff_records.phone`. Without
+> it an upgrade does not merely lock people out — it CRASHES on launch: the seed guards
+> look for the normalised spelling, miss the old-format row, and re-seed; the old
+> `seedTestUsers` then inserted its hardcoded id and died on `UNIQUE constraint failed:
+> users.id` inside startup. Two numbers that normalise to the same value are SKIPPED, never
+> merged: that is a duplicate account for the owner to resolve, not something to guess at.
+>
+> **`seedTestUsers` is DELETED.** It created a second admin (`03339999999` / `admin123`) via
+> raw SQL that bypassed `createUser` — and so bypassed the password strength rule that
+> account would have failed — in every build, surviving every wipe because its id was
+> hardcoded. v45 soft-deletes the row on devices that already have it. **The seed creates
+> ONE admin**: `03000000000` / `Admin@12345`, stored as `+923000000000`.
+>
+> **Guard a migration on the COLUMN, not the table.** `PRAGMA table_info` returns `[]` for a
+> missing table, so one check covers both. v45's first version read `users.phone`
+> unconditionally and stalled the whole chain in the entryAudit suite, whose fixture `users`
+> has no `phone` column — the exact trap rule 9 names.
+
+> **FIREBASE AUTH IS A TRANSPORT CREDENTIAL, NOT THIS APP'S LOGIN (step 7, 2026-10-07).**
+> The app authenticates locally against `users.passwordHash`; Firestore merely refuses a
+> write from nobody. `ensureFirebaseAccount` runs as a SIDE-EFFECT of a login that already
+> succeeded — fire-and-forget, never awaited, never throws. Nothing about logging in,
+> working offline or the local session depends on it.
+>
+> - **Sign in BEFORE create.** With email-enumeration protection on, an unknown account
+>   returns `auth/invalid-credential`, not `auth/user-not-found` — so "create on not-found"
+>   silently stops creating anyone. `auth/email-already-in-use` from the create attempt is
+>   what distinguishes a new account from a wrong password.
+> - The account is keyed on a synthetic address, `<E.164 digits>@digikhata.internal`. The
+>   domain is deliberately unreachable, which is also why no password reset can arrive by
+>   email.
+> - React Native persistence (`getReactNativePersistence(AsyncStorage)`) is read off the
+>   module at runtime: it exists in the build Metro resolves but not in the browser
+>   typings. Without it a restart signs the account out and uploads stop until the next
+>   local login.
+>
+> **PASSWORD DIVERGENCE IS STRUCTURAL, NOT AN EDGE CASE.** `users.passwordHash` is in
+> `LOCAL_ONLY_FIELDS`, so local hashes are PER DEVICE. Change a password on one phone and
+> the other still accepts the old one, while Firebase — the only copy both share — holds
+> the new one. Chosen answer (2026-10-07):
+> - `changeOwnPassword` **refuses when offline** and moves **Firebase first**, local hash
+>   second. A Firebase refusal therefore leaves nothing changed anywhere. Changing a
+>   password needs connectivity; writing a transaction never does.
+> - A divergence surfaces in Settings and is resolved with **Firebase as the tiebreaker**:
+>   if Firebase accepts the typed password, that password is current and the LOCAL hash is
+>   updated to match it.
+>
+> **The long-term answer is CUSTOM TOKENS, and it was not done now.** A Cloud Function
+> holding the Admin SDK would mint a custom token after the app proves a local login, so no
+> Firebase password would exist at all and divergence would be impossible by construction.
+> It was deferred because it needs a backend this project does not yet have, and because
+> the hard part — how the function decides to trust the request — most likely comes back to
+> the local password anyway. Revisit when a backend exists; it replaces the whole
+> divergence mechanism rather than extending it.
+
+> **ownerId / visibleTo ARE STAMPED AT UPLOAD, NOT AT WRITE (step 6, 2026-10-07).**
+> `services/database/syncAuthorisation.ts` is the single place: the author comes from the
+> document path (`users/{localId}/…`), `ownerId` is that account's `firebase_uid`, and
+> `visibleTo` is the author plus their live parent chain. Both uploaders in syncProcessor
+> stamp through it — if one ever does not, it bypasses the rules.
+>
+> - **Upload time, not write time.** A row queued before its author had a Firebase uid
+>   would otherwise carry no ownerId forever and stay refused even after they logged in. At
+>   upload the uid is necessarily present (you cannot upload signed out) and the parent
+>   chain is CURRENT, so a staff member moved between owners does not ship a stale audience.
+>   This still satisfies "computed, not stored": no table gains a column, and check 150
+>   asserts that.
+> - **No identity yet => the row stays PENDING, never `failed`.** It is a perfectly good row
+>   whose author simply has not logged in since Auth landed. Marking it failed would bury it.
+>   The batch uploader excludes such rows and marks synced only what it actually sent — a
+>   batch is all-or-nothing, so one unauthorised row must not take the commit down, and
+>   deleting a skipped row would lose it unsent.
+> - **A removed ancestor ends the chain.** A soft-deleted owner stops appearing in
+>   `visibleTo`, so they stop reading their old team's books.
+> - Consequence worth knowing: a user who never logs in again never gets an identity, so
+>   their queue never drains and grows unbounded. That is the deferred "confirm your
+>   password to turn on backup" nudge in the backlog, now with teeth.
+>
+> **TESTING TRAP.** The regression harness loads modules in their own realm, so an array
+> built inside one has a different `Array.prototype`, and `node:assert/strict` rejects it on
+> prototype alone even when the contents match. Wrap such values in the suite's `plain()`
+> helper before `deepEqual`. This cost real time on check 150; `sorted()` hides it because
+> spreading rebuilds the array in the test's realm.
+
 ## Non-negotiable rules
 
 1. **Every account is its own business ("like Facebook").** Every BOOK query filters on its
@@ -537,6 +640,79 @@ their own, enforced in the data layer not by hiding buttons).
 
 ## Bigger remaining work
 
+> **SYNC HAS NO INITIAL-UPLOAD PATH — HARD PREREQUISITE FOR THE PULL STEP (noted 2026-10-07).**
+> `sync_queue` only ever gains a row when something is WRITTEN (`syncHelpers.writeRowWithSyncIn`
+> step 3), and migration v44 emptied it. So every row already in SQLite — every customer,
+> bill and khata entry that exists today — will NEVER upload: nothing will touch it again.
+> A second device would sign in and see an empty book, and it would look like pull was
+> broken when the cause is that nothing was ever pushed.
+>
+> A BACKFILL that enqueues existing rows must be built BEFORE the pull step, or that step
+> cannot be judged to work. It has to compute `ownerId` / `visibleTo` per row exactly as a
+> live write does, which is why it comes after Auth rather than before. Do not treat pull as
+> finished without it.
+>
+> **Sync identity, decided 2026-10-06/07:** the document path stays the LOCAL id
+> (`users/{localId}/…`); authorisation rides on `ownerId` + `visibleTo` denormalised onto
+> each document, both holding FIREBASE uids, mapped through `users.firebase_uid` (v46).
+> Per-uid paths were rejected because an owner must read staff books, which live under the
+> staff member's own identity. `visibleTo` is computed at PAYLOAD time, not stored as
+> columns. Order is Auth → ownerId → rules: `ownerId` cannot exist before the uid does.
+> Rules must also be matched by every pull query (`array-contains`), because Firestore
+> rules reject a query they cannot prove — they do not filter it.
+>
+> **AUDIENCE INJECTION — BLOCKING PREREQUISITE FOR THE PULL STEP (accepted 2026-10-11).**
+> Pull MUST DISCARD any document whose `ownerId` is not a known team member's
+> `users.firebase_uid`. This is a requirement, not a hardening idea: the read rule admits a
+> document because the caller is in its `visibleTo`, and `visibleTo` is written by whoever
+> AUTHORED that document. Account creation is open to anyone holding the API key shipped in
+> the APK, so a stranger can create a document, stamp `ownerId` with their OWN uid — which
+> is all the create rule asks — and put a victim's uid in `visibleTo`. The victim's own
+> `array-contains` pull query then returns it, and a forged bill lands in their book.
+> The rules cannot close this: `ownerId` immutability stops a document being MOVED into
+> another business, not one being BORN pointing at it. Nor can the path, which is the local
+> id and unconstrained by design.
+> The filter therefore belongs to the READER, checked against the local tree
+> (the puller's own `firebase_uid` plus their descendants', `is_deleted = 0`), and an
+> unknown `ownerId` is dropped silently — no row written, no error on screen.
+> PULL IS NOT DONE UNTIL THAT FILTER EXISTS AND IS TESTED.
+
+> **THE RULES PLAYGROUND EVALUATES THE EDITOR, NOT WHAT IS LIVE (learned the hard way,
+> 2026-10-11).** It simulates against the text in the console's rules editor, including
+> UNPUBLISHED changes. Eight green simulations therefore prove the draft and say nothing
+> whatever about the published ruleset. This cost a debugging session: the step-8b rules were
+> pasted into the editor, simulated green, and reported as published; the live ruleset was
+> still the Oct 7 deny-all, so every upload was refused with correct uids and correct
+> stamping, which reads exactly like a payload bug and is not one. The version history
+> settled it — the real rules were published THIRTEEN MINUTES AFTER the failing run.
+> To know what is live, read the PUBLISH TIMESTAMP in the rules version history and compare
+> it to when the failure happened. Never the editor contents, and never a green Playground.
+> `[Sync]` log ids carry their own epoch-ms, so the moment of a refused write is recoverable
+> from the queue id. Deploying from git (`firebase deploy --only firestore:rules`) removes
+> the whole ambiguity, which is one more reason to fix the CLI login.
+
+- **KNOWN GAP — the Firebase CLI is not logged in, so step 8b's rules were published from the
+  CONSOLE and `firestore.rules` was transcribed BACK by hand (2026-10-11).**
+  `firebase deploy --only firestore:rules` from the repo root cannot run today: the last
+  `login` was abandoned at the authorisation-code prompt (`ExitPromptError` at the end of
+  `firebase-debug.log`), and `firebase-tools` is not installed locally either. So the console
+  became the source of truth and git went stale — which is the exact thing putting the file
+  in git was meant to prevent (`ROOT_IS_NOT_THE_APP.md`). The transcription closed it once,
+  and nothing but check 149 and a person reading both files proves the two still agree.
+  Sort the login BEFORE the next rules change, and deploy git → live after that, never back.
+- **BACKLOG — login takes ~3s offline because of the Firebase attempt (owner-measured,
+  2026-10-07).** `ensureFirebaseAccount` is already fire-and-forget (`void`, not awaited)
+  in `authStore.login`, so the delay is NOT the await — it is the work happening on the JS
+  thread while the UI tries to transition. Options when this is picked up: skip the attempt
+  outright when `useSyncStore.isOnline` is false (cheapest, and the offline case is exactly
+  the slow one); defer it behind `InteractionManager.runAfterInteractions`; or shorten the
+  Firebase timeout. Acceptable today, measured at about 3 seconds, and explicitly deferred
+  by the owner. Do not "fix" it by awaiting it or by blocking login on the result.
+- **BACKLOG — a "confirm your password to turn on backup" nudge.** An already-logged-in user
+  gets no Firebase account until their NEXT local login, because the app holds a hash and
+  not a password. Someone who stays logged in for months therefore never starts syncing, and
+  nothing tells them. Deferred by the owner on 2026-10-07; no sign-out, no account, writes
+  simply queue meanwhile.
 - **Sync is the biggest piece and it's broken.** Push-only. `pullSyncService` imports a
   non-existent export and is never called; other pull functions query top-level collections
   while writes go to `users/{uid}/…`, so they always return `[]`. Two owners in two countries
@@ -566,6 +742,10 @@ their own, enforced in the data layer not by hiding buttons).
   - **Day Close** — `src/services/database/dayClosingDb.ts`: `closeDay()`, `mayCloseDay()`
     (a kept stub, constant-true under the two-level tree — see the sub-staff section) and a
     `canClose` flag. NO screen imports it and no route exists. A day can never be closed.
+    It also WRITES a `firestore_path` by raw SQL (`dayClosingDb.ts:109`) while never enqueuing
+    anything, so it has a document shape and no push. It sits in `syncPaths.SYNC_PATHS` as
+    `pending` for that reason — parked beside Attendance, deliberately not wired (owner,
+    2026-10-11) — rather than left out, where it would be rediscovered as a missing step.
   - **Attendance** — `src/services/database/attendanceDb.ts` (`clockIn` / `clockOut` /
     `getTodayAttendanceForUser`) and a screen, `src/screens/StaffBook/StaffAttendanceScreen.tsx`,
     registered as `StaffAttendance` in `src/navigation/AdminNavigator.tsx:120` but with NO

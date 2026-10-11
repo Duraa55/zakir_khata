@@ -3,6 +3,7 @@ import { classifyAccountLevel, expectedAccountLevel, AccountLevel, LevelNode, Le
 import { ENTRY_AUDIT_V31_SQL } from './entryAuditMigration';
 import { DAY_CLOSING_V33_SQL } from './dayClosingMigration';
 import { repairAttachmentsIn } from './attachmentRepair';
+import { internationalPhone, DEFAULT_COUNTRY_CODE } from '../../utils/phone';
 // NOTE: seedTestUsers is called from AppNavigator after getDatabase() to avoid
 // a circular dependency (db.ts → userDb.ts → db.ts).
 
@@ -38,6 +39,7 @@ async function initializeDatabase(database: SQLite.SQLiteDatabase): Promise<void
       area TEXT,
       pictureUrl TEXT,
       parentId TEXT,
+      firebase_uid TEXT, -- v46. The Firebase Auth uid this local account maps to; NULL until it signs in once.
       createdAt TEXT NOT NULL,
       updatedAt TEXT NOT NULL,
       FOREIGN KEY (parentId) REFERENCES users(id) ON DELETE SET NULL
@@ -1694,6 +1696,256 @@ async function migrateFrom(database: SQLite.SQLiteDatabase): Promise<void> {
     // has no staff_records at all) still advances and does not retry this forever.
     await database.execAsync('PRAGMA user_version = 43');
     version = 43;
+  }
+
+  if (version < 44) {
+    // CLEAR THE SYNC BACKLOG, once, on every device.
+    //
+    // `sync_queue` is appended to by every write with no config check
+    // (syncHelpers.writeRowWithSyncIn step 3), but the only drain returns early while
+    // Firebase is unconfigured (syncProcessor.processSyncQueue). Firebase has never been
+    // configured in any build — no .env, no env block in eas.json — so the queue has
+    // accumulated one row per write since install and nothing has ever removed one.
+    //
+    // It is cleared rather than drained, for three reasons:
+    //   1. PAYLOADS PREDATE THEIR OWN PROTECTIONS. A queued `customers` row written
+    //      before syncHelpers.LOCAL_ONLY_FIELDS existed still carries `cnic` in its JSON.
+    //      Draining would ATTEMPT to upload national ID numbers; only the Firestore rules
+    //      would stop it. That is one misconfiguration away from a real leak.
+    //   2. Payloads were serialised at write time, so older ones predate v41 (currency)
+    //      and v42 (customer_id) and would push rows missing columns the app now needs.
+    //   3. Superseded: a record edited ten times has ten queued rows, nine of them stale.
+    //
+    // NOTHING IS LOST. Every queued row is a copy of state already committed to SQLite —
+    // both writers (syncHelpers.ts and entryAuditDb.enqueue) write the row first and
+    // enqueue second, and the payload is syncPayloadFor(), a SUBSET of that row. Entries,
+    // customers, staff and audit history are untouched; only the upload queue goes.
+    const hasQueue = (await database.getAllAsync<{ name: string }>(
+      "SELECT name FROM sqlite_master WHERE type='table' AND name='sync_queue'"
+    )).length > 0;
+    if (hasQueue) {
+      // Counted per table BEFORE the delete, so the one-time clear is reportable rather
+      // than silent — this runs once and the evidence is gone afterwards.
+      const byTable = await database.getAllAsync<{ table_name: string; status: string; n: number }>(
+        'SELECT table_name, status, COUNT(*) AS n FROM sync_queue GROUP BY table_name, status ORDER BY n DESC'
+      );
+      const total = byTable.reduce((sum, r) => sum + Number(r.n ?? 0), 0);
+      if (__DEV__) {
+        console.log('[DB] v44 clearing sync_queue — ' + total + ' row(s):');
+        for (const r of byTable) console.log(`[DB]   ${r.table_name} (${r.status}): ${r.n}`);
+      }
+      await database.withTransactionAsync(async () => {
+        // Every status, 'dismissed' included: those are failed uploads the Sync Centre
+        // hides but keeps, and they are equally stale.
+        await database.execAsync('DELETE FROM sync_queue');
+        // pending_count mirrors the queue, so leaving it would report a backlog that no
+        // longer exists.
+        await database.execAsync('UPDATE sync_metadata SET pending_count = 0');
+      });
+    }
+    // Stamped OUTSIDE the conditional, so a database with no sync_queue (the entryAudit
+    // suite builds its own minimal schema) still advances instead of retrying forever.
+    // This is the v43 lesson: a migration that can abort mid-chain strands every later one.
+    await database.execAsync('PRAGMA user_version = 44');
+    version = 44;
+  }
+
+  if (version < 45) {
+    // RE-NORMALISE STORED PHONES TO E.164, and retire the second seeded admin.
+    //
+    // normalisePhone used to strip only '92' and force a leading '0', so an existing
+    // database holds '03001234567' and, worse, '0971501234567' for a Dubai number. Login
+    // now normalises to '+92...' / '+971...', so without this EVERY existing account
+    // becomes unreachable — the stored value and the lookup value no longer agree.
+    //
+    // It is also a CRASH on upgrade, not just a lockout: seedDatabase and seedTestUsers
+    // guard on the normalised phone, miss the old-format row, and re-seed. seedTestUsers
+    // inserts a hardcoded id and dies on "UNIQUE constraint failed: users.id" inside app
+    // startup. A wipe fixes a developer's phone; it does not fix an upgrade.
+    // Guard on the COLUMN, not just the table. The entryAudit suite builds its own
+    // minimal schema whose `users` has no `phone` at all, and PRAGMA table_info returns
+    // [] for a missing table too — so one check covers both, and neither can abort the
+    // chain. This is the trap CLAUDE.md names explicitly, and it caught this migration.
+    const columnsOf = async (table: string): Promise<Set<string>> => new Set(
+      (await database.getAllAsync<{ name: string }>(`PRAGMA table_info(${table})`)).map(c => c.name)
+    );
+    const userCols = await columnsOf('users');
+    const userRows = userCols.has('phone') ? await database.getAllAsync<{ id: string; phone: string }>(
+      'SELECT id, phone FROM users'
+    ) : [];
+    // users.phone is UNIQUE, so a rewrite that would collide is SKIPPED rather than
+    // allowed to abort the chain (the v43 lesson). Two spellings of one number is a
+    // duplicate account the owner must resolve; silently merging them would be worse.
+    const taken = new Set(userRows.map(r => r.phone));
+    for (const r of userRows) {
+      const digits = internationalPhone(r.phone);
+      const next = digits ? '+' + digits : null;
+      if (!next || next === r.phone) continue;
+      if (taken.has(next)) {
+        if (__DEV__) console.warn('[DB] v45 skipped ' + r.id + ': ' + next + ' is already taken');
+        continue;
+      }
+      taken.delete(r.phone);
+      taken.add(next);
+      await database.runAsync('UPDATE users SET phone = ? WHERE id = ?', [next, r.id]);
+    }
+
+    // staff_records.phone is a COPY of the login phone (createStaffMember), so it has to
+    // move with it or the profile and the login disagree. Not unique, so no collisions.
+    const staffCols = await columnsOf('staff_records');
+    const staffRows = staffCols.has('phone') ? await database.getAllAsync<{ id: string; phone: string | null }>(
+      'SELECT id, phone FROM staff_records WHERE phone IS NOT NULL'
+    ) : [];
+    for (const r of staffRows) {
+      const digits = r.phone ? internationalPhone(r.phone) : null;
+      const next = digits ? '+' + digits : null;
+      if (!next || next === r.phone) continue;
+      await database.runAsync('UPDATE staff_records SET phone = ? WHERE id = ?', [next, r.id]);
+    }
+
+    // The second seeded admin ('AL-REEF Admin', password 'admin123') was inserted by raw
+    // SQL that bypassed createUser's strength rule, shipped in every build, and survived
+    // every wipe. The seeding code is gone; this retires the row it already created.
+    // SOFT delete, per rule 4: it keeps any entries that account authored visible, and
+    // verifyUserLogin already refuses is_deleted rows, so the login is shut either way.
+    if (userCols.has('is_deleted') && userCols.has('deleted_at')) {
+      await database.runAsync(
+        "UPDATE users SET is_deleted = 1, deleted_at = ? WHERE id = 'test-admin-001' AND is_deleted = 0",
+        [new Date().toISOString()]
+      );
+    }
+
+    await database.execAsync('PRAGMA user_version = 45');
+    version = 45;
+  }
+
+  if (version < 46) {
+    // users.firebase_uid — the MAPPING between a local account and its Firebase Auth uid.
+    //
+    // The document path stays the LOCAL id (users/{localId}/...), because per-uid paths
+    // break the product: an owner must read their staff's books, and those live under the
+    // staff member's own identity. Authorisation is carried by `ownerId` / `visibleTo` on
+    // each document instead, and both of those must hold the FIREBASE uid so the rules can
+    // compare them to request.auth.uid. This column is what lets a write resolve one from
+    // the other, so it has to exist before Auth can store anything.
+    //
+    // NULL until that account signs in once. An already-logged-in user keeps a NULL here
+    // until their next local login — we hold their password hash, not their password, so
+    // there is no way to create their Firebase account before then.
+    const userCols = await database.getAllAsync<{ name: string }>('PRAGMA table_info(users)');
+    // Guard on the TABLE existing: table_info returns [] for a missing one, and
+    // addColumnIfNotExists would then fall through to an ALTER that throws and strands
+    // every later migration.
+    if (userCols.length > 0) {
+      await addColumnIfNotExists(database, 'users', 'firebase_uid', 'TEXT');
+      // UNIQUE so two local accounts can never claim the same Firebase identity — that
+      // would let one person's writes pass the rules as another's. SQLite permits many
+      // NULLs under a unique index, which is exactly what every row starts as.
+      await database.execAsync(
+        'CREATE UNIQUE INDEX IF NOT EXISTS idx_users_firebase_uid ON users(firebase_uid)'
+      );
+    }
+
+    await database.execAsync('PRAGMA user_version = 46');
+    version = 46;
+  }
+
+  if (version < 47) {
+    // REPAIR a phone that v45 normalised with the broken rule.
+    //
+    // normalisePhone delegated straight to internationalPhone, whose documented rule for a
+    // number with NO leading zero is "assume it already carries a country code". That is
+    // right for a stored contact number and wrong for a typed login: someone entering
+    // "3001234567" has left off the trunk 0, not the country code. v45 therefore wrote
+    // '+3000000000' for such a row — an account reachable ONLY by typing it back the same
+    // way, which is how the seeded admin became unreachable as "03000000000".
+    //
+    // A '+' followed by EXACTLY 10 digits is not valid E.164 for any currency this app
+    // supports (PK +92 -> 12 digits, AE +971 -> 12, US +1 -> 11, CN +86 -> 13), so it can
+    // only be that bug's output. Narrow on purpose: it cannot touch a real number.
+    const MIS_NORMALISED = /^\+\d{10}$/;
+    const repair = (phone: string | null): string | null => {
+      if (!phone || !MIS_NORMALISED.test(phone)) return null;
+      return '+' + DEFAULT_COUNTRY_CODE + phone.slice(1);
+    };
+
+    const cols = async (table: string): Promise<Set<string>> => new Set(
+      (await database.getAllAsync<{ name: string }>(`PRAGMA table_info(${table})`)).map(c => c.name)
+    );
+
+    const uCols = await cols('users');
+    const uRows = uCols.has('phone') ? await database.getAllAsync<{ id: string; phone: string }>(
+      'SELECT id, phone FROM users'
+    ) : [];
+    const taken = new Set(uRows.map(r => r.phone));
+    for (const r of uRows) {
+      const next = repair(r.phone);
+      if (!next) continue;
+      // users.phone is UNIQUE; a repair that would collide is skipped, never merged.
+      if (taken.has(next)) {
+        if (__DEV__) console.warn('[DB] v47 skipped ' + r.id + ': ' + next + ' is already taken');
+        continue;
+      }
+      taken.delete(r.phone);
+      taken.add(next);
+      if (__DEV__) console.log('[DB] v47 repaired ' + r.id + ': ' + r.phone + ' -> ' + next);
+      await database.runAsync('UPDATE users SET phone = ? WHERE id = ?', [next, r.id]);
+    }
+
+    const sCols = await cols('staff_records');
+    const sRows = sCols.has('phone') ? await database.getAllAsync<{ id: string; phone: string | null }>(
+      'SELECT id, phone FROM staff_records WHERE phone IS NOT NULL'
+    ) : [];
+    for (const r of sRows) {
+      const next = repair(r.phone);
+      if (next) await database.runAsync('UPDATE staff_records SET phone = ? WHERE id = ?', [next, r.id]);
+    }
+
+    await database.execAsync('PRAGMA user_version = 47');
+    version = 47;
+  }
+
+  if (version < 48) {
+    // THE SYNC COLUMNS the three purchase LINE tables never had (2026-10-11).
+    //
+    // They were written by raw SQL and never enqueued, so a purchase invoice, order or
+    // return would reach a second device as a header with no lines — which reads as a pull
+    // bug and is not one. Moving them onto the shared writer is what fixes that, and
+    // `writeRowWithSyncIn` writes `synced`, `created_at`, `updated_at` and `firestore_path`
+    // on EVERY row unconditionally, so the columns have to exist before the call sites can
+    // move over or the INSERT fails on a missing column.
+    //
+    // `purchase_return_items` had no `is_deleted` at all, so a soft delete could not even be
+    // expressed on it — a returned line could only ever have been hard-deleted, which the
+    // rules refuse and pull could never learn about.
+    //
+    // bill_items and stock_movements already carry all six, from the v11 column loop; this
+    // is why those two needed no migration to join the same step.
+    //
+    // EACH TABLE IS CHECKED FOR EXISTENCE FIRST. A database old enough not to have the
+    // purchase tables yet still has to get through here: `addColumnIfNotExists` only looks
+    // at the columns, so on a missing table its ALTER throws and the whole chain stalls at
+    // v47 with "no such table" — the v43 lesson, and the entryAudit suite boots from v30,
+    // which is exactly that database. A fresh install creates these tables with the columns
+    // already on them, so skipping is correct and not a deferral.
+    for (const table of ['purchase_invoice_items', 'purchase_order_items', 'purchase_return_items']) {
+      const exists = await database.getFirstAsync<{ name: string }>(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?", [table]
+      );
+      if (!exists) continue;
+      await addColumnIfNotExists(database, table, 'is_deleted', 'INTEGER DEFAULT 0');
+      await addColumnIfNotExists(database, table, 'synced', 'INTEGER DEFAULT 0');
+      await addColumnIfNotExists(database, table, 'deleted_at', 'TEXT');
+      // No CURRENT_TIMESTAMP default: SQLite refuses a non-constant default on ADD COLUMN.
+      // Existing rows therefore carry NULL timestamps, which the backfill must tolerate —
+      // it orders on rowid, and pull orders on the server cursor, not on these.
+      await addColumnIfNotExists(database, table, 'created_at', 'TEXT');
+      await addColumnIfNotExists(database, table, 'updated_at', 'TEXT');
+      await addColumnIfNotExists(database, table, 'firestore_path', 'TEXT');
+    }
+
+    await database.execAsync('PRAGMA user_version = 48');
+    version = 48;
   }
 }
 

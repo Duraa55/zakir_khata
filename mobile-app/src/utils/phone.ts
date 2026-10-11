@@ -7,7 +7,7 @@ export const DEFAULT_COUNTRY_CODE = '92';
  * ("4235678901"). A foreign number saved the local way carries its country code
  * inside those digits, so it is always longer than this.
  */
-const MAX_NATIONAL_DIGITS = 10;
+export const MAX_NATIONAL_DIGITS = 10;
 
 /**
  * A phone number in the international digits WhatsApp and SMS need — no '+', the

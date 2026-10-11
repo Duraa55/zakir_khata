@@ -13,6 +13,13 @@ let transactionDepth = 0;
 let networkCalls = 0;
 let failSql = null;
 let session = { isAuthenticated: true, user: { id: 'subA', name: 'UNTRUSTED SCREEN NAME' } };
+// WHO is signed in to Firebase, which is NOT the same thing as who is logged in locally:
+// the uploader sends a row only under its own author’s Firebase session, because the
+// rules compare the stamped ownerId to the caller’s uid.
+let firebaseUid = 'fb_owner';
+// An error for the next upload to meet, so the queue can be driven against a real
+// Firestore refusal rather than a description of one.
+let setDocError = null;
 const adapter = {
   execAsync: async sql => sqlite.exec(sql),
   runAsync: async (sql, params = []) => {
@@ -44,7 +51,7 @@ function load(relative) {
   const req = id => {
     if (id === 'firebase/firestore') return {
       doc: (_db, destination) => destination,
-      setDoc: async () => { assert.equal(transactionDepth,0); },
+      setDoc: async () => { assert.equal(transactionDepth,0); if (setDocError) { const e = new Error(setDocError.message); e.code = setDocError.code; throw e; } },
       updateDoc: async () => { assert.equal(transactionDepth,0); },
       writeBatch: () => ({ update() {}, set() {}, commit: async () => { assert.equal(transactionDepth,0); } }),
     };
@@ -59,6 +66,7 @@ function load(relative) {
       copyAsync: async () => {},
     };
     if (id.endsWith('/authStore')) return { useAuthStore: { getState: () => session } };
+    if (id.endsWith('/firebaseAuth')) return { currentFirebaseUid: async () => firebaseUid };
     if (id.endsWith('/useSyncStore')) return { useSyncStore: { getState: () => syncState } };
     if (id.startsWith('.')) return load(path.relative(root, path.resolve(path.dirname(file), id + '.ts')));
     return require(id);
@@ -77,7 +85,9 @@ async function check(name, test) { await test(); passed++; console.info('PASS ' 
 (async () => {
   // Start with populated v30 tables. initializeDatabase runs the actual v31 gate.
   sqlite.exec(`PRAGMA user_version = 30;
-    CREATE TABLE users (id TEXT PRIMARY KEY, name TEXT, role TEXT, parentId TEXT, is_deleted INTEGER DEFAULT 0);
+    -- firebase_uid (v46) is the mapping the UPLOADER needs: nothing is sent without an
+    -- ownerId, and that is this column. A fixture without it uploads nothing at all.
+    CREATE TABLE users (id TEXT PRIMARY KEY, name TEXT, role TEXT, parentId TEXT, is_deleted INTEGER DEFAULT 0, firebase_uid TEXT);
     CREATE TABLE customers (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, name TEXT NOT NULL, phone TEXT, notes TEXT,
       created_at TEXT NOT NULL, updated_at TEXT, synced INTEGER DEFAULT 0, is_deleted INTEGER DEFAULT 0, deleted_at TEXT, firestore_path TEXT);
     INSERT INTO customers (id,user_id,name,created_at) VALUES ('c1','subA','Customer','2026-09-08');
@@ -88,9 +98,9 @@ async function check(name, test) { await test(); passed++; console.info('PASS ' 
       is_deleted INTEGER DEFAULT 0, deleted_at TEXT);
     -- Two levels: admin -> staff. subA and subB were sub-staff before that level was
     -- retired; they are ordinary staff under the same owner now, keeping their old ids.
-    INSERT INTO users VALUES ('owner','Owner','admin',NULL,0),('staffA','Ahmed','staff','owner',0),
-      ('staffB','Bilal','staff','owner',0),('subA','Sub A','staff','owner',0),('subB','Sub B','staff','owner',0),
-      ('otherOwner','Other Owner','admin',NULL,0),('otherStaff','Other Staff','staff','otherOwner',0);
+    INSERT INTO users VALUES ('owner','Owner','admin',NULL,0,'fb_owner'),('staffA','Ahmed','staff','owner',0,'fb_staffA'),
+      ('staffB','Bilal','staff','owner',0,'fb_staffB'),('subA','Sub A','staff','owner',0,'fb_subA'),('subB','Sub B','staff','owner',0,'fb_subB'),
+      ('otherOwner','Other Owner','admin',NULL,0,'fb_otherOwner'),('otherStaff','Other Staff','staff','otherOwner',0,'fb_otherStaff');
     INSERT INTO transactions (id,userId,partyName,amount_paisa,type,notes,date,createdAt,updatedAt)
       VALUES ('legacy','subA','Customer',50000,'lena','Original','2026-09-08','2026-09-08','2026-09-08');`);
   // The point of this snapshot is that no EXISTING value is lost or rewritten by the
@@ -222,22 +232,71 @@ async function check(name, test) { await test(); passed++; console.info('PASS ' 
       await assert.rejects(writer.writeWithSync({tableName,recordId:'legacy',operation:'update',data:{notes:'bypass'},userId:'owner',firestorePath:'x'}),/Invalid book table/);
     }
   });
-  await check('both sync workers drain audit queue without mutating immutable audit rows', async () => {
+  await check('both sync workers drain the audit queue under each author’s own Firebase session, without mutating immutable audit rows', async () => {
     const processor = load('src/services/syncProcessor.ts');
     const before = JSON.stringify(all('SELECT * FROM entry_audit'));
     const queued = all('SELECT * FROM sync_queue');
+    // The uids whose rows are waiting. A row goes up ONLY under its own author’s
+    // Firebase session, because the rules compare the stamped ownerId to the caller.
+    // A shared phone therefore drains one account at a time — and the queue must still
+    // end up empty across those sessions, with nothing failed and nothing lost.
+    const uidsQueued = () => [...new Set(all('SELECT firestore_path FROM sync_queue')
+      .map(r => one('SELECT firebase_uid AS uid FROM users WHERE id=?', String(r.firestore_path).split('/')[1])?.uid))];
+    const drain = async worker => {
+      for (const uid of uidsQueued()) {
+        assert.ok(uid, 'a queued row has no resolvable author, so it could never upload');
+        firebaseUid = uid;
+        // A single run processes up to 20 records; drain any remaining records.
+        for (let i=0; i<10 && count('sync_queue'); i++) await worker();
+      }
+    };
+    // Signed out: nothing may leave, and not one row may be marked failed for it.
+    firebaseUid = null;
     await processor.processSyncQueue();
-    // A single run processes up to 20 records; drain any remaining records.
-    for (let i=0; i<10 && count('sync_queue'); i++) await processor.processSyncQueue();
+    assert.equal(count('sync_queue'), queued.length, 'a signed-out run must send nothing');
+    assert.equal(all("SELECT * FROM sync_queue WHERE status='failed'").length, 0,
+      'a signed-out run must leave rows PENDING, never failed');
+    await drain(processor.processSyncQueue);
     assert.equal(count('sync_queue'),0);
     assert.equal(JSON.stringify(all('SELECT * FROM entry_audit')),before);
     for (const item of queued) {
       const keys=Object.keys(item);
       sqlite.prepare('INSERT INTO sync_queue ('+keys.join(',')+') VALUES ('+keys.map(()=>'?').join(',')+')').run(...Object.values(item));
     }
-    await processor.batchProcessSyncQueue();
+    await drain(processor.batchProcessSyncQueue);
     assert.equal(count('sync_queue'),0);
     assert.equal(JSON.stringify(all('SELECT * FROM entry_audit')),before);
+  });
+  await check('a refused upload stays PENDING however often it is retried, a malformed path fails at once, and a row that already reached failed still recovers', async () => {
+    const processor = load('src/services/syncProcessor.ts');
+    firebaseUid = 'fb_owner';
+    const queue = (id, firestorePath) => sqlite.prepare(
+      'INSERT INTO sync_queue (id,table_name,record_id,operation,payload,firestore_path,status,created_at) ' +
+      "VALUES (?,'customers','c1','update','{}',?,'pending','2026-09-08')"
+    ).run(id, firestorePath);
+    const statusOf = id => one('SELECT status, retry_count, error_message FROM sync_queue WHERE id=?', id);
+
+    // THE DENY-ALL CASE. The rules refuse every write today; that says something about
+    // the server, not about the row, so no number of attempts may bury it.
+    setDocError = { code: 'permission-denied', message: 'Missing or insufficient permissions.' };
+    queue('q_denied', 'users/owner/customers/c1');
+    for (let i = 0; i < 5; i++) await processor.processSyncQueue();
+    const denied = statusOf('q_denied');
+    assert.equal(denied.status, 'pending', 'a permission denial must not bury the row at any retry count');
+    assert.ok(denied.retry_count >= 5, 'the attempts must still be counted: ' + denied.retry_count);
+    assert.match(denied.error_message, /permission/, 'a waiting row must carry WHY it is waiting');
+
+    // A MALFORMED PATH is permanently wrong and still fails on the first attempt.
+    setDocError = { message: 'Invalid document reference. Document references must have an even number of segments' };
+    queue('q_badpath', 'users/owner/customers/odd/segments/here/x');
+    await processor.processSyncQueue();
+    assert.equal(statusOf('q_badpath').status, 'failed', 'a malformed path must fail at once, not retry forever');
+
+    // AND THE ANSWER TO "can those cards recover once the real rules land": yes. Both
+    // workers re-select failed rows, so nothing has to be repaired by hand.
+    setDocError = null;
+    for (let i = 0; i < 3; i++) await processor.processSyncQueue();
+    assert.equal(count('sync_queue'), 0, 'a row that reached failed must upload once the refusal stops');
   });
   await check('all sync attempts occurred after commit', async () => { assert.ok(networkCalls>0); assert.equal(transactionDepth,0); });
   console.info(`${passed} checks passed. No real data changed.`);

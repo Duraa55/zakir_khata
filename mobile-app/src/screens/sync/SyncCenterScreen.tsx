@@ -46,11 +46,13 @@ export const SyncCenterScreen: React.FC<Props> = ({ navigation }) => {
     setLoading(true);
     try {
       const db = await getDatabase();
-      // Pending and failed only — dismissed rows are kept on the phone but not shown.
+      // Pending, failed AND stopped. Stopped rows used to be loaded by nothing and shown
+      // nowhere, so "Stop retrying" was a one-way door: the upload was given up on and
+      // the only way back was a reinstall. They have their own section now.
       const queue = await db.getAllAsync<SyncQueueItem>(
         `SELECT id, table_name, operation, status, error_message, created_at, retry_count
          FROM sync_queue
-         WHERE status IN ('pending', 'failed')
+         WHERE status IN ('pending', 'failed', 'dismissed')
          ORDER BY created_at DESC
          LIMIT 50`
       );
@@ -103,8 +105,25 @@ export const SyncCenterScreen: React.FC<Props> = ({ navigation }) => {
     );
   };
 
+  /**
+   * Put the stopped uploads back in the queue. This is the other half of "Stop
+   * retrying", and without it that button was a trap: it is offered on a card labelled
+   * FAILED, at the moment someone is most likely to press anything at all, and nothing
+   * in the app could undo it afterwards.
+   */
+  const handleResumeAllStopped = async () => {
+    try {
+      const db = await getDatabase();
+      await db.runAsync(`UPDATE sync_queue SET status = 'pending' WHERE status = 'dismissed'`);
+      await loadSyncData();
+    } catch (err) {
+      if (__DEV__) console.error('Failed to resume items:', err);
+    }
+  };
+
   const failedItems = queueItems.filter(q => q.status === 'failed');
   const pendingItems = queueItems.filter(q => q.status === 'pending');
+  const stoppedItems = queueItems.filter(q => q.status === 'dismissed');
 
   return (
     <SafeAreaView style={styles.safe} edges={['top']}>
@@ -185,6 +204,29 @@ export const SyncCenterScreen: React.FC<Props> = ({ navigation }) => {
                   <Text style={styles.itemTitle}>{opLabel(item.operation)} · {tableLabel(item.table_name)}</Text>
                   <Text style={styles.itemMeta}>{when(item.created_at, 'HH:mm')}</Text>
                 </View>
+                {/* A refused upload stays pending now, so "waiting" must never mean
+                    "waiting, cause unknown". Shown only when there is a reason. */}
+                {!!item.error_message && <Text style={styles.itemBody}>{item.error_message}</Text>}
+              </View>
+            ))}
+          </View>
+        )}
+
+        {stoppedItems.length > 0 && (
+          <View style={styles.section}>
+            <View style={styles.sectionHead}>
+              <Icon name="pause-circle" size={iconSize.sm} tint={color.textSecondary} />
+              <Text style={styles.sectionTitle}>{t('syncStopped')}</Text>
+              <TouchableOpacity onPress={handleResumeAllStopped} style={styles.linkBtn}><Text style={styles.linkText}>{t('syncResumeUploading')}</Text></TouchableOpacity>
+            </View>
+            <Text style={styles.itemBody}>{t('syncStoppedBody')}</Text>
+            {stoppedItems.map(item => (
+              <View key={item.id} style={styles.item}>
+                <View style={styles.itemTop}>
+                  <Text style={styles.itemTitle}>{opLabel(item.operation)} · {tableLabel(item.table_name)}</Text>
+                  <Text style={styles.itemMeta}>{when(item.created_at, 'dd MMM, HH:mm')}</Text>
+                </View>
+                {!!item.error_message && <Text style={styles.itemBody}>{item.error_message}</Text>}
               </View>
             ))}
           </View>
