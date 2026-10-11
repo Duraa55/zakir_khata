@@ -1,4 +1,13 @@
 {
   "indexes": [],
-  "fieldOverrides": []
+  "fieldOverrides": [
+    {
+      "//": "A SECOND DEVICE does not know its own local id yet, so it cannot address its identity document at users/{localId}/profile/self - it has to find it by COLLECTION GROUP. A single-field index is automatic for a collection but NOT for a collection group, and it is configured HERE rather than under \"indexes\": Firestore rejects a one-field entry there with 'this index is not necessary, configure using single field index controls'. The array-contains clause in the query is not optional either - rules REJECT a query they cannot prove rather than filtering it, and the read rule tests visibleTo. See services/firebase/firebaseProfile.ts.",
+      "collectionGroup": "profile",
+      "fieldPath": "visibleTo",
+      "indexes": [
+        { "arrayConfig": "CONTAINS", "queryScope": "COLLECTION_GROUP" }
+      ]
+    }
+  ]
 }

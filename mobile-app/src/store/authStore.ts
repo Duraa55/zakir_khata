@@ -3,6 +3,7 @@ import * as SecureStore from 'expo-secure-store';
 import * as Crypto from 'expo-crypto';
 import { verifyUserLogin, updateUser } from '../services/database/userDb';
 import { ensureFirebaseAccount, signOutFirebase } from '../services/firebase/firebaseAuth';
+import { adoptAccountFromCloud, mayBeAdoptable, publishAccountProfile } from '../services/firebase/firebaseProfile';
 import { User, AuthState } from '../types';
 
 const AUTH_KEY = 'auth_session';
@@ -21,7 +22,16 @@ interface AuthStore extends AuthState {
   passwordDiverged: boolean;
   /** Firebase is the tiebreaker: if it accepts this password, the local hash follows. */
   resolvePasswordDivergence: (password: string) => Promise<boolean>;
-  login: (phone: string, password: string) => Promise<'ok' | 'invalid' | 'locked'>;
+  login: (phone: string, password: string) => Promise<
+    | 'ok'
+    | 'invalid'
+    | 'locked'
+    /** Signed in to Firebase, but this account has published no profile, so a second
+     *  device has nothing to rebuild it from. No local account is created. */
+    | 'no-cloud-profile'
+    /** A real local account already holds that phone under a different id. Never merged. */
+    | 'account-conflict'
+  >;
   logout: () => Promise<void>;
   checkSession: () => Promise<void>;
   updateProfilePicture: (userId: string, uri: string) => Promise<void>;
@@ -58,13 +68,44 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
   login: async (phone, password) => {
     set({ loading: true });
     try {
-      const user = await verifyUserLogin(phone, password);
+      let user = await verifyUserLogin(phone, password);
+
+      // ── A SECOND DEVICE FOR AN ACCOUNT THAT ALREADY EXISTS ──────────────────────────
+      // Only reached when the local password check found nothing, so it costs an ordinary
+      // login nothing. The password is proved against FIREBASE here, which is the shared
+      // credential; the local hash is then derived from it on this device.
+      if (!user) {
+        const adoption = await adoptAccountFromCloud(phone, password);
+        if (__DEV__) console.log('[Auth] adoption:', adoption.status);
+        // Signed in, but this account has never published a profile — so there is nothing
+        // to rebuild it from. Create NOTHING: a half-account with no data behind it is
+        // worse than a refusal, and the message tells them the one thing that fixes it.
+        if (adoption.status === 'no-profile') return 'no-cloud-profile';
+        if (adoption.status === 'conflict') return 'account-conflict';
+        if (adoption.status === 'materialised') user = await verifyUserLogin(phone, password);
+      } else if (await mayBeAdoptable(user.id, user.phone)) {
+        // THE SEEDED ADMIN. `seedDatabase` runs at boot on every install and creates an
+        // admin on the bootstrap number with a fresh local id, so on a second device that
+        // row answers the login first — and the user would land in a brand-new empty
+        // account that looks legitimate, with the right uid mapped to the wrong local id.
+        // Only an untouched seed row gets here, so no real data can be at stake.
+        const adoption = await adoptAccountFromCloud(phone, password);
+        if (__DEV__) console.log('[Auth] seed adoption:', adoption.status);
+        if (adoption.status === 'conflict') return 'account-conflict';
+        // 'no-profile' and 'wrong-password' are the ORDINARY fresh install: nothing exists
+        // in the cloud to adopt, so fall through and log in as the seeded admin as always.
+        if (adoption.status === 'adopted') user = await verifyUserLogin(phone, password);
+      }
+
       if (!user) {
         if (__DEV__) console.warn('[Auth] Login failed — invalid credentials.');
         return 'invalid';
       }
 
-      const authData = await buildSession(user);
+      // Narrowed and captured: `user` is a `let` now that adoption can replace it, so the
+      // async callback below cannot see the null check above without this.
+      const account = user;
+      const authData = await buildSession(account);
       await SecureStore.setItemAsync(AUTH_KEY, JSON.stringify(authData));
       set(authData);
 
@@ -76,9 +117,13 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
       // Deliberately NOT awaited. ensureFirebaseAccount never throws, but it does make
       // network calls, and a slow or hanging connection must not delay the user getting
       // into their own books. Offline, it fails and retries at the next login.
-      void ensureFirebaseAccount(user.id, user.phone, password)
-        .then(r => {
+      void ensureFirebaseAccount(account.id, account.phone, password)
+        .then(async r => {
           if (__DEV__) console.log('[Auth] Firebase account:', r.status, 'code' in r ? r.code : '');
+          // AND THE IDENTITY DOCUMENT, every login, idempotently. Until this has run once
+          // online, a second device for this account cannot exist at all — it is what
+          // carries the shared local id. After the uid exists, never before it.
+          if (r.status === 'signed-in' || r.status === 'created') await publishAccountProfile(account.id);
           // Only divergence is surfaced: every other failure is transient and retried at
           // the next login, so nagging about it would be noise.
           set({ passwordDiverged: r.status === 'failed' && r.code === 'password-divergence' });

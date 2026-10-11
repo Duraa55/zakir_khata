@@ -38,7 +38,14 @@ export const LoginScreen = ({ navigation }: any) => {
     
     const cleanPhone = phone.replace(/\s/g, '');
     const result = await login(countryCode + cleanPhone, password);
-    if (result === 'invalid') {
+    // Each failure says the thing that fixes it. "Wrong credentials" for a second device
+    // whose account simply has not published its details yet would send the user hunting
+    // for a typo that is not there.
+    if (result === 'no-cloud-profile') {
+      Alert.alert(t('loginNoCloudTitle'), t('loginNoCloudBody'));
+    } else if (result === 'account-conflict') {
+      Alert.alert(t('loginConflictTitle'), t('loginConflictBody'));
+    } else if (result === 'invalid') {
       Alert.alert(t('errorTitle'), t('wrongCreds'));
     }
   };

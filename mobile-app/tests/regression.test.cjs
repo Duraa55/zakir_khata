@@ -5378,7 +5378,9 @@ check(147,'Firebase Auth is a SIDE-EFFECT of a login that already succeeded: it 
  assert.ok(/void ensureFirebaseAccount\(/.test(store),
   'login AWAITS the Firebase step — a hanging network call would hold the user out of their own books');
  // It runs only after the local check passed and the session was written.
- const callAt=store.indexOf('ensureFirebaseAccount(user.id');
+ // The CALL, not its argument: pinning `ensureFirebaseAccount(user.id` broke the moment the
+ // adoption path made `user` a let and captured it as `account`, which changed no guarantee.
+ const callAt=store.indexOf('void ensureFirebaseAccount(');
  const sessionAt=store.indexOf('set(authData)');
  const verifyAt=store.indexOf('await verifyUserLogin');
  assert.ok(verifyAt>=0&&sessionAt>verifyAt&&callAt>sessionAt,
@@ -5728,6 +5730,11 @@ check(152,'ONE map from table to Firestore path, checked against the MIGRATED SC
   // entryAuditDb builds the audited book's own path with a DYNAMIC collection name, and the
   // dead pullSyncService interpolates a whole collection. Neither can be matched statically.
   if(!fixed.length||/^\$\{/.test(fixed[0])) continue;
+  // The identity document is not a book row: `users` is in LOCAL_ONLY_TABLES, and routing
+  // this through the queue would need a pseudo-table and would make syncProcessor run
+  // `UPDATE users SET synced=1 WHERE id='self'`. It is written directly by firebaseProfile,
+  // stamped by the same authorisedPayload. Exempt by name, so a NEW stray path still fails.
+  if(tail==='profile/self') continue;
   const table=Object.keys(sp.SYNC_PATHS).find(t=>{
    const segs=sp.SYNC_PATHS[t].segments;
    return segs.length===fixed.length&&segs.every((s,i)=>/^\{\w+\}$/.test(s)?/^\$\{[^}]+\}$/.test(fixed[i]):s===fixed[i]);
@@ -6087,6 +6094,147 @@ check(157,'THE INITIAL UPLOAD PATH: the backlog v44 emptied is enqueued once, ev
  assert.ok(queue().some(r=>r.record_id==='e3'));
  assert.ok(cursors().length>0&&h.all("SELECT DISTINCT account_local_id FROM sync_backfill").length===2,'the two accounts share one cursor');
 }));
+check(158,'HOW A SECOND DEVICE BECOMES THE SAME PERSON: one identity document per account at users/{localId}/profile/self carrying the SHARED local id and no credential, found by collection group because a second device cannot know its own id yet — and the seeded admin, which answers the login FIRST on every fresh install, is adopted only while untouched while a real account is never merged over',at('src/services/database/accountAdoption.ts','applyCloudProfile'),()=>isolated(async h=>{
+ // The LOCAL half is loaded and RUN. It lives apart from firebaseProfile precisely so it can
+ // be: the harness cannot load the Firebase packages, so anything beside them is only ever
+ // assertable as source text, and the rules about which rows may be rewritten matter far too
+ // much for that.
+ const ad=h.load('src/services/database/accountAdoption.ts');
+ const udb=h.load('src/services/database/userDb.ts');
+ const db=h.load('src/services/database/db.ts');
+ const sqlite=await db.getDatabase();
+ const sp=h.load('src/services/database/syncPaths.ts');
+ const seedPhone=udb.normalisePhone(h.load('src/services/database/seedData.ts').ADMIN_SEED_PHONE);
+ const profile=(over={})=>({id:'shared_id',name:'Owner',name_ur:null,phone:seedPhone,role:'admin',
+  account_level:'admin',businessName:'AL-REEF',businessType:null,area:'Khuzdar',pictureUrl:null,
+  parentId:null,default_currency:'PKR',createdAt:'2026-01-01T00:00:00.000Z',...over});
+ const userRow=id=>h.one('SELECT id,name,role,phone,passwordHash FROM users WHERE id=?',id);
+ const apply=()=>ad.applyCloudProfile(sqlite,profile(),'03000000000','Secret@123');
+
+ // ── NO LOCAL ROW: built from the profile, with the SHARED id ──────────────────────────
+ const made=await apply();
+ assert.equal(made.status,'materialised');
+ assert.equal(made.localId,'shared_id','the second device did not take the shared id, so no path and no user_id would match');
+ const built=userRow('shared_id');
+ assert.ok(built,'no local row was created');
+ assert.equal(built.phone,seedPhone,'the phone was not stored in the one canonical spelling login looks it up in');
+ // The hash is DERIVED HERE from the password just proved against Firebase; it never travels.
+ assert.ok(built.passwordHash,'a row with no hash can never log in again');
+ assert.ok(await udb.verifyUserLogin('03000000000','Secret@123'),'the materialised account cannot log in with the password it was built from');
+ assert.equal(await udb.verifyUserLogin('03000000000','WrongOne@1'),null,'any password opens the materialised account');
+
+ // Idempotent: logging in again on the same device changes nothing.
+ assert.deepEqual(plain(await apply()),{status:'already',localId:'shared_id'});
+ assert.equal(h.one('SELECT COUNT(*) c FROM users WHERE phone=?',seedPhone).c,1,'a duplicate row was created for the same number');
+
+ // ── THE SEEDED ADMIN, adopted only while untouched ───────────────────────────────────
+ const seeded=async()=>{
+  h.sqlite.prepare('DELETE FROM users WHERE phone=?').run(seedPhone);
+  await udb.createUser('Admin','03000000000','Admin@12345','admin','admin');
+  return h.one('SELECT id FROM users WHERE phone=?',seedPhone).id;
+ };
+ let seedId=await seeded();
+ assert.notEqual(seedId,'shared_id','the seed id is generated per device, which is the whole problem');
+ assert.equal(await ad.mayBeAdoptable(sqlite,seedId,seedPhone),true,
+  'an untouched seeded admin is not adoptable, so a second device would land in a brand-new empty account that looks entirely legitimate');
+ assert.equal((await apply()).status,'adopted');
+ assert.equal(userRow(seedId),undefined,'the old seed id survived, so two rows now hold one number');
+ assert.equal(userRow('shared_id').name,'Owner','the adopted row kept the seed identity instead of the cloud one');
+ // The password that now opens it is the CLOUD one, not the seed default.
+ assert.ok(await udb.verifyUserLogin('03000000000','Secret@123'));
+ assert.equal(await udb.verifyUserLogin('03000000000','Admin@12345'),null,'the seed password still opens the adopted account');
+
+ // ── ONE AUTHORED ROW AND IT IS A REAL ACCOUNT ────────────────────────────────────────
+ // Checked against the author columns SYNC_PATHS enumerates, never a list written out here:
+ // a hardcoded list is how a table gets added on one side and forgotten on the other.
+ let covered=0;
+ for(const [table,spec] of Object.entries(sp.SYNC_PATHS)){
+  if(spec.author.kind!=='column') continue;
+  seedId=await seeded();
+  h.insert(table,{[spec.author.column]:seedId});
+  assert.equal(await ad.mayBeAdoptable(sqlite,seedId,seedPhone),false,'a row in '+table+' does not count as having authored anything');
+  assert.deepEqual(plain(await apply()),{status:'conflict'},
+   'an account with rows in '+table+' was merged over, and everything it wrote would be stranded under an id nothing points at');
+  assert.ok(userRow(seedId),'the row was rewritten despite the conflict');
+  // Some of these tables are IMMUTABLE by trigger - entry_audit and day_closings both
+  // refuse a delete, on purpose - so cleanup is best-effort. It does not need to succeed:
+  // every seeded() call mints a fresh id, so a row left pointing at a discarded one can
+  // never make a later iteration pass or fail.
+  try{ h.sqlite.prepare('DELETE FROM '+table+' WHERE '+spec.author.column+' = ?').run(seedId); }catch{}
+  covered++;
+ }
+ assert.ok(covered>12,'only '+covered+' tables were swept, so the author columns were not read from the map');
+
+ // ── NEVER ADOPTABLE: not the bootstrap number, not an admin ──────────────────────────
+ seedId=await seeded();
+ assert.equal(await ad.mayBeAdoptable(sqlite,seedId,'+923009999999'),false,'any phone would be adopted over');
+ h.sqlite.prepare('UPDATE users SET role=? WHERE id=?').run('staff',seedId);
+ assert.equal(await ad.mayBeAdoptable(sqlite,seedId,seedPhone),false,'a staff row on the bootstrap number would be rewritten');
+ assert.deepEqual(plain(await apply()),{status:'conflict'});
+
+ // ── THE LOCAL HALF MUST STAY LOCAL ───────────────────────────────────────────────────
+ const adSrc=read('src/services/database/accountAdoption.ts');
+ // The IMPORTS, not the word: the comments explain what the password was proved against,
+ // and naming Firebase there is the point.
+ assert.ok(!/^import .*firebase/im.test(adSrc),
+  'the local half imports Firebase, which is what made it untestable in the first place');
+
+ // ── THE DOCUMENT AND THE QUERY (source only: the harness cannot load Firebase) ───────
+ const src=read('src/services/firebase/firebaseProfile.ts');
+ const columns=/const PROFILE_COLUMNS =\s*([\s\S]*?);/.exec(src);
+ assert.ok(columns,'the document shape is no longer declared in one place');
+ assert.ok(!/passwordHash/.test(columns[1]),'the profile SELECT would read a credential out of users');
+ for(const field of ['id','name','phone','role','parentId','default_currency'])
+  assert.ok(columns[1].includes(field),'the profile cannot rebuild a users row without '+field);
+ // users/{localId} itself is NOT matched by the rules - the recursive wildcard needs at least
+ // one segment below it - which is exactly why the document sits a level down and needs no
+ // rules change.
+ assert.ok(/profile\/self/.test(src),'the identity document is not at profile/self');
+ assert.ok(/match \/users\/\{\w+\}\/\{document=\*\*\}/.test(fs.readFileSync(path.join(root,'..','firestore.rules'),'utf8')),
+  'the rule this path relies on is gone');
+ assert.ok(/collectionGroup\(/.test(src),'a second device cannot address its own document by path, so the lookup must be a collection group query');
+ assert.ok(/array-contains/.test(src),'the query does not match the read rule, so Firestore would reject it whole rather than filtering it');
+ // A PARENT's query returns their staff's profiles too, because visibleTo is author + chain.
+ assert.ok(/ownerId === uid/.test(src),'the lookup does not pick its OWN profile out of the results');
+ assert.ok(/authorisedPayload\(/.test(src)&&/authorisationFor\(/.test(src),'the document is not stamped by the same code every upload uses');
+
+ // ── THE INDEX, without which the query cannot run at all ─────────────────────────────
+ // A FIELD OVERRIDE, not an entry under "indexes": Firestore refuses a one-field composite
+ // with "this index is not necessary, configure using single field index controls" - which
+ // the first deploy from git found, and a hand-made console index never would have.
+ const indexFile=JSON.parse(fs.readFileSync(path.join(root,'..','firestore.indexes.json'),'utf8'));
+ const override=(indexFile.fieldOverrides||[]).find(o=>o.collectionGroup==='profile'&&o.fieldPath==='visibleTo');
+ assert.ok(override,'firestore.indexes.json has no field override for profile.visibleTo, so the collection group query cannot run: a single-field index is automatic for a collection but NOT for a collection group');
+ assert.ok(override.indexes.some(i=>i.arrayConfig==='CONTAINS'&&i.queryScope==='COLLECTION_GROUP'),
+  'the override does not enable array-contains at COLLECTION_GROUP scope: '+JSON.stringify(override.indexes));
+ assert.ok(!(indexFile.indexes||[]).some(i=>i.collectionGroup==='profile'),
+  'a composite entry for profile is back under "indexes"; Firestore rejects it outright');
+
+ // ── NOTHING IS CREATED WHEN THERE IS NOTHING TO REBUILD FROM ─────────────────────────
+ // The ORDINARY state at rollout: signed in, no profile published yet. A half-account with
+ // no data behind it is worse than a refusal.
+ const noProfile=/if \(!own[\s\S]*?return \{ status: 'no-profile' \};/.exec(src);
+ assert.ok(noProfile,'the no-profile branch could not be read');
+ assert.ok(/signOutFirebase\(\)/.test(noProfile[0]),
+  'the device is left holding a Firebase session for an account it has no local row for, so currentFirebaseUid returns a uid that maps to nothing');
+ assert.ok(!/INSERT INTO users|applyCloudProfile/.test(noProfile[0]),'the no-profile branch creates a local account');
+
+ const store=read('src/store/authStore.ts');
+ assert.ok(/'no-cloud-profile'/.test(store)&&/'account-conflict'/.test(store),'login cannot report either new outcome');
+ assert.ok(/ordinary fresh install/i.test(store),'the fresh-install fall-through is undocumented, so the next person deletes it');
+ assert.ok(/adoption\.status === 'adopted'/.test(store)&&/adoption\.status === 'materialised'/.test(store),
+  'login does not re-verify after the local row changed underneath it');
+ // Adoption is only ever REACHED when local auth could not succeed on its own, so an
+ // ordinary login never waits on the network.
+ // The CALL, not the import line, which naturally comes first.
+ const gate=store.indexOf('if (!user) {'), call=store.indexOf('await adoptAccountFromCloud(');
+ assert.ok(gate>=0&&call>gate,'adoption runs before the local password check, which would put a round trip in every login');
+ assert.ok(/mayBeAdoptable\(/.test(store),'an ordinary login on a real account would pay for a Firebase round trip');
+ const login=read('src/screens/auth/LoginScreen.tsx');
+ assert.ok(/loginNoCloudTitle/.test(login)&&/loginConflictTitle/.test(login),
+  'the login screen still says "wrong credentials" for a second device whose account simply has not published its details yet');
+}));
+
 (async()=>{
  const originals=new Map(sourceFiles().map(p=>[p,crypto.createHash('sha256').update(fs.readFileSync(p)).digest('hex')]));
  let passed=0;const failures=[];
