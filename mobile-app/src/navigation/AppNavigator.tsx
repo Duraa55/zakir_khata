@@ -11,6 +11,7 @@ import { seedDatabase } from '../services/database/seedData';
 import { initializeOfflineSync, stopOfflineSync } from '../services/firebase/offlineSync';
 import { IS_FIREBASE_CONFIGURED } from '../services/firebase/firebaseConfig';
 import { currentFirebaseUid } from '../services/firebase/firebaseAuth';
+import { logBackfillPlan } from '../services/database/syncBackfill';
 import { AmbientBackground } from '../components/AmbientBackground';
 import { Icon } from '../components/ui/primitives';
 import { color, space, iconSize, touchTarget, hairline, type as typeScale } from '../theme/tokens';
@@ -60,6 +61,16 @@ export const AppNavigator = () => {
         
         await checkSession();
         if (__DEV__) console.log('[Auth] Check session complete.');
+
+        // WHAT THE BACKFILL WOULD ENQUEUE, printed and not done. `sync_queue` only ever
+        // gains a row when something is written, and v44 emptied it, so everything that
+        // already exists would otherwise never upload — but enqueuing tens of thousands of
+        // rows is not something to discover after the fact. This is read-only, __DEV__-only,
+        // and runs after checkSession so there is a session to report for.
+        if (__DEV__) {
+          const me = useAuthStore.getState().user?.id;
+          if (me) await logBackfillPlan(await getDatabase(), me);
+        }
       } catch (error: any) {
         // Startup used to log this and carry on, so a stalled migration stayed invisible
         // until some screen hit a table that was never created. Say it out loud.

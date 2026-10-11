@@ -279,6 +279,23 @@ async function initializeDatabase(database: SQLite.SQLiteDatabase): Promise<void
       pending_count INTEGER DEFAULT 0
     );
 
+    -- WHERE THE INITIAL UPLOAD GOT TO, per account and per table (v49).
+    --
+    -- Keyed on BOTH because one phone can host several logins: a single cursor per table
+    -- would let the owner's run advance past a staff member's rows, which could then never
+    -- be queued by anyone and would simply never appear in the Sync Centre.
+    --
+    -- The cursor is an id, NOT a rowid. v37 and v43 both REBUILD staff_records, and a
+    -- rebuild renumbers rowids, so a rowid cursor would silently skip or repeat rows after.
+    -- (No backticks in this comment: the whole block is a JS template literal.)
+    CREATE TABLE IF NOT EXISTS sync_backfill (
+      account_local_id TEXT NOT NULL,
+      table_name TEXT NOT NULL,
+      last_id TEXT,
+      updated_at TEXT,
+      PRIMARY KEY (account_local_id, table_name)
+    );
+
     -- Also created by migration v38. Listed here as well, like every other table, so a
     -- database whose migration chain stalled still opens with a usable table instead of
     -- failing at "no such table" deep inside the salary screen.
@@ -1946,6 +1963,26 @@ async function migrateFrom(database: SQLite.SQLiteDatabase): Promise<void> {
 
     await database.execAsync('PRAGMA user_version = 48');
     version = 48;
+  }
+
+  if (version < 49) {
+    // THE BACKFILL CURSOR (2026-10-11). See the base schema above for why it is keyed on
+    // (account, table) and why the cursor is an id rather than a rowid.
+    //
+    // Creating a table is all this does. Nothing is backfilled here: the backfill writes
+    // sync_queue rows, it must be re-runnable and interruptible, and a migration is neither.
+    await database.execAsync(`
+      CREATE TABLE IF NOT EXISTS sync_backfill (
+        account_local_id TEXT NOT NULL,
+        table_name TEXT NOT NULL,
+        last_id TEXT,
+        updated_at TEXT,
+        PRIMARY KEY (account_local_id, table_name)
+      )
+    `);
+
+    await database.execAsync('PRAGMA user_version = 49');
+    version = 49;
   }
 }
 

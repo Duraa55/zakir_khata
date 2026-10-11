@@ -5952,6 +5952,130 @@ check(156,'the Activity Log’s own audience travels as activityAudience — a r
  assert.equal(sh.columnValueForPayloadField(sh.syncPayloadFor('activities',{visible_to:original}).activityAudience),original,
   'the audience does not survive a round trip, so pull would write a different value than push sent');
 }));
+check(157,'THE INITIAL UPLOAD PATH: the backlog v44 emptied is enqueued once, every live row regardless of a `synced` flag the Firestore wipe made a liar, soft-deleted rows included, only this account’s own rows and only once it has a Firebase identity, parents before children, payloads through the same gate a live write uses — and a run killed half way RESUMES at the next row instead of restarting or double-queueing',at('src/services/database/syncBackfill.ts','runBackfill'),()=>isolated(async h=>{
+ const bf=h.load('src/services/database/syncBackfill.ts');
+ const db=h.load('src/services/database/db.ts');
+ const sqlite=await db.getDatabase();
+ seedPeople(h);h.login('owner');
+ const setUid=(id,uid)=>h.sqlite.prepare('UPDATE users SET firebase_uid=? WHERE id=?').run(uid,id);
+ const queue=()=>h.all('SELECT table_name,record_id,payload,firestore_path,operation,status FROM sync_queue ORDER BY table_name,record_id');
+ const cursors=()=>h.all('SELECT account_local_id,table_name,last_id FROM sync_backfill ORDER BY table_name');
+
+ // ── PARENTS BEFORE CHILDREN ───────────────────────────────────────────────────────────
+ const order=bf.backfillOrder();
+ const at_=t=>order.indexOf(t);
+ for(const [parent,child] of [['bills','bill_items'],['purchase_invoices','purchase_invoice_items'],
+   ['purchase_orders','purchase_order_items'],['purchase_returns','purchase_return_items'],
+   ['staff_records','staff_salary_transactions'],['staff_records','salary_month_closings'],
+   ['staff_records','staff_attendance']]){
+  assert.ok(at_(parent)>=0&&at_(child)>=0,parent+' or '+child+' is missing from the backfill order');
+  assert.ok(at_(parent)<at_(child),child+' is backfilled before '+parent+', so a line could reach Firestore before the document it belongs to');
+ }
+ // Every live table, and no table that nothing enqueues.
+ const sp=h.load('src/services/database/syncPaths.ts');
+ for(const [t,spec] of Object.entries(sp.SYNC_PATHS)){
+  if(spec.pending) assert.ok(!order.includes(t),t+' is not wired for push but the backfill would queue it');
+  else assert.ok(order.includes(t),t+' would never be backfilled, so its existing rows could never upload');
+ }
+
+ // ── The backlog: rows that exist and will never be touched again ─────────────────────
+ h.insert('customers',{id:'c1',user_id:'owner',name:'Bilal',cnic:'3520212345671',synced:1});
+ h.insert('expenses',{id:'e1',user_id:'owner',synced:1});                       // `synced` is a lie
+ h.insert('expenses',{id:'e2',user_id:'owner',is_deleted:1,deleted_at:'2026-10-01T00:00:00.000Z'});
+ h.insert('expenses',{id:'e3',user_id:'staffA'});                               // someone else's
+ h.insert('bills',{id:'b1',user_id:'owner'});
+ h.insert('bill_items',{id:'i1',bill_id:'b1',item_name:'Rice',quantity:2,unit_price:100,line_total:200});
+ // A stored path is used as-is; a NULL one is rebuilt from the map.
+ h.sqlite.prepare("UPDATE expenses SET firestore_path='users/owner/expenses/e1' WHERE id='e1'").run();
+ h.sqlite.prepare('UPDATE bills SET firestore_path=NULL WHERE id=?').run('b1');
+ const booksBefore=Object.fromEntries(['customers','expenses','bills','bill_items']
+  .map(t=>[t,plain(h.all('SELECT * FROM '+t+' ORDER BY id'))]));
+
+ // ── NO FIREBASE IDENTITY: nothing enqueued, and the cursor must NOT move ─────────────
+ const dry0=await bf.planBackfill(sqlite,'owner');
+ assert.equal(dry0.hasFirebaseIdentity,false);
+ assert.equal(dry0.totalEnqueue,0,'rows were counted as enqueueable for an account that cannot authorise any of them');
+ assert.deepEqual(plain(await bf.runBackfill(sqlite,'owner')),{enqueued:0,tablesCompleted:0,stoppedEarly:true});
+ assert.equal(queue().length,0);
+ assert.equal(cursors().length,0,'the cursor moved past rows that were never queued — they could never be queued again');
+
+ setUid('owner','fb_owner');
+ setUid('staffA','fb_staffA');
+
+ // ── THE DRY RUN WRITES NOTHING ───────────────────────────────────────────────────────
+ const plan=await bf.planBackfill(sqlite,'owner');
+ assert.equal(queue().length,0,'planBackfill queued something');
+ assert.equal(cursors().length,0,'planBackfill moved a cursor');
+ assert.equal(plan.hasFirebaseIdentity,true);
+ const forTable=t=>plan.tables.find(x=>x.table===t);
+ assert.equal(forTable('expenses').enqueue,2,'the plan does not count e1 (synced=1, a stale flag) and e2 (soft-deleted)');
+ assert.equal(forTable('expenses').otherAuthor,1,'staffA’s row is counted as this account’s');
+ assert.equal(forTable('customers').enqueue,1);
+ assert.equal(forTable('bill_items').enqueue,1);
+ assert.equal(plan.totalEnqueue,5,'the plan total disagrees with its own per-table counts: '+JSON.stringify(plan.tables.filter(t=>t.enqueue)));
+
+ // ── RESUME: stop early, then continue ────────────────────────────────────────────────
+ const first=await bf.runBackfill(sqlite,'owner',{chunkSize:1,maxRows:2});
+ assert.equal(first.enqueued,2,'the budget was not honoured');
+ assert.ok(first.stoppedEarly);
+ const afterFirst=queue().map(r=>r.table_name+'/'+r.record_id);
+ assert.equal(afterFirst.length,2);
+ assert.ok(cursors().length>0,'nothing recorded where to resume from, so a second run would restart');
+
+ const second=await bf.runBackfill(sqlite,'owner',{chunkSize:2});
+ const all=queue();
+ assert.equal(all.length,5,'the backlog did not finish: '+all.length+' of 5');
+ assert.equal(first.enqueued+second.enqueued,5,'the two runs together queued the wrong number');
+ // RESUMED, not restarted: no row queued twice.
+ const keys=all.map(r=>r.table_name+'/'+r.record_id);
+ assert.equal(new Set(keys).size,keys.length,'a row was queued twice — the run restarted instead of resuming: '+keys.join(', '));
+ for(const k of afterFirst) assert.ok(keys.includes(k),'a row queued by the first run disappeared: '+k);
+
+ // ── Idempotent once finished ─────────────────────────────────────────────────────────
+ assert.equal((await bf.runBackfill(sqlite,'owner')).enqueued,0,'a completed backfill queued the backlog again');
+ assert.equal((await bf.planBackfill(sqlite,'owner')).totalEnqueue,0);
+
+ // ── WHAT WENT INTO THE QUEUE ─────────────────────────────────────────────────────────
+ const row=t=>all.find(r=>r.table_name===t);
+ assert.ok(!keys.includes('expenses/e3'),'staffA’s row was queued under the owner, and would sit pending forever');
+ assert.ok(keys.includes('expenses/e2'),'the soft-deleted row was skipped, so a second device keeps entry history for a row it never receives');
+ assert.ok(keys.includes('expenses/e1'),'a row marked synced=1 was skipped — that flag describes a document the Firestore wipe deleted');
+ // The same gate a live write uses: a CNIC must not leave the phone, even on a bulk run.
+ const customer=JSON.parse(row('customers').payload);
+ assert.ok(!('cnic' in customer),'the backfill shipped a national ID');
+ // Local bookkeeping is not document data, and a live payload has neither.
+ for(const r of all){
+  const p=JSON.parse(r.payload);
+  assert.ok(!('synced' in p),r.table_name+' sent its local synced flag');
+  assert.ok(!('firestore_path' in p),r.table_name+' sent its own path as a field');
+ }
+ assert.equal(row('expenses').operation,'create','a merge-set is what makes a re-run harmless');
+ assert.equal(row('expenses').status,'pending');
+ // Paths: the stored one honoured, the missing one rebuilt, and a nested child under its parent.
+ assert.equal(all.find(r=>r.record_id==='e1').firestore_path,'users/owner/expenses/e1');
+ assert.equal(all.find(r=>r.record_id==='b1').firestore_path,'users/owner/bills/b1','a NULL stored path was not rebuilt from the map');
+ assert.equal(all.find(r=>r.record_id==='i1').firestore_path,'users/owner/bills/b1/items/i1');
+ // Every queued path addresses a document and hands back this account as its author.
+ const sa=h.load('src/services/database/syncAuthorisation.ts');
+ for(const r of all){
+  assert.equal(r.firestore_path.split('/').length%2,0,'odd-segment path: '+r.firestore_path);
+  assert.equal(sa.authorLocalIdFrom(r.firestore_path),'owner',r.table_name+' filed a row under another account');
+ }
+
+ // ── NOT ONE BOOK ROW TOUCHED ─────────────────────────────────────────────────────────
+ // The backfill writes sync_queue and its own cursor, nothing else, so a failed run can
+ // never leave the books in a worse state than it found them.
+ for(const [t,before] of Object.entries(booksBefore))
+  assert.deepEqual(plain(h.all('SELECT * FROM '+t+' ORDER BY id')),before,t+' was modified by the backfill');
+
+ // ── A SECOND ACCOUNT ON THE SAME PHONE HAS ITS OWN CURSOR ────────────────────────────
+ // Without this, the owner's run would advance past staffA's rows and they could never be
+ // queued — the Sync Centre would simply never show them.
+ const staffRun=await bf.runBackfill(sqlite,'staffA');
+ assert.equal(staffRun.enqueued,1,'staffA’s own backfill found nothing, because the owner’s run had already consumed the cursor');
+ assert.ok(queue().some(r=>r.record_id==='e3'));
+ assert.ok(cursors().length>0&&h.all("SELECT DISTINCT account_local_id FROM sync_backfill").length===2,'the two accounts share one cursor');
+}));
 (async()=>{
  const originals=new Map(sourceFiles().map(p=>[p,crypto.createHash('sha256').update(fs.readFileSync(p)).digest('hex')]));
  let passed=0;const failures=[];
