@@ -6352,6 +6352,82 @@ check(158,'HOW A SECOND DEVICE BECOMES THE SAME PERSON: one identity document pe
   }
 }));
 
+check(159,'THE AUDIENCE FILTER, the only thing standing between a pull and a forged document: a stranger can stamp their OWN uid as ownerId and put a victim in visibleTo, so the rules admit it and the READER must refuse it — accepted from the viewer and everyone beneath them (a dismissed staff member included, because their entries must stay visible), never from an ancestor or another business',at('src/services/database/pullAudience.ts','knownAudience'),()=>isolated(async h=>{
+ const pa=h.load('src/services/database/pullAudience.ts');
+ const db=h.load('src/services/database/db.ts');
+ const sqlite=await db.getDatabase();
+ seedPeople(h);
+ const setUid=(id,uid)=>h.sqlite.prepare('UPDATE users SET firebase_uid=? WHERE id=?').run(uid,id);
+ setUid('owner','fb_owner');
+ setUid('staffA','fb_staffA');
+ setUid('staffB','fb_staffB');
+ setUid('otherOwner','fb_other');
+ setUid('otherStaff','fb_otherStaff');
+ // subA deliberately has NO uid: a staff member who has never logged in anywhere.
+
+ // ── WHO THIS VIEWER MAY RECEIVE DATA FROM ────────────────────────────────────────────
+ const ownerKnows=await pa.knownAudience(sqlite,'owner');
+ assert.ok(ownerKnows.has('fb_owner'),'the viewer cannot receive their own documents');
+ assert.ok(ownerKnows.has('fb_staffA'),'an owner cannot receive their staff member’s books, which is the product');
+ assert.ok(!ownerKnows.has('fb_other')&&!ownerKnows.has('fb_otherStaff'),'another business is in the accepted set');
+ // No uid, nothing to add - and nothing missed either, since they own no documents.
+ assert.equal(ownerKnows.size,3,'unexpected members: '+[...ownerKnows].sort().join(', '));
+
+ // A DISMISSED STAFF MEMBER STAYS IN THE SET (non-negotiable rule 4). Their documents were
+ // stamped visibleTo = [them, the admin] while they were live, so the rules admit them; this
+ // filter would be the only thing keeping their history off a second device.
+ h.sqlite.prepare("UPDATE users SET is_deleted=1, deleted_at='2026-10-01T00:00:00.000Z' WHERE id='staffB'").run();
+ const afterRemoval=await pa.knownAudience(sqlite,'owner');
+ assert.ok(afterRemoval.has('fb_staffB'),
+  'a removed staff member was dropped from the accepted set, so a device that never pulled them could never receive their entries');
+
+ // ── DOWNWARD ONLY ────────────────────────────────────────────────────────────────────
+ const staffKnows=await pa.knownAudience(sqlite,'staffA');
+ assert.deepEqual([...staffKnows],['fb_staffA'],'a staff member accepts documents from outside their own account: '+[...staffKnows].join(', '));
+ assert.ok(!staffKnows.has('fb_owner'),'a staff member would accept their admin’s books, and this must not lean on the rules to stop it');
+
+ // ── THE INJECTION ITSELF ─────────────────────────────────────────────────────────────
+ // Account creation is open to anyone holding the API key in the APK. The create rule asks
+ // only that ownerId be the caller's own uid and says nothing about who else is in
+ // visibleTo, so this document is written successfully and the read rule admits it.
+ const forged={ownerId:'fb_stranger',visibleTo:['fb_owner','fb_stranger'],total_paisa:9999999};
+ assert.equal(pa.acceptable(forged,afterRemoval),false,
+  'a forged document naming the viewer in visibleTo was accepted; ownerId immutability stops a document being MOVED into a business, never one being BORN pointing at it');
+ // The same document is refused however plausible the rest of it looks.
+ // Upward, with everything else about the document in order: the admin's own bill, offered
+ // to a staff member who is named in its visibleTo. The rules would admit it; this must not.
+ assert.equal(pa.acceptable({ownerId:'fb_owner',visibleTo:['fb_owner','fb_staffA']},staffKnows),false,
+  'a staff member accepted their admin’s document');
+ assert.equal(pa.acceptable({...forged,ownerId:'fb_staffA'},staffKnows),true,'a staff member refused their OWN document');
+ assert.equal(pa.acceptable({ownerId:'fb_staffA',visibleTo:['fb_staffA','fb_owner']},afterRemoval),true,'a genuine staff document was refused');
+
+ // ── TOTAL: anything it cannot vouch for is refused ───────────────────────────────────
+ for(const bad of [null,undefined,'a string',42,[],{},{ownerId:''},{ownerId:null},{ownerId:42},{ownerId:['fb_owner']},{visibleTo:['fb_owner']}])
+  assert.equal(pa.acceptable(bad,afterRemoval),false,'accepted a document with no usable owner: '+JSON.stringify(bad));
+ // An empty known set accepts nothing, which is the state before identity is resolved.
+ assert.equal(pa.acceptable({ownerId:'fb_owner'},new Set()),false);
+
+ // ── THE ROW MUST LAND IN THE OWNER’S OWN BOOK ──────────────────────────────────────
+ // acceptable() proves WHO may send it. This proves the row is filed under that same person:
+ // ownerId is a Firebase uid, the author column holds a LOCAL id, and the two must agree.
+ assert.equal(await pa.ownerMatchesAuthor(sqlite,'expenses',{ownerId:'fb_staffA',user_id:'staffA'}),true);
+ assert.equal(await pa.ownerMatchesAuthor(sqlite,'expenses',{ownerId:'fb_staffA',user_id:'owner'}),false,
+  'a document owned by one account was about to be filed in another’s book');
+ // The two camelCase tables, which nothing else in the schema would lead you to expect.
+ assert.equal(await pa.ownerMatchesAuthor(sqlite,'transactions',{ownerId:'fb_staffA',userId:'staffA'}),true);
+ assert.equal(await pa.ownerMatchesAuthor(sqlite,'transactions',{ownerId:'fb_staffA',user_id:'staffA'}),false,'transactions keys on userId');
+ // A parent-resolved table has no author column of its own; its parent carries the check.
+ assert.equal(await pa.ownerMatchesAuthor(sqlite,'bill_items',{ownerId:'fb_staffA',bill_id:'b1'}),true);
+ assert.equal(await pa.ownerMatchesAuthor(sqlite,'expenses',{ownerId:'fb_nobody',user_id:'staffA'}),false,'an owner with no local account was matched');
+ assert.equal(await pa.ownerMatchesAuthor(sqlite,'not_a_table',{ownerId:'fb_staffA',user_id:'staffA'}),false);
+
+ // ── ONE SCOPING PREDICATE, AND IT IS THE SHARED ONE (rule 1) ─────────────────────────
+ const src=read('src/services/database/pullAudience.ts');
+ assert.ok(/userScope\(/.test(src),'a second copy of the scoping subquery was written instead of using the one helper');
+ assert.ok(!/account_level|is_deleted/.test(src.replace(/^\s*(\*|\/\/).*$/gm,'')),
+  'the scoping query mentions account_level or is_deleted, which rule 1 forbids');
+ assert.ok(!/^import .*firebase/im.test(src),'the filter imports Firebase, which would make it untestable beside the packages the harness cannot load');
+}));
 (async()=>{
  const originals=new Map(sourceFiles().map(p=>[p,crypto.createHash('sha256').update(fs.readFileSync(p)).digest('hex')]));
  let passed=0;const failures=[];

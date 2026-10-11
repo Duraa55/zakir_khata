@@ -12,9 +12,14 @@
  *   params: [...userScopeParams(userId), ...]
  *
  * @param col Column name. Use 'userId' for camelCase tables (transactions, cashbook),
- *            or 'user_id' for snake_case tables (expenses, stock_items, bills, etc.)
+ *            or 'user_id' for snake_case tables (expenses, stock_items, bills, etc.).
+ *            'id' scopes the `users` table against ITSELF — the viewer and the accounts
+ *            directly beneath them — which pullAudience needs to collect their uids. It is
+ *            the same SQL with a different column, NOT another copy of the predicate: rule 1
+ *            keeps this helper and its remaining inline copies byte-identical, and nothing
+ *            here mentions account_level or is_deleted.
  */
-export const userScope = (col: 'userId' | 'user_id' = 'user_id'): string =>
+export const userScope = (col: 'userId' | 'user_id' | 'id' = 'user_id'): string =>
   `(${col} = ? OR ${col} IN (SELECT id FROM users WHERE parentId = ?))`;
 
 /**

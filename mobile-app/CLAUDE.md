@@ -677,6 +677,21 @@ their own, enforced in the data layer not by hiding buttons).
 > unknown `ownerId` is dropped silently — no row written, no error on screen.
 > PULL IS NOT DONE UNTIL THAT FILTER EXISTS AND IS TESTED.
 >
+> **AND A CURSOR MUST NEVER ADVANCE PAST A DOCUMENT IT DROPPED (2026-10-12).** The obvious
+> way to bootstrap a fresh device is two passes: pull with the known set as just the viewer,
+> derive the team from what arrives, then pull again with the team included. IT LOSES DATA
+> SILENTLY. Pass one advances the `bills` cursor past a staff member's bills it had just
+> dropped, and pass two never refetches them — a gap nobody would find, because every later
+> pull starts after it.
+>
+> Advancing only over ACCEPTED documents is not the fix either: one document with a
+> permanently unknown owner would then block that collection's cursor for ever.
+>
+> So anything the filter depends on must be in place BEFORE pull runs at all and before any
+> cursor moves. The team bootstrap is therefore a single cursor-free query of the admin's own
+> `staff_records` — not a pull pass — and the order is: identity bootstrap, audience filter,
+> team bootstrap, pull.
+>
 > **THE OTHER PLACE THE CLIENT HAS TO PROTECT US: the profile lookup's ownerId filter
 > (2026-10-12).** `findAccountProfile` runs a collection-group query over `profile` and keeps
 > only documents whose `ownerId` equals its own uid. THAT FILTER IS LOAD-BEARING, not a
