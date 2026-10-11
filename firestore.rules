@@ -1,0 +1,97 @@
+rules_version = '2';
+
+// =============================================================================
+// LIVE. Published 2026-10-11 (step 8b). This file is a transcription of what is
+// deployed, and the active block below is byte-for-byte what the console holds.
+// =============================================================================
+//
+// It replaced a deny-all (step 8a), which replaced a console-only
+// `allow read, write: if request.auth != null`. That rule was harmless only while nothing
+// could authenticate. Firebase Auth landed in step 7 and account creation is open to
+// anyone holding the Web API key, which ships inside the APK — so it had stopped being a
+// weak rule and become no rule at all.
+//
+// THE SHAPE, AND WHY IT IS THIS AND NOT SOMETHING SIMPLER:
+//
+//   * The path key is the LOCAL user id, not the Firebase uid. Per-uid paths break the
+//     product: an owner must read a staff member's books, and those live under the staff
+//     member's own identity. Authorisation therefore rides on the DOCUMENT, not the path.
+//   * `ownerId` alone cannot express "my staff's data" — a staff member's document carries
+//     their uid, not the owner's. Walking parentId in rules would need a get() per
+//     evaluation: billed as a read, latency on every call, capped at 10, and it would drag
+//     the users collection into Firestore purely so rules could read it. `visibleTo`
+//     (author + parent chain, written at save time) makes it one O(1) test.
+//   * `ownerId` immutable on update is what stops one business MOVING documents into
+//     another's view.
+//   * Both fields hold FIREBASE uids, mapped from the local id through users.firebase_uid
+//     (migration v46). They are stamped at UPLOAD time by
+//     `services/database/syncAuthorisation.ts` (`authorisedPayload`), never stored as columns.
+//   * There is NO `allow delete`. A removal is a soft delete — an UPDATE setting
+//     `is_deleted` — so a hard delete is denied by having no rule at all. Nothing outside
+//     `/users` matches any rule either, and no rule means denied.
+//
+// WHAT `sane()` DOES AND DOES NOT DO:
+//
+//   It makes a document without a usable audience unwritable: `visibleTo` must be a list
+//   and must contain `ownerId`. The app always satisfies it — `visibleTo` is built as
+//   `[author, ...parents]` — and so does the soft-delete path, because `request.resource.data`
+//   on an update is the POST-MERGE document and still carries both fields.
+//
+//   It does NOT constrain WHO ELSE is in `visibleTo`, and it cannot. Account creation is
+//   open to anyone with the shipped API key, so a stranger can create a document, stamp
+//   `ownerId` with their own uid — all the create rule asks — and put a victim's uid in
+//   `visibleTo`. The victim's own `array-contains` pull query then returns it. THE READER
+//   MUST THEREFORE DROP ANY DOCUMENT WHOSE `ownerId` IS NOT A KNOWN TEAM MEMBER'S
+//   `firebase_uid`. That filter is a blocking prerequisite for the pull step, not
+//   hardening — see CLAUDE.md, "AUDIENCE INJECTION". The path cannot help: it is the local
+//   id and is unconstrained by design.
+//
+//   The `size() <= 8` cap is the ONLY cap on the audience; `authorisationFor` walks the
+//   parent chain with a cycle guard but no depth limit. The tree is two levels today, so
+//   there is headroom. If it ever deepens past 8, writes begin failing with
+//   permission-denied and the cause will not be obvious from the app.
+//
+// A READ OF A DOCUMENT WITH NO `visibleTo` ERRORS RATHER THAN DENYING CLEANLY
+// ("Property visibleTo is undefined on object"). Access is still refused. It is reachable
+// only by creating a document BY HAND in the console, because every pull query must carry
+// `where('visibleTo', 'array-contains', uid)` and Firestore does not return documents
+// missing that field — so such a document is never a query candidate and the rule is never
+// evaluated against it. No guard was added: `sane()` already makes the state unreachable
+// through the rules, and guarding the read would tolerate it instead.
+//
+// AND A TRAP FOR WHOEVER WIRES THE PULL STEP: Firestore rules do not filter a query, they
+// REJECT it. Any query that could return a document the caller cannot read fails whole.
+// Every pull query must therefore carry its own
+// `where('visibleTo', 'array-contains', uid)` — matching the rule is not optional.
+//
+// DEPLOY FROM THE REPO ROOT, NOT THE CONSOLE: `firebase deploy --only firestore:rules`.
+// This file was transcribed back from the console once, on 2026-10-11, because the rules
+// were published there. That is the thing versioning them was meant to prevent; see
+// CLAUDE.md for the CLI-login gap that forced it.
+// =============================================================================
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    match /users/{pathId}/{document=**} {
+
+      function owner()    { return request.resource.data.ownerId; }
+      function audience() { return request.resource.data.visibleTo; }
+      function sane()     { return audience() is list
+                                  && audience().size() <= 8
+                                  && owner() in audience(); }
+
+      allow read: if request.auth != null
+                  && request.auth.uid in resource.data.visibleTo;
+
+      allow create: if request.auth != null
+                    && owner() == request.auth.uid
+                    && sane();
+
+      allow update: if request.auth != null
+                    && resource.data.ownerId == request.auth.uid
+                    && owner() == resource.data.ownerId
+                    && sane();
+    }
+  }
+}
