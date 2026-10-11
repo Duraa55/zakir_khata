@@ -691,15 +691,29 @@ their own, enforced in the data layer not by hiding buttons).
 > from the queue id. Deploying from git (`firebase deploy --only firestore:rules`) removes
 > the whole ambiguity, which is one more reason to fix the CLI login.
 
-- **KNOWN GAP — the Firebase CLI is not logged in, so step 8b's rules were published from the
-  CONSOLE and `firestore.rules` was transcribed BACK by hand (2026-10-11).**
-  `firebase deploy --only firestore:rules` from the repo root cannot run today: the last
-  `login` was abandoned at the authorisation-code prompt (`ExitPromptError` at the end of
-  `firebase-debug.log`), and `firebase-tools` is not installed locally either. So the console
-  became the source of truth and git went stale — which is the exact thing putting the file
-  in git was meant to prevent (`ROOT_IS_NOT_THE_APP.md`). The transcription closed it once,
-  and nothing but check 149 and a person reading both files proves the two still agree.
-  Sort the login BEFORE the next rules change, and deploy git → live after that, never back.
+- **DEPLOY RULES AND INDEXES FROM GIT, and the login flag that makes it possible
+  (2026-10-11).** From the repo ROOT, never `mobile-app/`:
+
+      npx firebase-tools deploy --only firestore:rules
+      npx firebase-tools deploy --only firestore:indexes
+
+  **`npx firebase-tools login --no-localhost` is the flag that works on this machine.** The
+  default flow opens a browser and waits on a `localhost:9005` callback that never arrives
+  here, ending in `ExitPromptError` — the tail of `firebase-debug.log` is that failure.
+  `--no-localhost` prints a code to paste instead and gets past it. Logged in as
+  cbaloch54@gmail.com.
+
+  This closes the gap that forced step 8b's rules to be published from the CONSOLE and
+  `firestore.rules` to be transcribed BACK by hand — the exact thing putting the file in git
+  was meant to prevent (`ROOT_IS_NOT_THE_APP.md`). Deploy git → live from here on, never the
+  other way.
+
+  **A DEPLOY DOES NOT DIFF.** It compiles and releases, and reports neither what the live
+  ruleset was nor whether it changed. A successful deploy therefore proves that live now
+  matches the repo; it proves nothing about what live held a moment earlier. Before deploying
+  over a ruleset somebody may have edited in the console, read the publish timestamp in the
+  rules version history first — see the Playground note above for why that timestamp, and
+  nothing else, tells you what is live.
 - **BACKLOG — login takes ~3s offline because of the Firebase attempt (owner-measured,
   2026-10-07).** `ensureFirebaseAccount` is already fire-and-forget (`void`, not awaited)
   in `authStore.login`, so the delay is NOT the await — it is the work happening on the JS
