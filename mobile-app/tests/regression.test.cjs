@@ -5496,7 +5496,39 @@ check(149,'Firestore rules are IN THE REPO and are the PUBLISHED ones: read is g
  const ops=blocks.flatMap(b=>b.ops).sort();
  // No `allow write`, and NO `allow delete`: a removal is a soft delete, i.e. an UPDATE
  // setting is_deleted, so a hard delete is refused by having no rule to match.
- assert.deepEqual(ops,['create','read','update'],'the published rules grant read, create and update only — got: '+ops.join(','));
+ //
+ // The SET of operations, not the list: there are two `allow read` rules now, in two match
+ // blocks with different jobs. Pinning the list broke the moment the second block landed and
+ // said nothing about whether the new one was safe, which is what the per-block assertions
+ // below are for.
+ assert.deepEqual([...new Set(ops)].sort(),['create','read','update'],
+  'the rules grant something other than read, create and update — got: '+ops.join(','));
+ assert.equal(blocks.length,4,'expected four allow rules across the two match blocks — got '+blocks.length+': '+ops.join(','));
+
+ // THE SECOND MATCH BLOCK exists only so a COLLECTION-GROUP query can be matched at all: a
+ // rule anchored under /users has no ancestry to bind when the query has no parent path, so
+ // a leading recursive wildcard is the only reachable form. READ-ONLY on purpose - the
+ // publish writes through the /users block, and a write rule here would widen writes to a
+ // `profile` collection anywhere in the database.
+ const braced=(text,from)=>{
+  // The BLOCK's brace is the last one on the match line - `{path=**}` and `{profileId}` are
+  // balanced placeholders, so starting at the first `{` would scan the wrong pair entirely.
+  const lineEnd=text.indexOf(String.fromCharCode(10),from);
+  const open=text.lastIndexOf('{',lineEnd); let depth=0;
+  for(let i=open;i<text.length;i++){
+   if(text[i]==='{')depth++;
+   else if(text[i]==='}'&&--depth===0)return text.slice(open+1,i);
+  }
+  return null;
+ };
+ const groupAt=active.indexOf('match /{path=**}/profile/');
+ assert.ok(groupAt>=0,'the profile collection-group block is gone, so a second device cannot find its own identity document and adoption fails with permission-denied');
+ const group=braced(active,groupAt);
+ assert.ok(group,'the collection-group block is unbalanced');
+ const groupAllows=[...group.matchAll(/allow\s+([a-z, ]+?)\s*:/g)].flatMap(m=>m[1].split(',').map(x=>x.trim()));
+ assert.deepEqual(groupAllows,['read'],'the collection-group block grants more than read, which would widen writes to a profile collection ANYWHERE: '+groupAllows.join(','));
+ assert.ok(/request\.auth != null/.test(group)&&/request\.auth\.uid in resource\.data\.visibleTo/.test(group),'the collection-group read is not gated on the audience list');
+ assert.ok(!/request\.resource/.test(group),'the collection-group block reasons about an incoming document, so it is not read-only');
 
  // THE WALK. This replaces a literal `!/if request\.auth != null;/`, which leaned on the
  // trailing semicolon and so would have missed `if request.auth != null && true;` and
@@ -5512,9 +5544,11 @@ check(149,'Firestore rules are IN THE REPO and are the PUBLISHED ones: read is g
   'the deny-all of step 8a is still here, so this file is NOT what is published and a deploy would close the database');
 
  const bodyOf=op=>{
-  const b=blocks.find(x=>x.ops.includes(op));
-  assert.ok(b,'there is no allow '+op+' rule');
-  return b.body;
+  // For `read` there are two now: take the one that reasons about a document's OWNER, which
+  // is the /users block. The collection-group block is asserted separately above.
+  const candidates=blocks.filter(x=>x.ops.includes(op));
+  assert.ok(candidates.length,'there is no allow '+op+' rule');
+  return (candidates.find(c=>/ownerId/.test(c.body))||candidates[0]).body;
  };
  // Read: the audience list, not the path. The path key is the LOCAL id, and an owner must
  // be able to read a staff member’s books, which live under the staff member’s own id.
@@ -5696,6 +5730,11 @@ check(152,'ONE map from table to Firestore path, checked against the MIGRATED SC
  assert.equal(dupes.length,0,'tables share a leaf collection, so a collection-group pull could not tell them apart: '+dupes.join(', '));
  for(const t of Object.keys(sp.SYNC_PATHS)) assert.equal(sp.tableForLeafCollection(sp.leafCollectionOf(t)),t,t+' does not round-trip through its own leaf');
  assert.equal(sp.tableForLeafCollection('nothing_like_this'),null);
+ // `profile` IS RESERVED. firestore.rules carries a leading-wildcard block matching a
+ // `profile` collection anywhere, added so a second device can find its identity document by
+ // collection group. A book table taking that leaf would silently fall under a rule written
+ // for identity documents - read-only, and matched outside /users too.
+ assert.ok(!leaves.includes('profile'),'a table claims the `profile` leaf, which firestore.rules reserves for identity documents');
 
  // ── Nothing carrying a firestore_path may be unaccounted for ──────────────────────────
  // The silence is the bug: stock_movements had no path and no mention anywhere, so there was

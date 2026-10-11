@@ -676,6 +676,24 @@ their own, enforced in the data layer not by hiding buttons).
 > (the puller's own `firebase_uid` plus their descendants', `is_deleted = 0`), and an
 > unknown `ownerId` is dropped silently — no row written, no error on screen.
 > PULL IS NOT DONE UNTIL THAT FILTER EXISTS AND IS TESTED.
+>
+> **THE OTHER PLACE THE CLIENT HAS TO PROTECT US: the profile lookup's ownerId filter
+> (2026-10-12).** `findAccountProfile` runs a collection-group query over `profile` and keeps
+> only documents whose `ownerId` equals its own uid. THAT FILTER IS LOAD-BEARING, not a
+> convenience for picking one result out of several.
+>
+> A stranger holding the API key that ships in the APK can create
+> `users/<anything>/profile/<anything>`: the create rule asks only that `ownerId` be their own
+> uid, and the leading-wildcard read block means such a document turns up in a victim's
+> collection-group results. It is harmless ONLY because the lookup drops anything whose
+> `ownerId` is not its own, and a document carrying the victim's uid as `ownerId` cannot be
+> created by anyone else. Remove or loosen that filter and a planted document can be adopted
+> as an identity — which hands over the local id every future document path is built from.
+>
+> These two filters are the same shape and the same lesson: the rules can prove who WROTE a
+> document, never who it is ABOUT. Wherever the client acts on `ownerId`, the client is the
+> thing enforcing it. Checked by 158 (`ownerId === uid` in the lookup) and, once pull lands,
+> by its own check.
 
 > **THE RULES PLAYGROUND EVALUATES THE EDITOR, NOT WHAT IS LIVE (learned the hard way,
 > 2026-10-11).** It simulates against the text in the console's rules editor, including

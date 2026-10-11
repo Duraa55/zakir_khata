@@ -1,8 +1,10 @@
 rules_version = '2';
 
 // =============================================================================
-// LIVE. Published 2026-10-11 (step 8b). This file is a transcription of what is
-// deployed, and the active block below is byte-for-byte what the console holds.
+// LIVE. Step 8b published 2026-10-11; the profile collection-group block added 2026-10-12.
+// Deployed from THIS FILE with `firebase deploy --only firestore:rules` - see CLAUDE.md for
+// the login flag that makes that work, and for why a deploy proves nothing about what live
+// held a moment earlier.
 // =============================================================================
 //
 // It replaced a deny-all (step 8a), which replaced a console-only
@@ -92,6 +94,30 @@ service cloud.firestore {
                     && resource.data.ownerId == request.auth.uid
                     && owner() == resource.data.ownerId
                     && sane();
+    }
+
+    // A COLLECTION-GROUP query cannot be matched by a rule anchored to a parent path. A
+    // second device does not know its own local id, so it finds its identity document by
+    // querying the `profile` collection GROUP - and that query has no ancestry to supply
+    // for {pathId} in the block above, so Firestore will not match it there. A recursive
+    // wildcard in the LEADING position is the only form reachable without knowing the
+    // parents. Read-only: the publish writes to users/{localId}/profile/self, which the
+    // block above already covers, including sane().
+    //
+    // THIS MATCHES A `profile` COLLECTION ANYWHERE, at any depth, which is wider than the
+    // block above. Nothing else in the app has or could have one - no leaf collection in
+    // syncPaths.SYNC_PATHS is named `profile`, and check 152 now asserts none ever is. The
+    // widening is bounded by the same audience test, and nothing can be CREATED out there
+    // because this block grants no write and no other rule matches outside /users.
+    //
+    // A STRANGER CAN ALREADY PLANT users/<anything>/profile/<anything> through the block
+    // above, since create only asks that ownerId be their own uid. Such a document now
+    // appears in a victim's collection-group results too, and is harmless only because the
+    // LOOKUP filters on ownerId == its own uid. That client-side filter is load-bearing -
+    // see CLAUDE.md, beside the audience filter for pull.
+    match /{path=**}/profile/{profileId} {
+      allow read: if request.auth != null
+                  && request.auth.uid in resource.data.visibleTo;
     }
   }
 }
