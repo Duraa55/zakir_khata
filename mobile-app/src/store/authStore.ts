@@ -31,6 +31,8 @@ interface AuthStore extends AuthState {
     | 'no-cloud-profile'
     /** A real local account already holds that phone under a different id. Never merged. */
     | 'account-conflict'
+    /** Two cloud profiles claim this Firebase identity. Nothing is adopted; it needs cleanup. */
+    | 'identity-ambiguous'
   >;
   logout: () => Promise<void>;
   checkSession: () => Promise<void>;
@@ -76,12 +78,13 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
       // credential; the local hash is then derived from it on this device.
       if (!user) {
         const adoption = await adoptAccountFromCloud(phone, password);
-        if (__DEV__) console.log('[Auth] adoption:', adoption.status);
+        if (__DEV__) console.log('[Auth] adoption: ' + adoption.status + ('code' in adoption ? ' (' + adoption.code + ')' : '') + ('ids' in adoption ? ' [' + adoption.ids.join(', ') + ']' : ''));
         // Signed in, but this account has never published a profile — so there is nothing
         // to rebuild it from. Create NOTHING: a half-account with no data behind it is
         // worse than a refusal, and the message tells them the one thing that fixes it.
         if (adoption.status === 'no-profile') return 'no-cloud-profile';
         if (adoption.status === 'conflict') return 'account-conflict';
+        if (adoption.status === 'ambiguous') return 'identity-ambiguous';
         if (adoption.status === 'materialised') user = await verifyUserLogin(phone, password);
       } else if (await mayBeAdoptable(user.id, user.phone)) {
         // THE SEEDED ADMIN. `seedDatabase` runs at boot on every install and creates an
@@ -90,8 +93,9 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
         // account that looks legitimate, with the right uid mapped to the wrong local id.
         // Only an untouched seed row gets here, so no real data can be at stake.
         const adoption = await adoptAccountFromCloud(phone, password);
-        if (__DEV__) console.log('[Auth] seed adoption:', adoption.status);
+        if (__DEV__) console.log('[Auth] seed adoption: ' + adoption.status + ('code' in adoption ? ' (' + adoption.code + ')' : '') + ('ids' in adoption ? ' [' + adoption.ids.join(', ') + ']' : ''));
         if (adoption.status === 'conflict') return 'account-conflict';
+        if (adoption.status === 'ambiguous') return 'identity-ambiguous';
         // 'no-profile' and 'wrong-password' are the ORDINARY fresh install: nothing exists
         // in the cloud to adopt, so fall through and log in as the seeded admin as always.
         if (adoption.status === 'adopted') user = await verifyUserLogin(phone, password);
@@ -123,7 +127,12 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
           // AND THE IDENTITY DOCUMENT, every login, idempotently. Until this has run once
           // online, a second device for this account cannot exist at all — it is what
           // carries the shared local id. After the uid exists, never before it.
-          if (r.status === 'signed-in' || r.status === 'created') await publishAccountProfile(account.id);
+          if (r.status === 'signed-in' || r.status === 'created') {
+            const published = await publishAccountProfile(account.id);
+            if (__DEV__) console.log('[Profile] ' + published.status
+              + ('reason' in published ? ' (' + published.reason + ')' : '')
+              + ('code' in published ? ' (' + published.code + ')' : ''));
+          }
           // Only divergence is surfaced: every other failure is transient and retried at
           // the next login, so nagging about it would be noise.
           set({ passwordDiverged: r.status === 'failed' && r.code === 'password-divergence' });

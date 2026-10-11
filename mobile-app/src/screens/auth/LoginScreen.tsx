@@ -43,6 +43,8 @@ export const LoginScreen = ({ navigation }: any) => {
     // for a typo that is not there.
     if (result === 'no-cloud-profile') {
       Alert.alert(t('loginNoCloudTitle'), t('loginNoCloudBody'));
+    } else if (result === 'identity-ambiguous') {
+      Alert.alert(t('loginAmbiguousTitle'), t('loginAmbiguousBody'));
     } else if (result === 'account-conflict') {
       Alert.alert(t('loginConflictTitle'), t('loginConflictBody'));
     } else if (result === 'invalid') {

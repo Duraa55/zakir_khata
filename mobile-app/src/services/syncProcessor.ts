@@ -237,7 +237,7 @@ export async function batchProcessSyncQueue(): Promise<void> {
       await db.runAsync(`DELETE FROM sync_queue WHERE id=?`, [item.id]);
     }
   } catch (error) {
-    if (__DEV__) console.error('Batch sync failed:', error);
+    if (__DEV__) console.error(`[Sync] batch commit failed [${(error as any)?.code || 'no-code'}]: ${(error as any)?.message || error}`);
   }
 
   await refreshPendingCount(db);

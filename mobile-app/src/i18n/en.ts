@@ -814,6 +814,8 @@ export const en = {
   "setWipeFailed": "Wipe failed.",
   "loginNoCloudTitle": "Nothing to restore yet",
   "loginNoCloudBody": "This account's details have not reached the cloud yet. Sign in on the device you already use, once, while online. Then try again here.",
+  "loginAmbiguousTitle": "This account is recorded twice",
+  "loginAmbiguousBody": "Two sets of details in the cloud claim this account, so it cannot be told which one is right. Nothing was changed on this phone. This needs fixing on the account before another device can be added.",
   "loginConflictTitle": "This number is already in use here",
   "loginConflictBody": "Another account on this phone already uses this number and has its own entries. Nothing was changed. Remove that account first, or use a different number.",
   "setDevBackfill": "Dev: queue existing rows for upload",

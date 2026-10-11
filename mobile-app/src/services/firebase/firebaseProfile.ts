@@ -45,19 +45,46 @@ const PROFILE_COLUMNS =
  * had a profile document before this shipped, so "signed in to Firebase, no profile found"
  * is the ordinary state at rollout rather than an edge case — see `findAccountProfile`.
  */
-export const publishAccountProfile = async (localUserId: string): Promise<'written' | 'skipped' | 'failed'> => {
-  if (!IS_FIREBASE_CONFIGURED) return 'skipped';
+export type PublishResult =
+  | { status: 'written' }
+  | { status: 'skipped'; reason: 'not-configured' | 'no-local-row' | 'no-firebase-identity' | 'unadopted-seed' }
+  | { status: 'failed'; code: string };
+
+export const publishAccountProfile = async (localUserId: string): Promise<PublishResult> => {
+  if (!IS_FIREBASE_CONFIGURED) return { status: 'skipped', reason: 'not-configured' };
   try {
     const db = await getDatabase();
     const row = await db.getFirstAsync<CloudProfile>(
       `SELECT ${PROFILE_COLUMNS} FROM users WHERE id = ? AND is_deleted = 0`, [localUserId]
     );
-    if (!row) return 'skipped';
+    if (!row) return { status: 'skipped', reason: 'no-local-row' };
+
+    // PUBLISHING AN IDENTITY DOCUMENT IS A CLAIM, AND A SEED ROW HAS NO RIGHT TO MAKE ONE.
+    //
+    // This ran unconditionally at first, and a second device whose adoption had failed went
+    // on to publish a profile for its OWN untouched seed admin under the shared Firebase uid
+    // — two documents claiming one identity with different local ids, which makes the
+    // collection-group lookup ambiguous and every later attempt worse than the last. The
+    // flaw was thinking "idempotent for the right account" meant "idempotent for any
+    // account".
+    //
+    // The gate is the adoption test read the other way round: a row that could still be
+    // REPLACED by a cloud profile is, by definition, not the account that profile describes.
+    // It is offline and costs an ordinary login nothing.
+    //
+    // CONSEQUENCE, accepted deliberately (owner, 2026-10-12): a brand-new business on a
+    // fresh install is also an untouched seeded admin until it writes its first row, so it
+    // publishes nothing until then and cannot be adopted yet. An account with no data is
+    // nothing to adopt.
+    if (await mayBeAdoptableIn(db, localUserId, row.phone)) {
+      if (__DEV__) console.log('[Profile] not publishing for an unadopted seed row: ' + localUserId);
+      return { status: 'skipped', reason: 'unadopted-seed' };
+    }
 
     // The same stamping every uploaded document gets. Null when this account has no Firebase
     // identity yet, in which case there is nothing to authorise the write as.
     const authorisation = await authorisationFor(db, localUserId);
-    if (!authorisation) return 'skipped';
+    if (!authorisation) return { status: 'skipped', reason: 'no-firebase-identity' };
 
     const firestore = getFirestoreDB();
     await setDoc(
@@ -66,11 +93,11 @@ export const publishAccountProfile = async (localUserId: string): Promise<'writt
       { merge: true }
     );
     if (__DEV__) console.log('[Profile] published users/' + localUserId + '/profile/self');
-    return 'written';
+    return { status: 'written' };
   } catch (err: any) {
     // Offline, denied, or Firebase down. Retried at the next login; nothing depends on it.
     if (__DEV__) console.warn('[Profile] could not publish:', err?.code || err?.message);
-    return 'failed';
+    return { status: 'failed', code: err?.code || err?.message || 'publish-failed' };
   }
 };
 
@@ -78,6 +105,12 @@ export type ProfileLookup =
   | { status: 'found'; profile: CloudProfile }
   /** Signed in, but this account has never published a profile. The rollout state. */
   | { status: 'no-profile' }
+  /**
+   * TWO OR MORE profiles claim this Firebase identity with different local ids. Adopt
+   * NOTHING: picking one would silently make this device the wrong account, and the result
+   * would depend on the order Firestore happened to return them in.
+   */
+  | { status: 'ambiguous'; ids: string[] }
   | { status: 'wrong-password' }
   | { status: 'unavailable'; code: string };
 
@@ -118,14 +151,28 @@ export const findAccountProfile = async (rawPhone: string, password: string): Pr
       collectionGroup(firestore, 'profile'),
       where('visibleTo', 'array-contains', uid)
     ));
-    const own = snapshot.docs.map(d => d.data()).find(d => d.ownerId === uid);
-    if (!own || typeof own.id !== 'string' || !own.id) {
+    // EVERY match, not the first. The query also returns a parent's staff profiles, because
+    // visibleTo is the author plus the parent chain, so the owner test is what picks ours.
+    const mine = snapshot.docs
+      .map(d => d.data())
+      .filter(d => d.ownerId === uid && typeof d.id === 'string' && d.id);
+    const ids = [...new Set(mine.map(d => d.id as string))];
+
+    if (ids.length > 1) {
+      // It has happened once already, so this cannot be left to "should not arise": the
+      // publish gate stops it being created, and this stops it being acted on. Firestore
+      // defines no order here, so resolving it would adopt an identity at random.
+      await signOutFirebase();
+      if (__DEV__) console.warn('[Profile] ' + ids.length + ' profiles claim this identity: ' + ids.join(', '));
+      return { status: 'ambiguous', ids };
+    }
+    if (!ids.length) {
       // Signed in and nothing to adopt. The caller must create NO local account for this:
       // a half-account with no data behind it is worse than a refusal.
       await signOutFirebase();
       return { status: 'no-profile' };
     }
-    return { status: 'found', profile: own as CloudProfile };
+    return { status: 'found', profile: mine[0] as CloudProfile };
   } catch (err: any) {
     await signOutFirebase();
     return { status: 'unavailable', code: err?.code || err?.message || 'query-failed' };

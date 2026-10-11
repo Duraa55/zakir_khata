@@ -6213,7 +6213,7 @@ check(158,'HOW A SECOND DEVICE BECOMES THE SAME PERSON: one identity document pe
  // ── NOTHING IS CREATED WHEN THERE IS NOTHING TO REBUILD FROM ─────────────────────────
  // The ORDINARY state at rollout: signed in, no profile published yet. A half-account with
  // no data behind it is worse than a refusal.
- const noProfile=/if \(!own[\s\S]*?return \{ status: 'no-profile' \};/.exec(src);
+ const noProfile=/if \(!ids\.length\)[\s\S]*?return \{ status: 'no-profile' \};/.exec(src);
  assert.ok(noProfile,'the no-profile branch could not be read');
  assert.ok(/signOutFirebase\(\)/.test(noProfile[0]),
   'the device is left holding a Firebase session for an account it has no local row for, so currentFirebaseUid returns a uid that maps to nothing');
@@ -6233,6 +6233,46 @@ check(158,'HOW A SECOND DEVICE BECOMES THE SAME PERSON: one identity document pe
  const login=read('src/screens/auth/LoginScreen.tsx');
  assert.ok(/loginNoCloudTitle/.test(login)&&/loginConflictTitle/.test(login),
   'the login screen still says "wrong credentials" for a second device whose account simply has not published its details yet');
+
+ // ── PUBLISHING AN IDENTITY DOCUMENT IS A CLAIM, AND A SEED ROW MAY NOT MAKE ONE ──────
+ // This ran unconditionally at first, and a second device whose adoption had failed went on
+ // to publish a profile for its OWN untouched seed admin under the shared uid: two documents
+ // claiming one identity, which makes the lookup ambiguous and every later attempt worse.
+ const publish=/export const publishAccountProfile[\s\S]*?^};/m.exec(src);
+ assert.ok(publish,'publishAccountProfile could not be read');
+ assert.ok(/mayBeAdoptableIn\(/.test(publish[0]),
+  'the publish is ungated, so an unadopted seed row can claim the Firebase identity of a real account');
+ assert.ok(/'unadopted-seed'/.test(publish[0]),'the skip does not say WHY, and with the gate in place a skip is the common path');
+ assert.ok(publish[0].indexOf('mayBeAdoptableIn(')<publish[0].indexOf('setDoc('),
+  'the document is written before the gate is checked');
+ // The gate lives INSIDE the publish, so no caller can forget it.
+ assert.ok(!/mayBeAdoptable/.test(store.slice(store.indexOf('publishAccountProfile('))),
+  'the gate was moved out to the caller, where the next call site will omit it');
+
+ // ── AMBIGUITY IS REFUSED, NEVER RESOLVED ────────────────────────────────────────────
+ // Firestore defines no order for query results, so picking one would adopt an identity at
+ // random. It has happened once, so "should not arise" is not enough on its own.
+ const lookup=/export const findAccountProfile[\s\S]*?^};/m.exec(src);
+ assert.ok(lookup,'findAccountProfile could not be read');
+ assert.ok(!/\.find\(/.test(lookup[0]),'the lookup still takes the FIRST matching profile');
+ assert.ok(/'ambiguous'/.test(lookup[0]),'two profiles claiming one identity has no distinct outcome');
+ assert.ok(/status === 'ambiguous'/.test(store),'login cannot report an ambiguous identity');
+ assert.ok(/loginAmbiguousTitle/.test(login),'the login screen has no message for an ambiguous identity');
+ // Adopt NOTHING: the ambiguous branch must not reach the local half.
+ const ambiguous=/if \(ids\.length > 1\)[\s\S]*?return \{ status: 'ambiguous', ids \};/.exec(src);
+ assert.ok(ambiguous&&/signOutFirebase\(\)/.test(ambiguous[0]),'an ambiguous lookup leaves a Firebase session behind');
+ assert.ok(ambiguous&&!/applyCloudProfile/.test(ambiguous[0]),'an ambiguous lookup still adopts something');
+
+ // ── A STATUS IS NEVER LOGGED WITHOUT ITS CODE ───────────────────────────────────────
+ // `[Auth] seed adoption: unavailable` cost an hour: the outcome carries a code precisely so
+ // it need not be guessed, and the log threw it away. This walks the sync and auth code for
+ // the same shape rather than trusting that it was a one-off.
+ for(const f of ['src/store/authStore.ts','src/services/syncProcessor.ts','src/services/firebase/firebaseProfile.ts','src/services/database/userDb.ts'])
+  for(const line of read(f).split(String.fromCharCode(10))){
+   if(!/console\.(log|warn|error)\(/.test(line)) continue;
+   if(!/(adoption|published|result|r)\.status/.test(line)) continue;
+   assert.ok(/code|reason|ids/.test(line),f+' logs a status with no code: '+line.trim());
+  }
 }));
 
 (async()=>{

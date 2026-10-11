@@ -260,6 +260,10 @@ export const changeOwnPassword = async (userId: string, currentPassword: string,
     const { changeFirebasePassword } = await import('../firebase/firebaseAuth');
     const result = await changeFirebasePassword(record.phone, currentPassword, newPassword);
     if (result.status === 'failed') {
+      // The CODE, not just the thrown label. The label is what the UI shows; the code is the
+      // only thing that says whether this was the network, a weak password or a stale
+      // session, and it used to be discarded here.
+      if (__DEV__) console.warn('[Auth] Firebase password change failed:', result.code);
       throw new Error(result.code === 'password-divergence'
         ? 'PASSWORD_DIVERGED'
         : 'PASSWORD_CHANGE_FAILED');
