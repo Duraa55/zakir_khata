@@ -6014,6 +6014,12 @@ check(157,'THE INITIAL UPLOAD PATH: the backlog v44 emptied is enqueued once, ev
  assert.equal(forTable('bill_items').enqueue,1);
  assert.equal(plan.totalEnqueue,5,'the plan total disagrees with its own per-table counts: '+JSON.stringify(plan.tables.filter(t=>t.enqueue)));
 
+ // ── THE PLAN AND THE RUN MUST AGREE ──────────────────────────────────────────────────
+ // planBackfill counts in SQL; runBackfill classifies each row in JS. Two expressions of one
+ // rule drift the moment nobody compares them, so the plan's total is asserted against what
+ // a real run actually enqueues, below.
+ const predicted=plan.totalEnqueue;
+
  // ── RESUME: stop early, then continue ────────────────────────────────────────────────
  const first=await bf.runBackfill(sqlite,'owner',{chunkSize:1,maxRows:2});
  assert.equal(first.enqueued,2,'the budget was not honoured');
@@ -6026,6 +6032,11 @@ check(157,'THE INITIAL UPLOAD PATH: the backlog v44 emptied is enqueued once, ev
  const all=queue();
  assert.equal(all.length,5,'the backlog did not finish: '+all.length+' of 5');
  assert.equal(first.enqueued+second.enqueued,5,'the two runs together queued the wrong number');
+ assert.equal(first.enqueued+second.enqueued,predicted,
+  'the SQL dry run and the row-by-row run disagree about what would be enqueued — one of the two expressions of the rule has drifted');
+ // And the index those per-row lookups depend on exists (v50).
+ assert.ok(h.all("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='sync_queue'").some(r=>r.name==='idx_sync_queue_record'),
+  'the "already queued?" lookup has no index, so a first run against a large backlog scans the whole outbox per row');
  // RESUMED, not restarted: no row queued twice.
  const keys=all.map(r=>r.table_name+'/'+r.record_id);
  assert.equal(new Set(keys).size,keys.length,'a row was queued twice — the run restarted instead of resuming: '+keys.join(', '));

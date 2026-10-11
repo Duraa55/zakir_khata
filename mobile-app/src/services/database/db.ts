@@ -1984,6 +1984,20 @@ async function migrateFrom(database: SQLite.SQLiteDatabase): Promise<void> {
     await database.execAsync('PRAGMA user_version = 49');
     version = 49;
   }
+
+  if (version < 50) {
+    // "HAS THIS ROW ALREADY BEEN QUEUED?" asked by record, which is how both halves of the
+    // backfill ask it: once per row in a run, and once per row inside the dry run's counting
+    // query. sync_queue had only its primary-key autoindex on `id`, so each of those was a
+    // scan of the whole outbox — fine while the queue is small, quadratic on a first run
+    // against a large backlog.
+    await database.execAsync(
+      'CREATE INDEX IF NOT EXISTS idx_sync_queue_record ON sync_queue(table_name, record_id)'
+    );
+
+    await database.execAsync('PRAGMA user_version = 50');
+    version = 50;
+  }
 }
 
 export const closeDatabase = async (): Promise<void> => {

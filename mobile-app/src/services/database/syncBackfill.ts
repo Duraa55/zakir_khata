@@ -154,10 +154,85 @@ const verdictFor = async (
   return { kind: 'enqueue', path, payload };
 };
 
+/** Tables that carry no `firestore_path` column, so the SQL below must not name it. */
+const storedPathTables = new Map<string, boolean>();
+const hasStoredPathColumn = async (db: SQLiteDatabase, table: string): Promise<boolean> => {
+  const cached = storedPathTables.get(table);
+  if (cached !== undefined) return cached;
+  const cols = await db.getAllAsync<{ name: string }>(`PRAGMA table_info(${table})`);
+  const has = cols.some(c => c.name === 'firestore_path');
+  storedPathTables.set(table, has);
+  return has;
+};
+
 /**
- * WHAT A RUN WOULD DO, writing nothing. Tens of thousands of rows appearing in the queue at
- * once is something the owner asked to see coming, and it is also the only way to tell
- * "nothing to do" apart from "nothing happened".
+ * THE SAME VERDICT AS `verdictFor`, counted in SQL instead of by loading rows.
+ *
+ * The dry run used to `SELECT *` every row of every table and classify them in JS. It was
+ * correct and it was on the boot path, which meant reading the whole database to print a
+ * summary — on exactly the data volume that makes a backfill worth worrying about.
+ *
+ * Every clause here mirrors one in `verdictFor`, IN THE SAME ORDER, because the order is
+ * what decides a row's single verdict:
+ *   author first  — a row whose parent is missing has NO author, so it is somebody else's,
+ *                   not a path failure. A LEFT JOIN plus a NULL-yielding comparison is what
+ *                   reproduces that.
+ *   then queued   — the live path already has it; leave it alone.
+ *   then the path — a stored one is honoured when it addresses a document, otherwise every
+ *                   `{col}` placeholder must be present.
+ * Check 157 pins the two against each other by asserting the plan's total equals what a real
+ * run then enqueues, so they cannot drift apart silently.
+ */
+type Counts = { considered: number; mine: number; alreadyQueued: number; enqueue: number; noPath: number };
+
+const countsFor = async (
+  db: SQLiteDatabase,
+  table: string,
+  accountLocalId: string,
+  cursor: string
+): Promise<Counts> => {
+  const spec = SYNC_PATHS[table];
+  const author = spec.author;
+  // Table and column names come from the frozen map, never from caller data; only the
+  // account id and the cursor are bound.
+  const join = author.kind === 'parent' ? ` LEFT JOIN ${author.parentTable} P ON P.id = T.${author.fk}` : '';
+  const mine = author.kind === 'column' ? `T.${author.column} = ?` : `P.${author.parentColumn} = ?`;
+  const queued = `EXISTS (SELECT 1 FROM sync_queue q WHERE q.table_name = '${table}' AND q.record_id = T.id)`;
+
+  const placeholders = spec.segments
+    .map(segment => /^\{(\w+)\}$/.exec(segment)?.[1])
+    .filter((column): column is string => !!column)
+    .map(column => `(T.${column} IS NOT NULL AND T.${column} <> '')`);
+  // An even segment count addresses a document, and segments = slashes + 1, so the slash
+  // count must be ODD. Same test as the stored-path branch of verdictFor.
+  const stored = (await hasStoredPathColumn(db, table))
+    ? `(T.firestore_path IS NOT NULL AND (LENGTH(T.firestore_path) - LENGTH(REPLACE(T.firestore_path, '/', ''))) % 2 = 1)`
+    : '0';
+  const pathOk = `(${stored} OR (${placeholders.length ? placeholders.join(' AND ') : '1'}))`;
+
+  // A CTE so `mine` is written ONCE: repeated inline it would need the account bound four
+  // times in textual order, which is the kind of positional binding that goes wrong quietly.
+  const row = await db.getFirstAsync<Counts>(
+    `WITH scoped AS (
+       SELECT (${mine}) AS mine, (${queued}) AS queued, ${pathOk} AS path_ok
+       FROM ${table} T${join}
+       WHERE T.id > ?
+     )
+     SELECT COUNT(*) AS considered,
+            COALESCE(SUM(CASE WHEN mine THEN 1 ELSE 0 END), 0) AS mine,
+            COALESCE(SUM(CASE WHEN mine AND queued THEN 1 ELSE 0 END), 0) AS alreadyQueued,
+            COALESCE(SUM(CASE WHEN mine AND NOT queued AND path_ok THEN 1 ELSE 0 END), 0) AS enqueue,
+            COALESCE(SUM(CASE WHEN mine AND NOT queued AND NOT path_ok THEN 1 ELSE 0 END), 0) AS noPath
+     FROM scoped`,
+    [accountLocalId, cursor]
+  );
+  return row ?? { considered: 0, mine: 0, alreadyQueued: 0, enqueue: 0, noPath: 0 };
+};
+
+/**
+ * WHAT A RUN WOULD DO, writing nothing and reading no row bodies. Tens of thousands of rows
+ * appearing in the queue at once is something the owner asked to see coming, and it is also
+ * the only way to tell "nothing to do" apart from "nothing happened".
  */
 export const planBackfill = async (db: SQLiteDatabase, accountLocalId: string): Promise<BackfillPlan> => {
   const uid = await firebaseUidOf(db, accountLocalId);
@@ -169,15 +244,12 @@ export const planBackfill = async (db: SQLiteDatabase, accountLocalId: string): 
     plan.rows = total?.c ?? 0;
     if (uid) {
       const cursor = await cursorFor(db, accountLocalId, table);
-      const rows = await db.getAllAsync<Record<string, any>>(
-        `SELECT * FROM ${table} WHERE id > ? ORDER BY id`, [cursor]
-      );
-      plan.done = plan.rows - rows.length;
-      for (const row of rows) {
-        const verdict = await verdictFor(db, table, row, accountLocalId);
-        if (verdict.kind === 'enqueue') plan.enqueue++;
-        else plan[verdict.kind]++;
-      }
+      const counts = await countsFor(db, table, accountLocalId, cursor);
+      plan.done = plan.rows - counts.considered;
+      plan.otherAuthor = counts.considered - counts.mine;
+      plan.alreadyQueued = counts.alreadyQueued;
+      plan.enqueue = counts.enqueue;
+      plan.noPath = counts.noPath;
     }
     tables.push(plan);
   }
