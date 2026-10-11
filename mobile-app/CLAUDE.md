@@ -10,7 +10,7 @@ in the other location are doing.
 
 React Native + Expo 51, TypeScript, expo-sqlite (local-first), Firebase Firestore
 (push-only), Zustand, NativeWind + StyleSheet. ~27k LOC, ~170 source files, 35 tables,
-schema at **v41**. English + Urdu.
+schema at **v48**. English + Urdu.
 
 Eight books: Cash, Khata (receivables), Bill, Stock, Expense, Purchase, Staff, Customer.
 Plus Reports, Reminders, Activity Log, Global Search, Sync Center.

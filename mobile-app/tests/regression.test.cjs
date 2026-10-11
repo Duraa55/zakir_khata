@@ -5857,6 +5857,101 @@ check(154,'v48 upgrades an EXISTING database without touching a row, is idempote
  assert.ok(h.one('PRAGMA user_version').user_version>=48,
   'the chain stalled at v47 on a database without the purchase tables — exactly how the entryAudit fixture broke');
 },47));
+check(155,'a stock movement queues TWO documents — the movement AND the item’s new count — and the count goes up as an ABSOLUTE value, because a queue payload is a document and "quantity + 5" has nothing to send; the local row still moves exactly as it did',at('src/services/database/stockDb.ts','addStockMovementIn'),()=>isolated(async h=>{
+ seedPeople(h);h.login('owner');
+ const stock=h.load('src/services/database/stockDb.ts');
+ h.insert('stock_items',{id:'st1',user_id:'owner',name_en:'Rice',purchase_price:123456,sale_price:123456,quantity:50});
+ const queued=table=>h.all('SELECT record_id,firestore_path,operation,payload,status FROM sync_queue WHERE table_name=? ORDER BY rowid',table);
+ const qty=()=>h.one('SELECT quantity,synced FROM stock_items WHERE id=?','st1');
+
+ await stock.addStockMovement({item_id:'st1',change:5,reason:'purchase',date:'2026-10-11',user_id:'owner'});
+
+ // ── BOTH rows, not just the movement ──────────────────────────────────────────────────
+ const movs=queued('stock_movements'), items=queued('stock_items');
+ assert.equal(movs.length,1,'the movement itself was not queued');
+ assert.equal(items.length,1,
+  'the item’s new count was not queued: the movements would sync and the quantity would not, so a second device shows the full ledger under a STALE number — and the app reads stock_items.quantity directly rather than recomputing it');
+ assert.equal(items[0].record_id,'st1');
+ assert.equal(items[0].operation,'update');
+ assert.equal(items[0].firestore_path,'users/owner/stock_items/st1');
+ assert.equal(movs[0].firestore_path,'users/owner/stock_movements/'+movs[0].record_id);
+ for(const r of [...movs,...items]) assert.equal(r.status,'pending');
+
+ // ── ABSOLUTE, not the delta ──────────────────────────────────────────────────────────
+ // This is the whole point: the old code wrote `quantity = quantity + ?`, which cannot be
+ // expressed as a document. A payload of 5 here would set the remote count to 5.
+ const sent=JSON.parse(items[0].payload);
+ assert.equal(sent.quantity,55,'the queued quantity is not the new absolute count');
+ assert.notEqual(sent.quantity,5,'the DELTA was queued, so the remote count would be overwritten with the change');
+ assert.equal(qty().quantity,55,'the local row must still move exactly as it did before');
+ assert.equal(qty().synced,0,'the local row must be marked unsynced');
+
+ // ── Stock OUT, and a second movement accumulates from the stored value ───────────────
+ await stock.addStockMovement({item_id:'st1',change:-20,reason:'sale',date:'2026-10-12',user_id:'owner'});
+ const after=queued('stock_items');
+ assert.equal(after.length,2,'the second movement did not queue the count again');
+ assert.equal(JSON.parse(after[1].payload).quantity,35,'the second queued count is not 55-20 — it was computed from something other than the stored value');
+ assert.equal(qty().quantity,35);
+
+ // ── Ownership is still the gate, and a refusal queues NOTHING ────────────────────────
+ const before=h.one('SELECT COUNT(*) c FROM sync_queue').c;
+ await assert.rejects(stock.addStockMovement({item_id:'st1',change:1,reason:'purchase',date:'2026-10-12',user_id:'staffA'}),/your own stock/);
+ assert.equal(h.one('SELECT COUNT(*) c FROM sync_queue').c,before,'a refused movement still queued something');
+ assert.equal(qty().quantity,35,'a refused movement changed the count');
+}));
+
+check(156,'the Activity Log’s own audience travels as activityAudience — a real ARRAY, with visible_to absent — so it can never be confused with the visibleTo of FIREBASE uids that the rules test; the stored column keeps its JSON string, the caller’s row is not mutated on the way out, and pull can invert the map',at('src/services/database/syncHelpers.ts','JSON_ARRAY_FIELDS'),()=>isolated(async h=>{
+ seedPeople(h);h.login('owner');
+ const sh=h.load('src/services/database/syncHelpers.ts');
+ const act=h.load('src/services/database/activityDb.ts');
+
+ // ── THE LIVE PATH: what actually reaches the queue ───────────────────────────────────
+ await act.logActivityRecord({user_id:'owner',user_name:'Owner',action:'created',entity_type:'bill',
+  entity_id:'b1',description:'Bill #1',amount:1000,visible_to:['owner','staffA']});
+ const row=h.one("SELECT payload FROM sync_queue WHERE table_name='activities'");
+ assert.ok(row,'the activity was not queued at all');
+ const sent=JSON.parse(row.payload);
+ assert.deepEqual(sent.activityAudience,['owner','staffA'],'the audience did not go up as a real array under its own name');
+ assert.ok(!('visible_to' in sent),
+  'visible_to is still in the document beside visibleTo — one underscore apart, opposite shapes, different id spaces, and a pull query naming the wrong one returns NOTHING rather than failing');
+ // The COLUMN is untouched: still the JSON string every existing query reads.
+ const stored=h.one("SELECT visible_to FROM activities WHERE id=?",sent.id);
+ assert.equal(stored.visible_to,'["owner","staffA"]','the stored column changed shape, which would break json_extract and the Activity Log');
+
+ // ── The caller’s row must not be mutated on the way out ─────────────────────────────
+ // The reshape deletes a key. Done on the row itself rather than a copy, the SQLite INSERT
+ // that follows would lose visible_to entirely.
+ const data={id:'a1',user_id:'owner',visible_to:'["owner"]'};
+ const out=sh.syncPayloadFor('activities',data);
+ assert.equal(data.visible_to,'["owner"]','syncPayloadFor mutated the row it was given');
+ assert.ok(!('activityAudience' in data),'syncPayloadFor added a field to the row it was given');
+ // plain(): the module realm has its own Array.prototype, which strict deepEqual rejects.
+ assert.deepEqual(plain(out.activityAudience),['owner']);
+
+ // ── Total by construction: a malformed stored value is a list, never a throw ─────────
+ for(const [stored2,expected] of [['not json',[]],['{"a":1}',[]],['',[]],[null,[]],['[]',[]],[['already'],['already']]])
+  assert.deepEqual(plain(sh.syncPayloadFor('activities',{visible_to:stored2}).activityAudience),expected,'visible_to = '+JSON.stringify(stored2));
+ // Absent column: no field invented.
+ assert.ok(!('activityAudience' in sh.syncPayloadFor('activities',{id:'a2'})),'a field was invented for a row that has no audience');
+
+ // ── Stripping and reshaping compose, and a table with neither is untouched ───────────
+ assert.ok(!('cnic' in sh.syncPayloadFor('customers',{id:'c1',name:'A',cnic:'3520212345671'})),'a CNIC left the phone');
+ assert.ok(!('passwordHash' in sh.syncPayloadFor('users',{id:'owner',passwordHash:'h'})),'a password hash left the phone');
+ const plain2={id:'e1',user_id:'owner',amount_paisa:500};
+ assert.deepEqual(plain(sh.syncPayloadFor('expenses',plain2)),plain2,'a table with no local-only fields and no reshape was altered');
+
+ // ── PULL inverts the same map rather than hardcoding the pair ────────────────────────
+ assert.equal(sh.columnForPayloadField('activities','activityAudience'),'visible_to');
+ assert.equal(sh.columnForPayloadField('activities','visible_to'),null,'the COLUMN name is not a document field');
+ assert.equal(sh.columnForPayloadField('activities','visibleTo'),null,'the rules’ own field must never map onto a column');
+ assert.equal(sh.columnForPayloadField('expenses','activityAudience'),null);
+ assert.equal(sh.columnValueForPayloadField(['owner','staffA']),'["owner","staffA"]');
+ assert.equal(sh.columnValueForPayloadField('not an array'),'[]');
+ // Column -> document -> column, unchanged.
+ const original='["owner","staffA"]';
+ assert.equal(sh.columnValueForPayloadField(sh.syncPayloadFor('activities',{visible_to:original}).activityAudience),original,
+  'the audience does not survive a round trip, so pull would write a different value than push sent');
+}));
 (async()=>{
  const originals=new Map(sourceFiles().map(p=>[p,crypto.createHash('sha256').update(fs.readFileSync(p)).digest('hex')]));
  let passed=0;const failures=[];
