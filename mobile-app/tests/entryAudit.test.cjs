@@ -20,6 +20,9 @@ let firebaseUid = 'fb_owner';
 // An error for the next upload to meet, so the queue can be driven against a real
 // Firestore refusal rather than a description of one.
 let setDocError = null;
+// The serverTimestamp() sentinel, and every document the uploaders hand to Firestore.
+const SERVER_STAMP = '__serverTimestamp__';
+const sent = [];
 const adapter = {
   execAsync: async sql => sqlite.exec(sql),
   runAsync: async (sql, params = []) => {
@@ -51,9 +54,13 @@ function load(relative) {
   const req = id => {
     if (id === 'firebase/firestore') return {
       doc: (_db, destination) => destination,
-      setDoc: async () => { assert.equal(transactionDepth,0); if (setDocError) { const e = new Error(setDocError.message); e.code = setDocError.code; throw e; } },
-      updateDoc: async () => { assert.equal(transactionDepth,0); },
-      writeBatch: () => ({ update() {}, set() {}, commit: async () => { assert.equal(transactionDepth,0); } }),
+      // Every document either uploader builds, captured. PULL ORDERS ON `syncedAt` and
+      // Firestore excludes a document that lacks it, so a write that forgets the stamp is
+      // not a cosmetic fault — it is a row, or a DELETION, that can never travel.
+      serverTimestamp: () => SERVER_STAMP,
+      setDoc: async (_ref, payload) => { assert.equal(transactionDepth,0); sent.push(payload); if (setDocError) { const e = new Error(setDocError.message); e.code = setDocError.code; throw e; } },
+      updateDoc: async (_ref, payload) => { assert.equal(transactionDepth,0); sent.push(payload); },
+      writeBatch: () => ({ update(_ref, payload) { sent.push(payload); }, set(_ref, payload) { sent.push(payload); }, commit: async () => { assert.equal(transactionDepth,0); } }),
     };
     if (id.endsWith('/firebaseConfig')) return { getFirestoreDB: () => ({}), IS_FIREBASE_CONFIGURED: true };
     if (id === 'expo-sqlite') return { openDatabaseAsync: async () => adapter };
@@ -235,6 +242,14 @@ async function check(name, test) { await test(); passed++; console.info('PASS ' 
   await check('both sync workers drain the audit queue under each author’s own Firebase session, without mutating immutable audit rows', async () => {
     const processor = load('src/services/syncProcessor.ts');
     const before = JSON.stringify(all('SELECT * FROM entry_audit'));
+    // A QUEUED SOFT DELETE, added here because the audited books never produce one — an
+    // audited delete is an `update` carrying the flags. Both workers below therefore run
+    // their delete branch, which is the branch that writes its own payload by hand and so
+    // the one that can silently lose the server stamp.
+    sqlite.prepare(
+      'INSERT INTO sync_queue (id,table_name,record_id,operation,payload,firestore_path,status,created_at) ' +
+      "VALUES ('sync_del','customers','c_del','delete','{\"deleted_at\":\"2026-10-12T00:00:00.000Z\"}','users/owner/customers/c_del','pending','2026-09-08')"
+    ).run();
     const queued = all('SELECT * FROM sync_queue');
     // The uids whose rows are waiting. A row goes up ONLY under its own author’s
     // Firebase session, because the rules compare the stamped ownerId to the caller.
@@ -266,6 +281,21 @@ async function check(name, test) { await test(); passed++; console.info('PASS ' 
     await drain(processor.batchProcessSyncQueue);
     assert.equal(count('sync_queue'),0);
     assert.equal(JSON.stringify(all('SELECT * FROM entry_audit')),before);
+
+    // EVERY DOCUMENT CARRIES THE SERVER STAMP, from BOTH workers — the single uploader and
+    // the batch — because pull orders on that field and Firestore does not return a document
+    // that lacks it. A deletion is the case that matters most: unstamped, the row would stay
+    // alive on the other phone for ever, which is worse than arriving late.
+    assert.ok(sent.length, 'no documents were captured, so this assertion proves nothing');
+    const deletes = sent.filter(p => p.is_deleted === true);
+    assert.ok(deletes.length, 'no soft delete was uploaded, so the delete path is untested here');
+    for (const payload of sent) {
+      assert.equal(payload.syncedAt, SERVER_STAMP,
+        'a document went up with no server timestamp, so pull could never see it: ' + JSON.stringify(payload).slice(0,160));
+    }
+    for (const payload of deletes) {
+      assert.ok(payload.deleted_at, 'a deletion carries no deleted_at');
+    }
   });
   await check('a refused upload stays PENDING however often it is retried, a malformed path fails at once, and a row that already reached failed still recovers', async () => {
     const processor = load('src/services/syncProcessor.ts');

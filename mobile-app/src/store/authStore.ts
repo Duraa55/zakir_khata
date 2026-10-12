@@ -4,6 +4,7 @@ import * as Crypto from 'expo-crypto';
 import { verifyUserLogin, updateUser } from '../services/database/userDb';
 import { ensureFirebaseAccount, signOutFirebase } from '../services/firebase/firebaseAuth';
 import { adoptAccountFromCloud, mayBeAdoptable, publishAccountProfile } from '../services/firebase/firebaseProfile';
+import { bootstrapTeamFromCloud } from '../services/firebase/firebaseTeam';
 import { User, AuthState } from '../types';
 
 const AUTH_KEY = 'auth_session';
@@ -132,6 +133,21 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
             if (__DEV__) console.log('[Profile] ' + published.status
               + ('reason' in published ? ' (' + published.reason + ')' : '')
               + ('code' in published ? ' (' + published.code + ')' : ''));
+
+            // AND WHO THIS ACCOUNT'S TEAM IS, which the audience filter needs before pull
+            // can run at all: `users` never syncs, so a device knows only the accounts it
+            // created or adopted, and `firebase_uid` is written only for whoever signs in
+            // HERE. Without this, pull would drop every staff member's documents — and
+            // advance its cursors past them, which is not recoverable. Published first, so
+            // this account's own profile exists before it goes looking for other people's.
+            const team = await bootstrapTeamFromCloud(account.id);
+            if (__DEV__) console.log('[Team] ' + team.status
+              + ('reason' in team ? ' (' + team.reason + ')' : '')
+              + ('code' in team ? ' (' + team.code + ')' : '')
+              + ('complete' in team ? ' complete=' + team.complete
+                  + ' ' + team.outcomes.map(o => o.status).join(',')
+                  + (team.unresolved.length ? ' unresolved=' + team.unresolved.map(u => u.localId + ':' + u.reason).join(',') : '')
+                : ''));
           }
           // Only divergence is surfaced: every other failure is transient and retried at
           // the next login, so nagging about it would be noise.

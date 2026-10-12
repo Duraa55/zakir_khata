@@ -75,6 +75,12 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
+    // The audience test, in one place, for every collection-group read block at the bottom
+    // of this file. Declared here at the top of the block it belongs to, which is where a
+    // rules function is conventionally put and where its scope is unambiguous.
+    function pulled() { return request.auth != null
+                               && request.auth.uid in resource.data.visibleTo; }
+
     match /users/{pathId}/{document=**} {
 
       function owner()    { return request.resource.data.ownerId; }
@@ -119,5 +125,67 @@ service cloud.firestore {
       allow read: if request.auth != null
                   && request.auth.uid in resource.data.visibleTo;
     }
+
+    // =========================================================================
+    // PULL: ONE COLLECTION-GROUP READ BLOCK PER SYNCED COLLECTION (2026-10-12).
+    //
+    // 23 of them, one for every live leaf in syncPaths.SYNC_PATHS, and the list is
+    // GENERATED FROM THAT MAP rather than typed - a regression check fails if a table is
+    // added to the map without its block here and its index in firestore.indexes.json,
+    // which is the "wired on one side, forgotten on the other" trap this project keeps
+    // hitting. `day_closings` is absent on purpose: it is `pending` in the map.
+    //
+    // WHY A BLOCK PER COLLECTION AND NOT THE /users BLOCK ABOVE: pull reads each
+    // collection as a COLLECTION GROUP, because a flat collection lives under the
+    // AUTHOR's local id - `users/{staffLocalId}/bills` - and the owner must read every
+    // team member's books in one query rather than one query per person. A
+    // collection-group query supplies no ancestry for {pathId}, so Firestore will not
+    // match it against that block at all. This is the same lesson the `profile` block
+    // above records; it is now the rule rather than the exception.
+    //
+    // THE COLLECTION NAME MUST BE A LITERAL. Firestore has no variable-collection form
+    // (`/{path=**}/{collection}/{docId}` is not a thing), which is the only reason this is
+    // 23 blocks instead of one. The CONDITION, though, exists exactly ONCE - `pulled()` -
+    // because 23 copies of a security test is 23 chances for one of them to differ.
+    //
+    // READ-ONLY, AND THAT IS WHAT BOUNDS THE WIDENING. Each block matches its collection
+    // name at ANY depth, but it grants no write, and no rule outside /users grants one
+    // either - so nothing can be CREATED out there, and the only documents these blocks
+    // can ever expose are the ones the /users block accepted. The audience test is
+    // identical to the one above.
+    //
+    // AND THE READER STILL CANNOT TRUST WHAT IT GETS. `visibleTo` is written by whoever
+    // authored the document, so being returned by one of these queries proves only that
+    // someone named you. The audience filter (services/database/pullAudience.ts) is what
+    // decides whether a document may enter the database. See CLAUDE.md, "AUDIENCE
+    // INJECTION".
+    //
+    // Every pull query must carry `where('visibleTo', 'array-contains', uid)`: rules
+    // REJECT a query they cannot prove rather than filtering it.
+    // =========================================================================
+
+    match /{path=**}/activities/{docId}         { allow read: if pulled(); }  // activities
+    match /{path=**}/attendance/{docId}         { allow read: if pulled(); }  // staff_attendance
+    match /{path=**}/bills/{docId}              { allow read: if pulled(); }  // bills
+    match /{path=**}/cashbook/{docId}           { allow read: if pulled(); }  // cashbook
+    match /{path=**}/customers/{docId}          { allow read: if pulled(); }  // customers
+    match /{path=**}/entry_audit/{docId}        { allow read: if pulled(); }  // entry_audit
+    match /{path=**}/expenses/{docId}           { allow read: if pulled(); }  // expenses
+    match /{path=**}/invoice_items/{docId}      { allow read: if pulled(); }  // purchase_invoice_items
+    match /{path=**}/items/{docId}              { allow read: if pulled(); }  // bill_items
+    match /{path=**}/order_items/{docId}        { allow read: if pulled(); }  // purchase_order_items
+    match /{path=**}/purchase_invoices/{docId}  { allow read: if pulled(); }  // purchase_invoices
+    match /{path=**}/purchase_orders/{docId}    { allow read: if pulled(); }  // purchase_orders
+    match /{path=**}/purchase_returns/{docId}   { allow read: if pulled(); }  // purchase_returns
+    match /{path=**}/reminders/{docId}          { allow read: if pulled(); }  // reminders
+    match /{path=**}/return_items/{docId}       { allow read: if pulled(); }  // purchase_return_items
+    match /{path=**}/salary/{docId}             { allow read: if pulled(); }  // staff_salary_transactions
+    match /{path=**}/salary_closings/{docId}    { allow read: if pulled(); }  // salary_month_closings
+    match /{path=**}/staff_records/{docId}      { allow read: if pulled(); }  // staff_records
+    match /{path=**}/stock_items/{docId}        { allow read: if pulled(); }  // stock_items
+    match /{path=**}/stock_movements/{docId}    { allow read: if pulled(); }  // stock_movements
+    match /{path=**}/supplier_payments/{docId}  { allow read: if pulled(); }  // supplier_payments
+    match /{path=**}/suppliers/{docId}          { allow read: if pulled(); }  // suppliers
+    match /{path=**}/transactions/{docId}       { allow read: if pulled(); }  // transactions
   }
 }

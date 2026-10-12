@@ -36,11 +36,14 @@ const opLabel = (op: string) => (op ? op.charAt(0).toUpperCase() + op.slice(1).t
 const when = (iso: string, pattern: string) => { try { return format(new Date(iso), pattern); } catch { return ''; } };
 
 export const SyncCenterScreen: React.FC<Props> = ({ navigation }) => {
-  const { isOnline, isSyncing, processSyncQueue } = useSyncStore();
+  const { isOnline, isSyncing, processSyncQueue, keptOutCount, pullBlocked } = useSyncStore();
   const { t } = useLanguageStore();
   const [queueItems, setQueueItems] = useState<SyncQueueItem[]>([]);
   const [metadata, setMetadata] = useState<SyncMetadata[]>([]);
   const [loading, setLoading] = useState(true);
+  // The DURABLE figures, so reopening this screen does not report zero for a pull that
+  // really did keep something out. The store's count is only the last run's.
+  const [pullTotals, setPullTotals] = useState<{ keptOut: number; lastPulledAt: string | null } | null>(null);
 
   const loadSyncData = async () => {
     setLoading(true);
@@ -61,6 +64,15 @@ export const SyncCenterScreen: React.FC<Props> = ({ navigation }) => {
         `SELECT table_name, last_synced_at, pending_count FROM sync_metadata`
       );
       setMetadata(meta);
+      // Per account: one phone can host several logins, and another login's pull figures
+      // are not this one's.
+      const { useAuthStore } = await import('../../store/authStore');
+      const me = useAuthStore.getState().user?.id;
+      if (me) {
+        const { pullTotals: readTotals } = await import('../../services/database/pullCursor');
+        const totals = await readTotals(db, me);
+        setPullTotals({ keptOut: totals.keptOut, lastPulledAt: totals.lastPulledAt });
+      }
     } catch (err) {
       if (__DEV__) console.error(err);
     } finally {
@@ -121,6 +133,9 @@ export const SyncCenterScreen: React.FC<Props> = ({ navigation }) => {
     }
   };
 
+  // The durable figure when it has been read, the last run's otherwise — so the number is
+  // right both immediately after a pull and on a later visit to this screen.
+  const keptOut = pullTotals ? pullTotals.keptOut : keptOutCount;
   const failedItems = queueItems.filter(q => q.status === 'failed');
   const pendingItems = queueItems.filter(q => q.status === 'pending');
   const stoppedItems = queueItems.filter(q => q.status === 'dismissed');
@@ -169,6 +184,32 @@ export const SyncCenterScreen: React.FC<Props> = ({ navigation }) => {
           <View style={styles.syncing}><ActivityIndicator color={color.accent} /><Text style={styles.statusLabel}>{t('syncSyncing')}</Text></View>
         ) : (
           <Button label={t('syncNow')} icon="refresh-cw" onPress={handleManualSync} disabled={!isOnline} fullWidth />
+        )}
+
+        {/* ── WHAT CAME DOWN, AND WHAT WAS REFUSED ──
+            A remote change this phone kept out is not an error and not a silence: the owner
+            deliberately gets a number and a reason, because an edit that vanished with no
+            explanation is what gets rediscovered weeks later as "sync is broken". It is
+            amber, not red — nothing is lost, the local version simply won and still has to
+            be uploaded. */}
+        {pullBlocked && (
+          <View style={[styles.item, styles.itemAttention]}>
+            <Text style={styles.itemTitle}>{t('syncPullBlockedTitle')}</Text>
+            <Text style={styles.itemBody}>{t('syncPullBlocked')}</Text>
+          </View>
+        )}
+
+        {keptOut > 0 && (
+          <View style={[styles.item, styles.itemAttention]}>
+            <Text style={styles.itemTitle}>{t('syncKeptOutTitle')}</Text>
+            <Text style={styles.itemBody}>
+              {keptOut === 1 ? t('syncKeptOut', { count: keptOut }) : t('syncKeptOutPlural', { count: keptOut })}
+            </Text>
+          </View>
+        )}
+
+        {!!pullTotals?.lastPulledAt && (
+          <Text style={styles.itemMeta}>{t('syncLastPulled')}: {when(pullTotals.lastPulledAt, 'dd MMM, HH:mm')}</Text>
         )}
 
         {failedItems.length > 0 && (

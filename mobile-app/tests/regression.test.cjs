@@ -1503,8 +1503,13 @@ check(78,'CNIC never reaches a log, a sync payload, an export, a PDF or search',
  for(const type of BOOKS){const html=await exportFile(h,type,'owner',{startDate:'2000-01-01',endDate:'2099-12-31'});assert.ok(!html.includes(CNIC)&&!html.includes(CNIC_DIGITS),type);}
  // Source: no console call anywhere names the cnic field, __DEV__ or not.
  for(const f of sourceFiles()){const s=fs.readFileSync(f,'utf8');if(!/cnic/i.test(s))continue;for(const line of s.split('\n'))if(/console\.(log|warn|error|info|debug)/.test(line))assert.ok(!/cnic/i.test(line),f+': '+line.trim());}
- // Pull sync never touches customers, so nothing remote can overwrite the local value.
- assert.ok(!/customers/.test(read('src/services/pullSyncService.ts')));
+ // PULL NEVER BRINGS A CNIC BACK. It used to be enough that the dead pull service did not
+ // name customers; the real pull does pull them, so the guarantee has moved: `cnic` is in
+ // LOCAL_ONLY_FIELDS, so it never leaves this phone and no document can carry one — and the
+ // column whitelist would only ever write a field a document actually has.
+ assert.deepEqual(plain(h.load('src/services/database/syncHelpers.ts').LOCAL_ONLY_FIELDS.customers),['cnic'],
+  'cnic is no longer withheld from the upload payload, so it would travel and pull could bring it back');
+ assert.ok(!/cnic/i.test(read('src/services/database/pullApply.ts')),'the pull path mentions cnic');
 }));
 check(79,'customers are own-only: each account sees exactly the customers it added, by list and by id; parents open a member\'s list read-only through Staff Book',at('src/services/database/customerDb.ts','getCustomerById'),()=>isolated(async h=>{
  seedCustomers(h);const api=customerDb(h);
@@ -5476,6 +5481,24 @@ check(149,'Firestore rules are IN THE REPO and are the PUBLISHED ones: read is g
  assert.ok(/rules_version = '2'/.test(rules),'rules_version 2 is required for the recursive wildcard used here');
  // The ACTIVE text only. A commented example is fine; an active rule is not.
  const active=rules.split('\n').filter(l=>!l.trim().startsWith('//')).join('\n');
+
+ // THE 23 GENERATED PULL BLOCKS ARE TAKEN OUT BEFORE THE HAND-WRITTEN RULES ARE COUNTED.
+ // Each is one line BY CONSTRUCTION, which is what lets them be matched exactly instead of
+ // loosely: a block that is anything other than a single `allow read: if pulled();` is not
+ // stripped, stays in, and trips the count below. Their own guarantee is the body of
+ // `pulled()`, asserted once just under this — one condition shared by all 23, so there is
+ // no per-block spelling to drift. Check 161 ties the SET of them to SYNC_PATHS, which is
+ // what catches a table wired on one side only.
+ const pullLine=/^\s*match \/\{path=\*\*\}\/(\w+)\/\{\w+\}\s*\{ allow read: if pulled\(\); \}/;
+ const pullLeaves=[];
+ const handWritten=active.split('\n').filter(line=>{
+  const m=pullLine.exec(line);
+  if(!m) return true;
+  pullLeaves.push(m[1]);
+  return false;
+ }).join('\n');
+ assert.ok(pullLeaves.length>=20,'the collection-group pull blocks are gone or no longer one-liners, so pull could not read a single collection: '+pullLeaves.length);
+ assert.ok(!pullLeaves.includes('profile'),'the profile block was swept up with the generated ones; it is hand-written and asserted separately');
  assert.ok(/match \/users\/\{\w+\}\/\{document=\*\*\}/.test(active),
   'the per-user match is gone — authorisation rides on the DOCUMENT, and nothing outside /users may match a rule at all');
 
@@ -5484,7 +5507,14 @@ check(149,'Firestore rules are IN THE REPO and are the PUBLISHED ones: read is g
  // pointing it at a different field, would leave every assertion below still passing.
  const helpers=[...active.matchAll(/function\s+(\w+)\s*\(\)\s*\{\s*return([\s\S]*?);\s*\}/g)]
   .map(m=>[m[1],m[2].trim()]);
- let resolved=active;
+ // THE SHARED PULL CONDITION, resolved rather than read: all 23 blocks above delegate to it,
+ // so this one body is what gates every collection-group read in the file.
+ const pulled=helpers.find(([name])=>name==='pulled');
+ assert.ok(pulled,'the shared pull read condition is gone, so each of the 23 blocks now carries its own spelling');
+ assert.ok(/request\.auth != null/.test(pulled[1])&&/request\.auth\.uid in resource\.data\.visibleTo/.test(pulled[1]),
+  'the collection-group pull reads are not gated on the audience list, so any signed-in caller could read every business: '+pulled[1]);
+ assert.ok(!/request\.resource/.test(pulled[1]),'the pull condition reasons about an incoming document, so those blocks are not read-only');
+ let resolved=handWritten;
  // Helpers call helpers (sane -> audience, owner), so substitute to a fixed point.
  for(let pass=0;pass<=helpers.length;pass++)
   for(const [name,body] of helpers) resolved=resolved.split(name+'()').join(body);
@@ -5503,7 +5533,10 @@ check(149,'Firestore rules are IN THE REPO and are the PUBLISHED ones: read is g
  // below are for.
  assert.deepEqual([...new Set(ops)].sort(),['create','read','update'],
   'the rules grant something other than read, create and update — got: '+ops.join(','));
- assert.equal(blocks.length,4,'expected four allow rules across the two match blocks — got '+blocks.length+': '+ops.join(','));
+ // FOUR HAND-WRITTEN RULES, with the generated pull blocks stripped above: create, read and
+ // update in the /users block, plus the profile collection-group read. Not a magic number —
+ // anything the strip did not recognise as a one-line `allow read: if pulled();` lands here.
+ assert.equal(blocks.length,4,'expected four hand-written allow rules — got '+blocks.length+': '+ops.join(','));
 
  // THE SECOND MATCH BLOCK exists only so a COLLECTION-GROUP query can be matched at all: a
  // rule anchored under /users has no ancestry to bind when the query has no parent path, so
@@ -5630,7 +5663,9 @@ check(150,'every uploaded document carries ownerId and visibleTo in FIREBASE uid
  assert.ok(cyclic&&cyclic.visibleTo.length<=3,'a parentId cycle must terminate, not spin');
 
  // ── The payload is stamped, never stored as columns ────────────────────────
- const stamped=sa.authorisedPayload({id:'b1',total:500},{ownerId:'fb_x',visibleTo:['fb_x','fb_y']});
+ // The third argument is the serverTimestamp() sentinel pull orders on; it is passed IN so
+ // this module stays loadable by a harness that cannot load Firebase. Check 161 owns it.
+ const stamped=sa.authorisedPayload({id:'b1',total:500},{ownerId:'fb_x',visibleTo:['fb_x','fb_y']},'__stamp__');
  assert.equal(stamped.ownerId,'fb_x');assert.deepEqual(plain(stamped.visibleTo),['fb_x','fb_y']);
  assert.equal(stamped.total,500,'the row itself must survive the stamping');
  for(const t of ['bills','customers','expenses','transactions'])
@@ -5639,7 +5674,7 @@ check(150,'every uploaded document carries ownerId and visibleTo in FIREBASE uid
 
  // ── Both uploaders stamp, and neither buries an unauthorised row ───────────
  const proc=read('src/services/syncProcessor.ts');
- assert.ok(/authorisedPayload\(payload, authorisation\)/.test(proc),'the single uploader must stamp the payload');
+ assert.ok(/authorisedPayload\(payload, authorisation, serverTimestamp\(\)\)/.test(proc),'the single uploader must stamp the payload, server timestamp included');
  assert.equal((proc.match(/authorisationFor\(db, authorId\)/g)||[]).length,2,'BOTH uploaders must authorise, or one of them bypasses the rules');
  assert.ok(/status='pending' WHERE id=\?/.test(proc),'an unauthorised row must stay PENDING, never be marked failed');
  assert.ok(/batched\.push\(item\)/.test(proc)&&/for \(const item of batched\)/.test(proc),
@@ -5766,8 +5801,8 @@ check(152,'ONE map from table to Firestore path, checked against the MIGRATED SC
  let matched=0;
  for(const tail of literals){
   const fixed=tail.split('/').slice(0,-1);   // drop the trailing ${id}
-  // entryAuditDb builds the audited book's own path with a DYNAMIC collection name, and the
-  // dead pullSyncService interpolates a whole collection. Neither can be matched statically.
+  // entryAuditDb builds the audited book's own path with a DYNAMIC collection name, which
+  // cannot be matched statically.
   if(!fixed.length||/^\$\{/.test(fixed[0])) continue;
   // The identity document is not a book row: `users` is in LOCAL_ONLY_TABLES, and routing
   // this through the queue would need a pseudo-table and would make syncProcessor run
@@ -6344,11 +6379,15 @@ check(158,'HOW A SECOND DEVICE BECOMES THE SAME PERSON: one identity document pe
  // `[Auth] seed adoption: unavailable` cost an hour: the outcome carries a code precisely so
  // it need not be guessed, and the log threw it away. This walks the sync and auth code for
  // the same shape rather than trusting that it was a one-off.
- for(const f of ['src/store/authStore.ts','src/services/syncProcessor.ts','src/services/firebase/firebaseProfile.ts','src/services/database/userDb.ts'])
-  for(const line of read(f).split(String.fromCharCode(10))){
-   if(!/console\.(log|warn|error)\(/.test(line)) continue;
-   if(!/(adoption|published|result|r)\.status/.test(line)) continue;
-   assert.ok(/code|reason|ids/.test(line),f+' logs a status with no code: '+line.trim());
+ for(const f of ['src/store/authStore.ts','src/services/syncProcessor.ts','src/services/firebase/firebaseProfile.ts','src/services/database/userDb.ts','src/services/firebase/firebaseTeam.ts','src/services/database/teamBootstrap.ts'])
+  // STATEMENTS, NOT LINES, and that distinction is the whole reason this guard went quiet:
+  // the regex below held two literal BACKSPACE bytes where \b was meant, so it matched
+  // nothing and the sweep asserted nothing at all for as long as it has existed. Repairing
+  // it then flagged a perfectly correct wrapped log, because a multi-line console.log keeps
+  // its reason and code on the continuation lines where a line-based scan cannot see them.
+  for(const [,call] of read(f).matchAll(/console\.(?:log|warn|error)\(([\s\S]*?)\);/g)){
+   if(!/\b(adoption|published|result|team|r)\.status\b/.test(call)) continue;
+   assert.ok(/code|reason|ids/.test(call),f+' logs a status with no code: '+call.replace(/\s+/g,' ').slice(0,140));
   }
 }));
 
@@ -6428,11 +6467,536 @@ check(159,'THE AUDIENCE FILTER, the only thing standing between a pull and a for
   'the scoping query mentions account_level or is_deleted, which rule 1 forbids');
  assert.ok(!/^import .*firebase/im.test(src),'the filter imports Firebase, which would make it untestable beside the packages the harness cannot load');
 }));
+
+check(160,'THE TEAM BOOTSTRAP, which must finish before pull moves a single cursor: `users` never syncs and firebase_uid is written only for whoever signs in HERE, so without this a device knows one account and the audience filter drops its whole team — membership comes from a staff_records document the VIEWER wrote (never a collection-group query a stranger can name themselves in), the uid from the member’s own profile, and STRUCTURE IS LOCAL while identity is remote',at('src/services/database/teamBootstrap.ts','applyTeamMember'),()=>isolated(async h=>{
+ // The LOCAL half is loaded and RUN, for the same reason accountAdoption is: the harness
+ // cannot load the Firebase packages, so anything beside them is assertable only as source
+ // text — and which rows may be rewritten is far too important for that.
+ const tb=h.load('src/services/database/teamBootstrap.ts');
+ const pa=h.load('src/services/database/pullAudience.ts');
+ const udb=h.load('src/services/database/userDb.ts');
+ const db=h.load('src/services/database/db.ts');
+ const sqlite=await db.getDatabase();
+ seedPeople(h);
+ h.sqlite.prepare('UPDATE users SET firebase_uid=? WHERE id=?').run('fb_owner','owner');
+ const row=id=>h.one('SELECT * FROM users WHERE id=?',id);
+ const count=()=>h.one('SELECT COUNT(*) c FROM users').c;
+ const phone=n=>udb.normalisePhone('+9715012345'+String(10+n));
+ const member=(over={})=>({localId:'cloud_staff',firebaseUid:'fb_cloud',name:'Dubai Manager',name_ur:null,
+  phone:phone(0),area:'Dubai',businessType:null,pictureUrl:null,default_currency:'AED',
+  createdAt:'2026-02-02T00:00:00.000Z',removed:false,...over});
+
+ // ── WHY THE STEP EXISTS: until it runs, the filter drops the entire team ─────────────
+ // A cursor must never advance past a document it dropped, so this cannot be left to pull.
+ const staffDocument={ownerId:'fb_cloud',visibleTo:['fb_cloud','fb_owner'],total:500};
+ assert.equal(pa.acceptable(staffDocument,await pa.knownAudience(sqlite,'owner')),false,
+  'the staff document is accepted before the bootstrap ran, so this case is not testing what it claims');
+ assert.deepEqual(plain(await tb.applyTeamMember(sqlite,'owner',member())),{status:'created',localId:'cloud_staff'});
+ assert.equal(pa.acceptable(staffDocument,await pa.knownAudience(sqlite,'owner')),true,
+  'the audience filter still drops a team member this device has just been taught about, so pull would refuse their books and advance past them');
+
+ // ── THE ROW IT WRITES, AND WHAT IT CANNOT DO ────────────────────────────────────────
+ const made=row('cloud_staff');
+ assert.equal(made.parentId,'owner','the member is not beneath the viewer, so userScope cannot see them');
+ assert.equal(made.role,'staff');
+ assert.equal(made.account_level,'staff');
+ assert.equal(made.firebase_uid,'fb_cloud');
+ assert.equal(made.businessName,row('owner').businessName,'the business name came from a document instead of the viewer’s own row');
+ assert.equal(made.is_deleted,0);
+ assert.equal(made.name,'Dubai Manager');
+ // NO CREDENTIAL TRAVELS, and none is invented. This device holds no password for that
+ // person, so the row must be unable to answer a login however it is typed at.
+ for(const typed of ['Admin@12345','Secret@123','','not-a-real-password',made.passwordHash])
+  assert.equal(await udb.verifyUserLogin(phone(0),typed),null,'a materialised team member logged in with '+JSON.stringify(typed));
+
+ // Idempotent: every login runs this, and the second run must write nothing.
+ const after=count();
+ assert.deepEqual(plain(await tb.applyTeamMember(sqlite,'owner',member())),{status:'already',localId:'cloud_staff'});
+ assert.equal(count(),after,'a second run created a second row for the same member');
+
+ // ── STRUCTURE IS LOCAL, IDENTITY IS REMOTE ──────────────────────────────────────────
+ // A document may claim anything. Where a member SITS is this device's decision, so the
+ // claim is never read: parentId is forced to the viewer and the level follows.
+ assert.equal((await tb.applyTeamMember(sqlite,'owner',member({localId:'forged_structure',firebaseUid:'fb_forged',
+  phone:phone(1),parentId:'otherOwner',role:'admin',account_level:'admin',businessName:'Another Business',is_deleted:1}))).status,'created');
+ const forged=row('forged_structure');
+ assert.equal(forged.parentId,'owner','a document chose its own place in the tree');
+ assert.equal(forged.role,'staff','a document promoted itself to admin');
+ assert.equal(forged.account_level,'staff');
+ assert.equal(forged.businessName,row('owner').businessName);
+
+ // ── THE VIEWER'S OWN ROW IS NEVER TOUCHED ───────────────────────────────────────────
+ // It holds the only password hash this device has for the person using it.
+ const ownerBefore=plain(row('owner'));
+ assert.deepEqual(plain(await tb.applyTeamMember(sqlite,'owner',member({localId:'owner',firebaseUid:'fb_stranger'}))),
+  {status:'refused',localId:'owner',reason:'self'});
+ assert.deepEqual(plain(row('owner')),ownerBefore,'the bootstrap rewrote the row holding this device’s own login');
+
+ // ── AN EXISTING ACCOUNT GAINS ITS uid AND NOTHING ELSE ──────────────────────────────
+ // The ORIGINAL device's case: every staff row is already here, with a NULL uid on all of
+ // them, because firebase_uid is written only for the account that signs in on a device.
+ const beforeA=plain(row('staffA'));
+ assert.deepEqual(plain(await tb.applyTeamMember(sqlite,'owner',member({localId:'staffA',firebaseUid:'fb_staffA',
+  name:'Renamed By A Document',phone:phone(2),removed:true}))),{status:'mapped',localId:'staffA'});
+ const afterA=row('staffA');
+ assert.equal(afterA.firebase_uid,'fb_staffA');
+ for(const col of Object.keys(beforeA))
+  if(col!=='firebase_uid')
+   assert.equal(afterA[col],beforeA[col],'a cloud document rewrote users.'+col+' on an account that already existed here');
+
+ // An identity is never re-pointed: sharing or swapping a uid would let one person's
+ // documents pass the rules — and this filter — as another's.
+ assert.deepEqual(plain(await tb.applyTeamMember(sqlite,'owner',member({localId:'staffA',firebaseUid:'fb_someone_else'}))),
+  {status:'refused',localId:'staffA',reason:'uid-mismatch'});
+ assert.equal(row('staffA').firebase_uid,'fb_staffA');
+
+ // ── A COLLISION IS REFUSED, NEVER MERGED (accountAdoption's rule) ───────────────────
+ assert.deepEqual(plain(await tb.applyTeamMember(sqlite,'owner',member({localId:'uid_taken',firebaseUid:'fb_staffA',phone:phone(3)}))),
+  {status:'refused',localId:'uid_taken',reason:'uid-claimed'});
+ assert.equal(row('uid_taken'),undefined,'a row was written for a uid another account already holds; users.firebase_uid is UNIQUE');
+ assert.deepEqual(plain(await tb.applyTeamMember(sqlite,'owner',member({localId:'phone_taken',firebaseUid:'fb_pt',phone:row('staffB').phone}))),
+  {status:'refused',localId:'phone_taken',reason:'phone-claimed'});
+ assert.equal(row('phone_taken'),undefined,'two rows now hold one phone number');
+ // Total: anything it cannot vouch for is refused rather than guessed at.
+ assert.equal((await tb.applyTeamMember(sqlite,'owner',member({firebaseUid:''}))).reason,'no-uid');
+ assert.equal((await tb.applyTeamMember(sqlite,'owner',member({localId:''}))).reason,'no-id');
+ assert.equal((await tb.applyTeamMember(sqlite,'owner',member({localId:'no_phone',firebaseUid:'fb_np',phone:''}))).reason,'no-phone');
+
+ // ── DOWNWARD ONLY, THROUGH THE SHARED TREE RULE ─────────────────────────────────────
+ // Nothing sits below a staff member, and assertConsistentLevel is what says so — the same
+ // function account creation uses, not a second copy of the rule.
+ assert.deepEqual(plain(await tb.applyTeamMember(sqlite,'staffA',member({localId:'below_staff',firebaseUid:'fb_below',phone:phone(4)}))),
+  {status:'refused',localId:'below_staff',reason:'inconsistent-level'});
+ assert.equal(row('below_staff'),undefined);
+ assert.equal((await tb.applyTeamMember(sqlite,'no_such_viewer',member({localId:'orphan',firebaseUid:'fb_orphan',phone:phone(5)}))).reason,
+  'inconsistent-level','a team was attached to a viewer with no live row at all');
+
+ // ── A DISMISSED STAFF MEMBER IS STILL BOOTSTRAPPED (non-negotiable rule 4) ──────────
+ // Their entries must stay visible, and on a device that has never pulled them this is the
+ // only way their history can arrive. The removal itself is mirrored, so the devices agree.
+ assert.equal((await tb.applyTeamMember(sqlite,'owner',member({localId:'dismissed',firebaseUid:'fb_dismissed',phone:phone(6),removed:true}))).status,'created');
+ assert.equal(row('dismissed').is_deleted,1,'the removal the viewer’s own record describes was not mirrored, so this device shows a dismissed employee as live');
+ assert.ok(row('dismissed').deleted_at);
+ assert.ok((await pa.knownAudience(sqlite,'owner')).has('fb_dismissed'),
+  'a dismissed staff member is outside the audience, so their history could never reach a second device — rule 4');
+
+ // One member's refusal never stops the next.
+ const batch=await tb.applyTeamMembers(sqlite,'owner',[
+  member({localId:'owner',firebaseUid:'fb_1'}),
+  member({localId:'batch_one',firebaseUid:'fb_b1',phone:phone(7)}),
+ ]);
+ // plain(): the array comes back from the module's own realm, so deepEqual would reject it
+ // on Array.prototype alone — the harness trap CLAUDE.md records.
+ assert.deepEqual(plain(batch.map(o=>o.status)),['refused','created'],'a refused member took the rest of the team down with it');
+
+ // ── THE HALVES STAY ON THEIR OWN SIDES ──────────────────────────────────────────────
+ const local=read('src/services/database/teamBootstrap.ts');
+ assert.ok(!/^import .*firebase/im.test(local),'the local half imports Firebase, which is what made it untestable in the first place');
+ assert.ok(/assertConsistentLevel\(/.test(local),'the tree rule was hand-rolled here instead of shared with account creation');
+ const cloud=read('src/services/firebase/firebaseTeam.ts');
+ assert.ok(!/INSERT INTO users|UPDATE users/.test(cloud),'the Firebase half writes users rows itself, where no test can run it');
+
+ // ── CURSOR-FREE, which is the entire reason this is not a pull pass ─────────────────
+ assert.ok(!/startAfter\(|sync_metadata|sync_backfill|\blimit\(/.test(cloud),
+  'the team bootstrap paginates or keeps a cursor; a cursor that advances past a dropped document loses it for ever');
+
+ // ── MEMBERSHIP COMES FROM A DOCUMENT THE VIEWER WROTE ──────────────────────────────
+ assert.ok(/'staff_records'/.test(cloud)&&/linked_user_id/.test(cloud),
+  'the team is not read from the viewer’s own staff_records, which is the only list they authored themselves');
+ assert.ok(!/collectionGroup\(/.test(cloud),
+  'membership comes from a collection-group query, so a stranger who names the viewer in visibleTo could add THEMSELVES to the team — the exact thing the audience filter exists to stop');
+ assert.ok(/array-contains/.test(cloud),
+  'the query does not match the read rule, so Firestore would reject it whole rather than filtering it');
+ assert.ok(/ownerId === uid/.test(cloud),
+  'the viewer’s own staff_records are read without the ownerId test; the path is a local id and unconstrained, so a stranger can plant a document in that very collection');
+ assert.ok(/'profile', 'self'/.test(cloud),
+  'the member’s uid is not read from their own identity document, and nothing else can carry it');
+ assert.ok(/complete/.test(cloud),'the result does not say whether the team is complete, which is the gate pull has to use');
+ // COMPLETE MEANS "NOTHING OF THEIRS COULD BE MISSED", not "everyone was resolved". A member
+ // with NO profile has no uid, so `authorisationFor` returns null and not one row of theirs
+ // has ever left their device — there is nothing for pull to drop or for a cursor to pass.
+ // Blocking on them would stop pull for ever, because a staff member who has never logged in
+ // anywhere is the ORDINARY state today (see the two recorded gaps in CLAUDE.md).
+ // The COMPUTED line, not the type declaration above it — which is what this matched first.
+ const completeLine=/complete: (![^\n]*)/.exec(cloud);
+ assert.ok(completeLine,'the team result no longer reports whether it is complete');
+ assert.ok(/no-profile/.test(completeLine[1]),
+  'a member with no profile document blocks pull for ever, though they have no uid and so no documents at all: '+completeLine[1].trim());
+ assert.ok(/refused\.length/.test(completeLine[1]),
+  'a member whose uid could not be mapped locally does not block pull, though documents stamped with it would be dropped and passed: '+completeLine[1].trim());
+ assert.ok(/currentFirebaseUid\(/.test(cloud),'the bootstrap does not establish whose uid it is testing ownerId against');
+
+ // It must run BEFORE pull, and it is wired where the profile publish already is.
+ const store=read('src/store/authStore.ts');
+ assert.ok(/bootstrapTeamFromCloud\(/.test(store),'nothing calls the team bootstrap, so a second device never learns its team');
+ assert.ok(store.indexOf('publishAccountProfile(')<store.indexOf('bootstrapTeamFromCloud('),
+  'the team is bootstrapped before this account has published its own profile');
+}));
+
+check(161,'PULL’S PREREQUISITES (P1): every document carries a SERVER timestamp — a DELETION above all, because an unstamped delete is a row that resurrects on the other phone — the cursor table is per account and keeps the document id that makes a page boundary inside one batch commit exact, and every live table in SYNC_PATHS has both its collection-group read block and its composite index, so a table can never be wired on one side only',at('src/services/database/syncAuthorisation.ts','authorisedPayload'),()=>isolated(async h=>{
+ const sa=h.load('src/services/database/syncAuthorisation.ts');
+ const bf=h.load('src/services/database/syncBackfill.ts');
+ const sp=h.load('src/services/database/syncPaths.ts');
+ const db=h.load('src/services/database/db.ts');
+ const sqlite=await db.getDatabase();
+
+ // ── THE STAMP, ON EVERY SHAPE OF DOCUMENT ────────────────────────────────────────────
+ // Firestore EXCLUDES a document that lacks the field a query orders by — it does not treat
+ // it as oldest — so a document with no stamp is not late, it is invisible for ever.
+ const stamp={__sentinel:'serverTimestamp'};
+ const auth={ownerId:'fb_owner',visibleTo:['fb_owner']};
+ const payload=sa.authorisedPayload({id:'c1',name:'Bilal'},auth,stamp);
+ assert.equal(payload[sa.SYNCED_AT_FIELD],stamp,'an uploaded document carries no server timestamp, so pull would never return it');
+ assert.equal(payload.ownerId,'fb_owner');
+ assert.deepEqual(plain(payload.visibleTo),['fb_owner']);
+ assert.equal(payload.name,'Bilal','the payload lost its own fields');
+ // THE DELETE PATH. It writes its own small payload rather than the row's, which is exactly
+ // how it came to be the one write that could miss the stamp.
+ const gone=sa.deletionPayload('2026-10-12T00:00:00.000Z',stamp);
+ assert.equal(gone[sa.SYNCED_AT_FIELD],stamp,'a soft delete goes up with no server timestamp: the other device would keep showing a row its owner deleted');
+ assert.equal(gone.is_deleted,true);
+ assert.equal(gone.deleted_at,'2026-10-12T00:00:00.000Z');
+ // ONE name for the field, shared by whoever writes it and whoever orders on it.
+ assert.equal(sa.SYNCED_AT_FIELD,'syncedAt');
+
+ // The stamp is a SENTINEL PASSED IN, never built here: this module is loaded and RUN by
+ // the harness, which cannot load the Firebase packages.
+ const saSrc=read('src/services/database/syncAuthorisation.ts');
+ assert.ok(!/^import .*firebase/im.test(saSrc),'syncAuthorisation imports Firebase, which would make the stamping untestable');
+ // The CODE, not the comments: the doc comment names serverTimestamp() deliberately, to say
+ // where the sentinel comes from.
+ assert.ok(!/serverTimestamp\(/.test(saSrc.replace(/^\s*(\*|\/\/|\/\*).*$/gm,'')),
+  'the sentinel is built inside the module instead of being passed in');
+
+ // ── NO UPLOADER MAY BUILD EITHER PAYLOAD BY HAND ────────────────────────────────────
+ // The delete branch is duplicated across two workers, so the only durable guarantee is
+ // that neither of them assembles the fields itself.
+ for(const f of ['src/services/syncProcessor.ts','src/services/firebase/firebaseProfile.ts']){
+  const src=read(f);
+  assert.ok(!/is_deleted:\s*true/.test(src),
+   f+' builds a deletion payload by hand, which is how one of the two workers loses the stamp: use deletionPayload()');
+  for(const line of src.split(String.fromCharCode(10))){
+   if(!/authorisedPayload\(|deletionPayload\(/.test(line)) continue;
+   if(/^\s*(\*|\/\/)/.test(line)) continue;
+   assert.ok(/serverTimestamp\(\)/.test(line),f+' builds a document without a server timestamp: '+line.trim());
+  }
+ }
+
+ // ── THE CURSOR TABLE (v52) ──────────────────────────────────────────────────────────
+ assert.ok(latest>=52,'db.ts has no v52 migration, so the pull cursor would not exist on an upgraded device');
+ const cols=h.all('PRAGMA table_info(sync_pull)');
+ const byName=Object.fromEntries(cols.map(c=>[c.name,c]));
+ for(const column of ['account_local_id','table_name','cursor_seconds','cursor_nanos','cursor_doc_id','updated_at'])
+  assert.ok(byName[column],'sync_pull has no '+column);
+ // PER ACCOUNT: one phone hosts several logins, and a shared cursor would let one account's
+ // pull advance past documents another had not read.
+ assert.deepEqual(sorted(cols.filter(c=>c.pk).map(c=>c.name)),['account_local_id','table_name'],
+  'the pull cursor is not keyed per account and table: '+JSON.stringify(cols.filter(c=>c.pk).map(c=>c.name)));
+ // THE DOCUMENT ID HALF IS LOAD-BEARING: a batch commit gives up to 500 documents the SAME
+ // write time, so a page boundary inside one batch would leave documents sharing the
+ // cursor's timestamp — startAfter(timestamp) alone would skip them for ever.
+ assert.ok(byName.cursor_doc_id,'the cursor keeps no document id, so a page boundary inside one batch commit loses rows');
+ h.sqlite.prepare("INSERT INTO sync_pull (account_local_id,table_name,cursor_seconds,cursor_nanos,cursor_doc_id,updated_at) VALUES ('owner','bills',1760000000,123456000,'bill_9','2026-10-12')").run();
+ assert.throws(()=>h.sqlite.prepare("INSERT INTO sync_pull (account_local_id,table_name) VALUES ('owner','bills')").run(),
+  /UNIQUE|PRIMARY/,'two cursors can exist for one account and table');
+ h.sqlite.prepare("INSERT INTO sync_pull (account_local_id,table_name) VALUES ('staffA','bills')").run();
+ await h.boot();
+ assert.equal(h.one("SELECT cursor_doc_id FROM sync_pull WHERE account_local_id='owner'").cursor_doc_id,'bill_9',
+  'reopening the database lost the pull cursor');
+
+ // ── THE MATRIX: RULES AND INDEXES, DERIVED FROM THE MAP ─────────────────────────────
+ const rules=fs.readFileSync(path.join(root,'..','firestore.rules'),'utf8');
+ const indexFile=JSON.parse(fs.readFileSync(path.join(root,'..','firestore.indexes.json'),'utf8'));
+ const leafOf=t=>sp.leafCollectionOf(t);
+ const live=Object.entries(sp.SYNC_PATHS).filter(([,s])=>!s.pending).map(([t])=>t);
+ assert.equal(live.length,23,'the number of synced tables changed; the rules blocks and indexes are per table, so say so here deliberately: '+live.length);
+ for(const table of live){
+  const leaf=leafOf(table);
+  // A collection-group query supplies no ancestry, so the /users block cannot match it.
+  assert.ok(new RegExp('match /\\{path=\\*\\*\\}/'+leaf+'/\\{\\w+\\}').test(rules),
+   table+' has no collection-group read block for its leaf collection "'+leaf+'", so its pull query would be refused outright');
+  const index=(indexFile.indexes||[]).find(i=>i.collectionGroup===leaf&&i.queryScope==='COLLECTION_GROUP');
+  assert.ok(index,table+' ("'+leaf+'") has no COLLECTION_GROUP composite index, so its pull query cannot run at all');
+  assert.deepEqual(plain(index.fields),
+   [{fieldPath:'visibleTo',arrayConfig:'CONTAINS'},{fieldPath:'syncedAt',order:'ASCENDING'}],
+   table+'’s index does not match the query (array-contains on visibleTo, then the server stamp): '+JSON.stringify(index.fields));
+ }
+ // A PENDING table must be wired NOWHERE, or the map describes something untrue.
+ for(const [table,spec] of Object.entries(sp.SYNC_PATHS)){
+  if(!spec.pending) continue;
+  const leaf=leafOf(table);
+  assert.ok(!new RegExp('match /\\{path=\\*\\*\\}/'+leaf+'/').test(rules),table+' is pending but has a read block');
+  assert.ok(!(indexFile.indexes||[]).some(i=>i.collectionGroup===leaf),table+' is pending but has an index');
+ }
+ // Leaf names must be unique, or two tables would share one block, one index and one cursor.
+ const leaves=live.map(leafOf);
+ assert.equal(new Set(leaves).size,leaves.length,'two live tables share a leaf collection name');
+ assert.ok(!leaves.includes('profile'),'a synced table is named profile, which the identity lookup’s own block already matches');
+ // THE CONDITION EXISTS ONCE. 23 copies of a security test is 23 chances for one to differ.
+ assert.equal((rules.match(/function pulled\(\)/g)||[]).length,1,'the shared read condition is defined more than once');
+ const blocks=rules.match(/match \/\{path=\*\*\}\/\w+\/\{\w+\}\s*\{[^}]*\}/g)||[];
+ for(const block of blocks.filter(b=>!/profile/.test(b))){
+  assert.ok(/allow read: if pulled\(\);/.test(block),'a pull block does not use the shared condition: '+block.replace(/\s+/g,' '));
+  assert.ok(!/allow (write|create|update|delete)/.test(block),'a collection-group block grants a WRITE, which is what bounds the widening: '+block.replace(/\s+/g,' '));
+ }
+
+ // ── THE RE-UPLOAD: forgetting the cursor is what makes the stamp reach old documents ──
+ seedPeople(h);h.login('owner');
+ h.sqlite.prepare('UPDATE users SET firebase_uid=? WHERE id=?').run('fb_owner','owner');
+ h.insert('customers',{id:'c_old',user_id:'owner',name:'Bilal',synced:1});
+ h.insert('expenses',{id:'e_old',user_id:'owner',synced:1});
+ assert.ok((await bf.runBackfill(sqlite,'owner')).enqueued>=2,'the first run queued nothing, so the reset below proves nothing');
+ h.sqlite.prepare('DELETE FROM sync_queue').run();                       // as if it had all uploaded
+ assert.equal((await bf.planBackfill(sqlite,'owner')).totalEnqueue,0,'the cursor does not consider the work done, so this is not the case being tested');
+ // Another account's cursors must survive: the reset is for ONE login.
+ h.sqlite.prepare("INSERT INTO sync_backfill (account_local_id,table_name,last_id) VALUES ('staffA','expenses','zzz')").run();
+ const cleared=await bf.resetBackfill(sqlite,'owner');
+ assert.ok(cleared.cleared>0,'nothing was cleared');
+ assert.ok(h.one("SELECT last_id FROM sync_backfill WHERE account_local_id='staffA'"),
+  'the reset cleared another login’s cursor, whose rows would then be offered again under the wrong account');
+ assert.ok((await bf.planBackfill(sqlite,'owner')).totalEnqueue>=2,
+  'after the reset the backlog is still judged done, so no old document would ever get the stamp pull orders on');
+ // And it touches nothing else: no book row, no queue row.
+ assert.equal(h.one('SELECT COUNT(*) c FROM sync_queue').c,0,'the reset queued rows by itself');
+ assert.ok(h.one("SELECT id FROM customers WHERE id='c_old'"),'the reset deleted a book row');
+}));
+
+check(162,'PULL (P2): a remote document enters through ONE choke point that refuses a forgery, an upward document, somebody else’s book, a column a document invented and a row this phone has not uploaded yet — and A DELETION APPLIES, which means the flags land in whichever columns the app’s OWN queries filter on, not whichever spelling the document happens to carry (a real document carries both, disagreeing)',at('src/services/database/pullApply.ts','applyDocument'),()=>isolated(async h=>{
+ const pull=h.load('src/services/database/pullApply.ts');
+ const cur=h.load('src/services/database/pullCursor.ts');
+ const pa=h.load('src/services/database/pullAudience.ts');
+ const cashDb=h.load('src/services/database/cashbookDb.ts');
+ const khataDb=h.load('src/services/database/transactionDb.ts');
+ const db=h.load('src/services/database/db.ts');
+ const sqlite=await db.getDatabase();
+ seedPeople(h);h.login('owner');
+ h.sqlite.prepare('UPDATE users SET firebase_uid=? WHERE id=?').run('fb_owner','owner');
+ h.sqlite.prepare('UPDATE users SET firebase_uid=? WHERE id=?').run('fb_staffA','staffA');
+ const known=await pa.knownAudience(sqlite,'owner');
+ const staffKnown=await pa.knownAudience(sqlite,'staffA');
+ const apply=(table,id,doc,set=known)=>pull.applyDocument(sqlite,table,id,doc,set,{path:'users/owner/'+table+'/'+id});
+ const stamped=(over={})=>({ownerId:'fb_owner',visibleTo:['fb_owner'],syncedAt:{seconds:1,nanoseconds:2},...over});
+
+ // ── A DELETION MUST APPLY, AND THIS IS THE REAL DOCUMENT SHAPE ──────────────────────
+ // Both spellings travel and they DISAGREE: a soft delete writes only the snake_case pair,
+ // so the camelCase half is whatever the create left behind. Copying fields onto columns
+ // would land isDeleted = 0 — and the Khata reads isDeleted and nothing else, so the entry
+ // would arrive looking ALIVE. Checked through the app's OWN queries, not through SQL
+ // written here: the bug is invisible to any other query.
+ h.insert('cashbook',{id:'cash_1',userId:'owner',description:'Dubai float',amount_paisa:250000,direction:'in',date,isDeleted:0,is_deleted:0});
+ h.insert('transactions',{id:'txn_1',userId:'owner',partyName:'Bilal',amount_paisa:500000,type:'lena',date,isDeleted:0,is_deleted:0});
+ assert.equal((await cashDb.getCashEntriesByUserId('owner')).length,1,'the fixture entry is not visible to begin with, so this proves nothing');
+ assert.equal((await khataDb.getTransactionsByUserId('owner')).length,1);
+
+ const deletedDoc=(id,extra)=>stamped({
+  id, is_deleted:true, deleted_at:'2026-10-12T19:29:22.685Z',
+  isDeleted:0, deletedAt:null,            // the stale half, exactly as the device sent it
+  ...extra,
+ });
+ assert.deepEqual(plain(await apply('cashbook','cash_1',deletedDoc('cash_1',{userId:'owner',description:'Dubai float',amount_paisa:250000,direction:'in',date}))),
+  {status:'written',id:'cash_1'});
+ assert.deepEqual(plain(await apply('transactions','txn_1',deletedDoc('txn_1',{userId:'owner',partyName:'Bilal',amount_paisa:500000,type:'lena',date}))),
+  {status:'written',id:'txn_1'});
+
+ assert.deepEqual(plain(await cashDb.getCashEntriesByUserId('owner')),[],
+  'a cash entry deleted on the other phone is still listed here: the deletion did not apply');
+ assert.deepEqual(plain(await khataDb.getTransactionsByUserId('owner')),[],
+  'a KHATA entry deleted on the other phone is still listed here — the Khata reads isDeleted, so a document carrying is_deleted alone resurrects the row');
+ // Every delete column the table has now agrees. Neither spelling can be the stale one.
+ for(const [table,id] of [['cashbook','cash_1'],['transactions','txn_1']]){
+  const row=h.one('SELECT * FROM '+table+' WHERE id=?',id);
+  assert.equal(row.is_deleted,1,table+'.is_deleted');
+  assert.equal(row.isDeleted,1,table+'.isDeleted was left at 0, so a query reading that spelling shows a deleted row as live');
+  assert.equal(row.deleted_at,'2026-10-12T19:29:22.685Z',table+'.deleted_at');
+  assert.equal(row.deletedAt,'2026-10-12T19:29:22.685Z',table+'.deletedAt disagrees with deleted_at');
+  assert.equal(row.synced,1,'a pulled row is synced by definition — it came from the server');
+ }
+ // AND IT NEVER QUEUES WHAT IT RECEIVED, which would send the server its own copy back.
+ assert.equal(h.one('SELECT COUNT(*) c FROM sync_queue').c,0,'pulling queued an upload');
+
+ // The reverse direction is just as explicit: an ALIVE document clears the flags rather
+ // than leaving a locally deleted row deleted for ever.
+ assert.equal((await apply('cashbook','cash_1',stamped({id:'cash_1',userId:'owner',description:'Restored',amount_paisa:250000,direction:'in',date,is_deleted:false,deleted_at:null}))).status,'written');
+ assert.equal((await cashDb.getCashEntriesByUserId('owner')).length,1,'an undeleted document did not bring the row back');
+ assert.equal(h.one("SELECT isDeleted FROM cashbook WHERE id='cash_1'").isDeleted,0,'the camelCase flag stayed deleted');
+
+ // ── THE AUDIENCE FILTER, AT THE CHOKE POINT ─────────────────────────────────────────
+ // Account creation is open to anyone holding the API key in the APK, so a stranger can
+ // author a document and name the victim in visibleTo. The rules ADMIT it; only this does not.
+ const forged=stamped({id:'cash_forged',ownerId:'fb_stranger',visibleTo:['fb_stranger','fb_owner'],userId:'owner',description:'Forged',amount_paisa:9999999,direction:'in',date});
+ assert.deepEqual(plain(await apply('cashbook','cash_forged',forged)),{status:'dropped',id:'cash_forged',reason:'unknown-owner'});
+ assert.equal(h.one("SELECT id FROM cashbook WHERE id='cash_forged'"),undefined,'a forged document was written to the database');
+ // Downward only: a staff member must not accept their admin's document.
+ assert.equal((await apply('cashbook','cash_1',stamped({id:'cash_1',ownerId:'fb_owner',visibleTo:['fb_owner','fb_staffA']}),staffKnown)).reason,'unknown-owner');
+ // ownerId is a uid, the author column is a LOCAL id: they must resolve to one account.
+ assert.deepEqual(plain(await apply('expenses','e_wrong',stamped({id:'e_wrong',ownerId:'fb_staffA',visibleTo:['fb_staffA','fb_owner'],user_id:'owner',amount:100,expense_date:date}))),
+  {status:'dropped',id:'e_wrong',reason:'owner-mismatch'});
+ assert.equal(h.one("SELECT id FROM expenses WHERE id='e_wrong'"),undefined);
+ // An id that does not match the document, or none at all.
+ assert.equal((await apply('expenses','e_x',stamped({id:'e_y',user_id:'owner'}))).reason,'id-mismatch');
+ assert.equal((await apply('expenses','e_x',stamped({user_id:'owner'}))).reason,'no-id');
+ // A table in the map but deliberately not wired for push is not pullable either.
+ assert.equal((await apply('day_closings','d1',stamped({id:'d1',user_id:'owner'}))).reason,'not-synced-table');
+ // A document that cannot MAKE a row is refused, not filled in with guesses. (An UPDATE of a
+ // row that already exists touches only the columns the document carried, which is why a
+ // soft delete — which carries almost nothing — still applies. That is the case above.)
+ assert.deepEqual(plain(await apply('cashbook','cash_new',stamped({id:'cash_new',userId:'owner',description:'No date, no createdAt'}))),
+  {status:'dropped',id:'cash_new',reason:'incomplete'});
+ assert.equal(h.one("SELECT id FROM cashbook WHERE id='cash_new'"),undefined,'a half-built row was created from an incomplete document');
+
+ // ── A DOCUMENT CANNOT NAME A COLUMN ─────────────────────────────────────────────────
+ // The service this replaced interpolated REMOTE KEYS into its SQL.
+ const nasty=stamped({id:'e_ok',user_id:'owner',amount:12345,expense_date:date,description:'Fuel',created_at:date,
+  'evil; DROP TABLE expenses':1,not_a_column:'x',ownerId:'fb_owner'});
+ assert.equal((await apply('expenses','e_ok',nasty)).status,'written');
+ assert.ok(h.one("SELECT id FROM expenses WHERE id='e_ok'"),'a document with an unknown field lost the whole row');
+ assert.ok(h.one("SELECT name FROM sqlite_master WHERE type='table' AND name='expenses'"),'the expenses table is gone');
+ assert.equal(h.one("SELECT amount FROM expenses WHERE id='e_ok'").amount,12345,'integer paisa did not survive the round trip');
+ for(const column of ['ownerId','visibleTo','syncedAt'])
+  assert.ok(!h.all('PRAGMA table_info(expenses)').some(c=>c.name===column),'a transport field became a column: '+column);
+
+ // ── LOCAL UNSENT WORK WINS, WHOLE ───────────────────────────────────────────────────
+ // And it is COUNTED, not silent: a refused edit nobody is told about is what gets
+ // rediscovered weeks later as "sync is broken".
+ for(const status of ['pending','failed','syncing']){
+  h.sqlite.prepare("INSERT INTO sync_queue (id,table_name,record_id,operation,payload,firestore_path,status,created_at) VALUES (?,?,?,?,?,?,?,?)")
+   .run('q_'+status,'expenses','e_ok','update','{}','users/owner/expenses/e_ok',status,date);
+  assert.deepEqual(plain(await apply('expenses','e_ok',stamped({id:'e_ok',user_id:'owner',amount:777,expense_date:date}))),
+   {status:'keptOut',id:'e_ok',reason:'local-pending'},'a '+status+' upload was overwritten by the server’s copy');
+  assert.equal(h.one("SELECT amount FROM expenses WHERE id='e_ok'").amount,12345,'the local row was changed anyway');
+  h.sqlite.prepare('DELETE FROM sync_queue WHERE id=?').run('q_'+status);
+ }
+
+ // ── ENTRY HISTORY IS INSERT-ONLY, AND ITS TRIGGER RAISES ────────────────────────────
+ // ON CONFLICT DO UPDATE trips entry_audit_no_update; OR REPLACE and OR IGNORE trip
+ // entry_audit_no_replace. So the only safe shape is to look first.
+ const auditDoc=stamped({id:'ea_1',change_group_id:'g1',book_table:'transactions',entry_id:'txn_1',
+  entry_owner_id:'owner',field_name:'amount_paisa',value_kind:'money_paisa',
+  old_value_json:'100',new_value_json:'200',actor_id:'owner',actor_name:'Owner',
+  changed_at:'2026-10-12T00:00:00.000Z',action:'edited'});
+ assert.deepEqual(plain(await apply('entry_audit','ea_1',auditDoc)),{status:'written',id:'ea_1'});
+ assert.deepEqual(plain(await apply('entry_audit','ea_1',auditDoc)),{status:'present',id:'ea_1'},'a replayed audit row was not recognised as already here');
+ // A REWRITTEN history row changes nothing — which is the guarantee, not a nicety.
+ assert.equal((await apply('entry_audit','ea_1',{...auditDoc,new_value_json:'999999'})).status,'present');
+ assert.equal(h.one("SELECT new_value_json FROM entry_audit WHERE id='ea_1'").new_value_json,'200',
+  'a remote document rewrote entry history, which the local triggers exist to make impossible');
+
+ // ── AN AUDITED BOOK REFUSES A REMOTE EDIT IT HAS NO HISTORY FOR ────────────────────
+ h.insert('transactions',{id:'txn_2',userId:'owner',partyName:'Bilal',amount_paisa:500000,type:'lena',date,isDeleted:0});
+ assert.deepEqual(plain(await apply('transactions','txn_2',stamped({id:'txn_2',userId:'owner',partyName:'Bilal',amount_paisa:999999,type:'lena',date}))),
+  {status:'keptOut',id:'txn_2',reason:'audit-conflict'},'a remote edit rewrote an audited entry with no verified history');
+ assert.equal(h.one("SELECT amount_paisa FROM transactions WHERE id='txn_2'").amount_paisa,500000,'the audited row was changed anyway');
+ // An IDENTICAL document is not a conflict — a replay must stay harmless.
+ assert.equal((await apply('transactions','txn_2',stamped({id:'txn_2',userId:'owner',partyName:'Bilal',amount_paisa:500000,type:'lena',date}))).status,'written');
+ // BUT A REMOTE DELETION OF AN AUDITED ENTRY MUST APPLY. The delete flags are part of what
+ // the audit guard compares, so a deletion read as a conflict and was kept out — leaving the
+ // entry the owner deleted on one phone alive on the other for ever. No audited FIELD moves
+ // in a soft delete, and a document that DOES move one is still refused (just above).
+ assert.equal((await apply('transactions','txn_2',deletedDoc('txn_2',{userId:'owner',partyName:'Bilal',amount_paisa:500000,type:'lena',date}))).status,'written');
+ assert.deepEqual(plain(await khataDb.getTransactionsByUserId('owner')),[],'a khata entry deleted on the other phone is still listed here');
+ assert.equal(h.one("SELECT isDeleted FROM transactions WHERE id='txn_2'").isDeleted,1);
+ // And a deletion arriving WITH a money change is still a conflict: the flags are judged
+ // apart from the fields, not instead of them.
+ assert.equal((await apply('transactions','txn_2',deletedDoc('txn_2',{userId:'owner',partyName:'Bilal',amount_paisa:12345,type:'lena',date}))).reason,'audit-conflict');
+ assert.equal(h.one("SELECT amount_paisa FROM transactions WHERE id='txn_2'").amount_paisa,500000,'a deletion carried a money rewrite past the audit guard');
+
+ // ── THE ONE RESHAPED FIELD GOES BACK TO ITS COLUMN ─────────────────────────────────
+ // activities.visible_to is a JSON string of LOCAL ids; it travels as `activityAudience`, a
+ // real array, so it can never be confused with the visibleTo of FIREBASE uids.
+ assert.equal((await apply('activities','a_1',stamped({id:'a_1',user_id:'owner',user_name:'Owner',action:'created',entity_type:'cash',description:'x',timestamp:date,
+  activityAudience:['owner','staffA']}))).status,'written');
+ assert.equal(h.one("SELECT visible_to FROM activities WHERE id='a_1'").visible_to,'["owner","staffA"]',
+  'the audience column was not rebuilt from activityAudience');
+ assert.ok(!h.all('PRAGMA table_info(activities)').some(c=>c.name==='activityAudience'));
+
+ // ── THE CURSOR ─────────────────────────────────────────────────────────────────────
+ assert.equal(await cur.readCursor(sqlite,'owner','bills'),null,'a device that has never pulled must start at the first document, not at the epoch');
+ await cur.advanceCursor(sqlite,'owner','bills',{seconds:1760000000,nanos:123456000,path:'users/owner/bills/b1'},{applied:2,dropped:1,keptOut:0});
+ assert.deepEqual(plain(await cur.readCursor(sqlite,'owner','bills')),{seconds:1760000000,nanos:123456000,path:'users/owner/bills/b1'});
+ // The counters ACCUMULATE (a kept-out row must still be visible after the run that made
+ // it); the cursor REPLACES. And a run that returned nothing must not move it.
+ await cur.advanceCursor(sqlite,'owner','bills',null,{applied:1,dropped:0,keptOut:3});
+ assert.deepEqual(plain(await cur.readCursor(sqlite,'owner','bills')),{seconds:1760000000,nanos:123456000,path:'users/owner/bills/b1'},'an empty run moved the cursor');
+ const totals=await cur.pullTotals(sqlite,'owner');
+ assert.equal(totals.applied,3);assert.equal(totals.keptOut,3);assert.equal(totals.dropped,1);
+ assert.ok(totals.lastPulledAt,'the Sync Centre has no date to show');
+ // Per account: another login's figures are not this one's.
+ await cur.advanceCursor(sqlite,'staffA','bills',{seconds:5,nanos:0,path:'users/staffA/bills/b9'},{applied:9,dropped:0,keptOut:0});
+ assert.equal((await cur.pullTotals(sqlite,'owner')).applied,3,'one login’s pull figures leaked into another’s');
+ await cur.clearPullCounters(sqlite,'owner');
+ assert.equal((await cur.pullTotals(sqlite,'owner')).keptOut,0,'the counters cannot be cleared once seen');
+ assert.ok(await cur.readCursor(sqlite,'owner','bills'),'clearing the counters threw away the cursor, so everything would be pulled again');
+
+ // ── THE HALVES, AND THE GATE (source only: the harness cannot load Firebase) ────────
+ const local=read('src/services/database/pullApply.ts');
+ assert.ok(!/^import .*firebase/im.test(local),'the local half imports Firebase, so none of the above could be run');
+ const cloud=read('src/services/firebase/firebasePull.ts');
+ assert.ok(!/INSERT INTO|ON CONFLICT|UPDATE \w+ SET/.test(cloud),'the Firebase half writes SQL itself, where no test can run it');
+ // THE GATE. An incomplete team means the filter cannot recognise a team member's
+ // documents, and a cursor that advances past a dropped document loses it for ever.
+ assert.ok(/bootstrapTeamFromCloud\(/.test(cloud),'pull does not bootstrap the team, so its audience set may be incomplete');
+ assert.ok(/team\.complete/.test(cloud)&&/'team-incomplete'/.test(cloud),'pull does not refuse to run on an incomplete team');
+ const gate=cloud.indexOf('team.complete'),firstRead=cloud.indexOf('getDocs(');
+ assert.ok(gate>=0&&gate<firstRead,'documents are fetched before the team gate is checked');
+ // PUSH DRAINS FIRST: pulling onto unsent work would decide a conflict by accident.
+ assert.ok(/processSyncQueue\(\)/.test(cloud)&&cloud.indexOf('processSyncQueue()')<firstRead,'pull reads before the push queue has drained');
+ // THE QUERY SHAPE. Each clause is load-bearing and named in CLAUDE.md.
+ assert.ok(/collectionGroup\(/.test(cloud),'a flat collection lives under its AUTHOR, so one query per table must cross the collection group');
+ assert.ok(/array-contains/.test(cloud),'the query does not match the read rule, so Firestore rejects it whole rather than filtering it');
+ assert.ok(/orderBy\(SYNCED_AT_FIELD\)/.test(cloud),'pull does not order on the server stamp, so its cursor would ride a client clock');
+ assert.ok(/orderBy\(documentId\(\)\)/.test(cloud),'there is no tie-break, so a page boundary inside one batch commit would skip documents sharing its timestamp');
+ assert.ok(/startAfter\(asTimestamp\(cursor\), cursor\.path\)/.test(cloud),'the cursor is not resumed as a (timestamp, path) pair');
+ assert.ok(/limit\(PAGE_SIZE\)/.test(cloud),'an unbounded query would read a whole business in one call');
+ assert.ok(/backfillOrder\(\)/.test(cloud),'tables are not pulled parents-first, so a bill line could arrive before its bill');
+ // The audience set is built ONCE per run, before anything is read, and handed to the local half.
+ assert.ok(/knownAudience\(/.test(cloud)&&cloud.indexOf('knownAudience(')<firstRead,'the audience set is built after documents were fetched');
+ assert.ok(/applyDocuments\(/.test(cloud),'the Firebase half does not go through the one choke point');
+ // The cursor moves AFTER the documents are applied, and over everything the query returned.
+ assert.ok(cloud.indexOf('applyDocuments(')<cloud.indexOf('advanceCursor('),'the cursor advances before the documents are applied');
+
+ // The dead service is gone, with its broken import and its remote-keys-into-SQL upsert.
+ assert.ok(!fs.existsSync(path.join(root,'src/services/pullSyncService.ts')),
+  'the old pull service is still here; it imported a non-existent export and interpolated remote keys into SQL');
+ const store=read('src/store/useSyncStore.ts');
+ assert.ok(/firebasePull/.test(store)&&!/pullSyncService/.test(store),'the store still points at the old pull service');
+ assert.ok(/keptOut/.test(store),'the store drops the kept-out count, so the Sync Centre cannot show it');
+ const centre=read('src/screens/sync/SyncCenterScreen.tsx');
+ assert.ok(/syncKeptOut/.test(centre)&&/syncPullBlocked/.test(centre),
+  'the Sync Centre shows neither the kept-out count nor a blocked download, so both would be silent');
+}));
+/**
+ * ONE CHECK AT A TIME: `ONLY=162 node tests/regression.test.cjs`, or `ONLY=159,160`.
+ *
+ * Every check boots its own database and runs every migration, so the whole suite is about
+ * five minutes — which made proving a single assertion (mutate, run, restore) cost twenty.
+ * This exists for that: seconds instead of minutes while a guard is being written.
+ *
+ * A FILTERED RUN CAN NEVER PASS FOR A GREEN SUITE, which is the whole risk of having it:
+ *   * it prints a banner saying how few checks ran;
+ *   * it never prints a TOTAL line, so anything grepping for one finds nothing;
+ *   * and it exits 2 EVEN WHEN EVERY SELECTED CHECK PASSES, so no script can read it as
+ *     success. Rule 9 means the whole suite, and this cannot be mistaken for it.
+ */
 (async()=>{
+ const only=(process.env.ONLY||'').split(',').map(s=>s.trim()).filter(Boolean);
+ const selected=only.length?testCases.filter(t=>only.includes(String(t.id))):testCases;
+ if(only.length){
+  const missing=only.filter(id=>!testCases.some(t=>String(t.id)===id));
+  console.info('\n'+'='.repeat(78));
+  console.info('PARTIAL RUN — ONLY='+only.join(',')+' — '+selected.length+' of '+testCases.length+' checks.');
+  console.info('THIS IS NOT THE SUITE, and it exits 2 however it goes. Rule 9 means all of it.');
+  console.info('='.repeat(78)+'\n');
+  if(missing.length){console.info('No such check: '+missing.join(', '));process.exitCode=2;return;}
+ }
  const originals=new Map(sourceFiles().map(p=>[p,crypto.createHash('sha256').update(fs.readFileSync(p)).digest('hex')]));
  let passed=0;const failures=[];
- for(const t of testCases){try{await t.fn();passed++;console.info('PASS '+String(t.id).padStart(2,'0')+' '+t.name);}catch(e){failures.push(t.id);console.info('FAIL '+String(t.id).padStart(2,'0')+' '+t.name+'\n  '+t.where+'\n  '+e.message.replace(/\n/g,'\n  '));}}
+ for(const t of selected){try{await t.fn();passed++;console.info('PASS '+String(t.id).padStart(2,'0')+' '+t.name);}catch(e){failures.push(t.id);console.info('FAIL '+String(t.id).padStart(2,'0')+' '+t.name+'\n  '+t.where+'\n  '+e.message.replace(/\n/g,'\n  '));}}
  for(const [p,hash]of originals)assert.equal(crypto.createHash('sha256').update(fs.readFileSync(p)).digest('hex'),hash,'Application source changed during tests: '+p);
+ if(only.length){
+  console.info('\nPARTIAL '+selected.length+'/'+testCases.length+': '+passed+' PASS, '+failures.length+' FAIL'+(failures.length?' ('+failures.join(', ')+')':'')+' — NOT a suite result, exit 2.');
+  process.exitCode=2;
+  return;
+ }
  console.info('\nTOTAL '+testCases.length+': '+passed+' PASS, '+failures.length+' FAIL'+(failures.length?' ('+failures.join(', ')+')':''));
  console.info('Temporary databases removed. Application code unchanged. Native PDF rendering/device startup are not simulated.');
  process.exitCode=failures.length?1:0;

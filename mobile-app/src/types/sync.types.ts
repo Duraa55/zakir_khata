@@ -18,7 +18,16 @@ export interface SyncStore {
   failedCount: number;
   lastSyncedAt: string | null;
   isSyncing: boolean;
-  
+  /**
+   * Remote changes the LAST PULL refused — because this device had unsent work of its own,
+   * or an audited entry disagreed. Shown in the Sync Centre: a silently refused edit is
+   * what gets rediscovered weeks later as "sync is broken". The durable per-table figures
+   * live in `sync_pull` (pullCursor.pullTotals); this is the last run's number.
+   */
+  keptOutCount: number;
+  /** The team is not fully known, so pull refused to run rather than drop and advance past. */
+  pullBlocked: boolean;
+
   setOnlineStatus: (status: boolean) => void;
   setPendingCount: (count: number) => void;
   incrementPendingCount: () => void;

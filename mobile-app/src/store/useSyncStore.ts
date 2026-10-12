@@ -1,7 +1,7 @@
 import { create } from 'zustand';
 import { SyncStore } from '../types/sync.types';
 import { processSyncQueue, batchProcessSyncQueue } from '../services/syncProcessor';
-import { pullRemoteChanges } from '../services/pullSyncService';
+import { pullRemoteChanges, type PullResult } from '../services/firebase/firebasePull';
 
 export const useSyncStore = create<SyncStore>((set, get) => ({
   isOnline: true,
@@ -9,6 +9,8 @@ export const useSyncStore = create<SyncStore>((set, get) => ({
   failedCount: 0,
   lastSyncedAt: null,
   isSyncing: false,
+  keptOutCount: 0,
+  pullBlocked: false,
 
   setOnlineStatus: (status: boolean) => set({ isOnline: status }),
   
@@ -36,11 +38,23 @@ export const useSyncStore = create<SyncStore>((set, get) => ({
     }
   },
 
+  /**
+   * Pull, and keep the one number the Sync Centre has to show: how many remote changes this
+   * device REFUSED. The pull itself drains the push queue first and gates on the team being
+   * fully known — see services/firebase/firebasePull.ts.
+   */
   pullRemoteChanges: async (userId: string) => {
     if (get().isSyncing) return;
     set({ isSyncing: true });
     try {
-      await pullRemoteChanges(userId);
+      const result: PullResult = await pullRemoteChanges(userId);
+      if (result.status === 'done') {
+        set({ keptOutCount: result.keptOut, lastSyncedAt: new Date().toISOString() });
+      } else if (result.status === 'blocked') {
+        // NOT a silent no-op: the Sync Centre says the team is not fully known, because
+        // "nothing came down" and "nothing could safely come down" are different states.
+        set({ pullBlocked: true });
+      }
     } finally {
       set({ isSyncing: false });
     }

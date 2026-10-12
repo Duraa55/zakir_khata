@@ -296,6 +296,44 @@ async function initializeDatabase(database: SQLite.SQLiteDatabase): Promise<void
       PRIMARY KEY (account_local_id, table_name)
     );
 
+    -- HOW FAR PULL HAS READ, per account and per table (v52).
+    --
+    -- PER ACCOUNT for the same reason sync_backfill is: one phone can host several logins,
+    -- and a shared cursor would let one account's pull advance past documents another
+    -- account had not read yet — which nothing would ever fetch again.
+    --
+    -- THE CURSOR IS A SERVER TIMESTAMP PLUS A DOCUMENT ID, and the id half is not belt and
+    -- braces. The batch uploader commits up to 500 documents at once and a batch gives
+    -- every document in it the SAME write time, so a page boundary inside one batch would
+    -- leave several documents sharing the cursor's timestamp: startAfter(timestamp) would
+    -- then skip the rest of them for ever. Ordering on (syncedAt, __name__) and resuming
+    -- after that pair is what makes the boundary exact.
+    --
+    -- Seconds and nanoseconds are stored separately because that is what a Firestore
+    -- Timestamp is; collapsing them into one number would round away the ordering this
+    -- exists to preserve. NULL means nothing has been pulled yet, which is not the same as
+    -- the epoch: a query with no cursor starts from the first document.
+    -- cursor_doc_id holds the FULL DOCUMENT PATH, not the bare id: in a collection-group
+    -- query the __name__ cursor value is the whole path.
+    --
+    -- The three counters (v53) are what the Sync Centre reads. kept_out is the one that
+    -- matters on screen: remote changes this device REFUSED, because it had unsent work of
+    -- its own or an audited entry disagreed. A silently refused edit is what gets
+    -- rediscovered weeks later as "sync is broken", so the number is kept rather than logged.
+    CREATE TABLE IF NOT EXISTS sync_pull (
+      account_local_id TEXT NOT NULL,
+      table_name TEXT NOT NULL,
+      cursor_seconds INTEGER,
+      cursor_nanos INTEGER,
+      cursor_doc_id TEXT,
+      applied INTEGER DEFAULT 0,
+      dropped INTEGER DEFAULT 0,
+      kept_out INTEGER DEFAULT 0,
+      last_pulled_at TEXT,
+      updated_at TEXT,
+      PRIMARY KEY (account_local_id, table_name)
+    );
+
     -- Also created by migration v38. Listed here as well, like every other table, so a
     -- database whose migration chain stalled still opens with a usable table instead of
     -- failing at "no such table" deep inside the salary screen.
@@ -2021,6 +2059,50 @@ async function migrateFrom(database: SQLite.SQLiteDatabase): Promise<void> {
 
     await database.execAsync('PRAGMA user_version = 51');
     version = 51;
+  }
+
+  if (version < 52) {
+    if (__DEV__) console.log('[DB] Migrating to v52: the pull cursor');
+    // WHERE PULL HAS READ TO, per account and per table. The full reasoning — why the
+    // cursor is a (server timestamp, document id) PAIR, and why one cursor per phone would
+    // lose data on a shared handset — is on the CREATE TABLE in initializeDatabase above.
+    //
+    // A new table, so there is nothing to guard on a column and nothing to preserve: an
+    // empty cursor table means "nothing pulled yet", which is exactly the state a device
+    // upgrading into this is in.
+    await database.execAsync(`
+      CREATE TABLE IF NOT EXISTS sync_pull (
+        account_local_id TEXT NOT NULL,
+        table_name TEXT NOT NULL,
+        cursor_seconds INTEGER,
+        cursor_nanos INTEGER,
+        cursor_doc_id TEXT,
+        updated_at TEXT,
+        PRIMARY KEY (account_local_id, table_name)
+      )
+    `);
+
+    await database.execAsync('PRAGMA user_version = 52');
+    version = 52;
+  }
+
+  if (version < 53) {
+    if (__DEV__) console.log('[DB] Migrating to v53: what pull applied, dropped and kept out');
+    // Counters on the v52 cursor table, because P1 shipped v52 to a device before pull
+    // itself existed. Guarded on the COLUMN, not the table — the v43 lesson — and the
+    // table is created above for a fresh install, so a missing one is nothing to repair.
+    const pullTable = await database.getFirstAsync<{ name: string }>(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'sync_pull'"
+    );
+    if (pullTable) {
+      await addColumnIfNotExists(database, 'sync_pull', 'applied', 'INTEGER DEFAULT 0');
+      await addColumnIfNotExists(database, 'sync_pull', 'dropped', 'INTEGER DEFAULT 0');
+      await addColumnIfNotExists(database, 'sync_pull', 'kept_out', 'INTEGER DEFAULT 0');
+      await addColumnIfNotExists(database, 'sync_pull', 'last_pulled_at', 'TEXT');
+    }
+
+    await database.execAsync('PRAGMA user_version = 53');
+    version = 53;
   }
 }
 

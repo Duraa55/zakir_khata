@@ -1,5 +1,5 @@
 import type { SQLiteDatabase } from 'expo-sqlite';
-import { doc, setDoc, collectionGroup, query, where, getDocs } from 'firebase/firestore';
+import { doc, setDoc, collectionGroup, query, where, getDocs, serverTimestamp } from 'firebase/firestore';
 import { signInWithEmailAndPassword, signOut } from 'firebase/auth';
 import { IS_FIREBASE_CONFIGURED, getFirestoreDB } from './firebaseConfig';
 import { authEmailFor, getFirebaseAuth } from './firebaseAuth';
@@ -89,7 +89,10 @@ export const publishAccountProfile = async (localUserId: string): Promise<Publis
     const firestore = getFirestoreDB();
     await setDoc(
       doc(firestore, `users/${localUserId}/profile/self`),
-      authorisedPayload({ ...row }, authorisation),
+      // Stamped like every other document. Pull never reads a profile — the team bootstrap
+      // fetches it by path, with no ordering — but the stamp is a required argument so that
+      // no document can be built without one by forgetting it.
+      authorisedPayload({ ...row }, authorisation, serverTimestamp()),
       { merge: true }
     );
     if (__DEV__) console.log('[Profile] published users/' + localUserId + '/profile/self');

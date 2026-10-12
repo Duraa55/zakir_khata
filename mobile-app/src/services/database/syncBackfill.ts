@@ -373,3 +373,37 @@ export const runBackfill = async (
   if (enqueued) afterSyncedWrite();
   return { enqueued, tablesCompleted, stoppedEarly };
 };
+
+/**
+ * FORGET WHERE THE INITIAL UPLOAD GOT TO, so the next run offers every row again.
+ *
+ * WHY THIS EXISTS AT ALL (owner-approved, 2026-10-12). Pull orders on a SERVER timestamp,
+ * and Firestore does not return a document that lacks the field it is ordering by — it
+ * excludes it. Every document uploaded before `SYNCED_AT_FIELD` existed therefore carries no
+ * stamp and is invisible to pull for ever, however many times pull runs. The fix is to send
+ * them again, and the only thing standing in the way is this module's own cursor, which
+ * correctly reports the work as already done.
+ *
+ * SAFE, AND DELIBERATELY NARROW:
+ *   * It deletes nothing but `sync_backfill` rows for ONE account. No book row, no queue
+ *     row, no other login's cursor.
+ *   * A re-upload is idempotent at the far end — every uploader uses `setDoc(..., { merge:
+ *     true })` — so re-sending a document costs one write and changes nothing about it
+ *     except the stamp, which is the point.
+ *   * `verdictFor` still skips rows the live path has already queued, so a reset followed by
+ *     a run cannot double-queue anything.
+ *
+ * It is NOT a repair for a half-finished run: that resumes on its own, which is what the
+ * cursor is for. Reach for this only when the DOCUMENTS need rewriting, as here.
+ */
+export const resetBackfill = async (
+  db: SQLiteDatabase,
+  accountLocalId: string
+): Promise<{ cleared: number }> => {
+  const before = await db.getFirstAsync<{ c: number }>(
+    'SELECT COUNT(*) AS c FROM sync_backfill WHERE account_local_id = ?', [accountLocalId]
+  );
+  await db.runAsync('DELETE FROM sync_backfill WHERE account_local_id = ?', [accountLocalId]);
+  if (__DEV__) console.log('[Backfill] cursor reset for ' + accountLocalId + ': ' + (before?.c ?? 0) + ' table cursors cleared');
+  return { cleared: before?.c ?? 0 };
+};

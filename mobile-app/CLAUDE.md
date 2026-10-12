@@ -278,6 +278,15 @@ scoping.
 > prototype alone even when the contents match. Wrap such values in the suite's `plain()`
 > helper before `deepEqual`. This cost real time on check 150; `sorted()` hides it because
 > spreading rebuilds the array in the test's realm.
+>
+> **AND A SECOND ONE, FOUND 2026-10-12: A GUARD THAT COULD NEVER FIRE.** Check 158's sweep
+> for "a status logged without its code" held two literal BACKSPACE bytes (0x08) where `\b`
+> was meant — a regex written through a shell that interpreted the escape — so it matched
+> nothing and asserted nothing for its whole life. Repaired, and made STATEMENT-based rather
+> than line-based, because a wrapped `console.log` keeps its codes on the continuation lines.
+> The lesson is not about one regex: a source-text assertion that can only ever pass looks
+> exactly like a passing test. When a static guard is added, make it FAIL once on purpose
+> before believing it.
 
 ## Non-negotiable rules
 
@@ -334,8 +343,17 @@ scoping.
 
 8. **No new `console.log`**; gate debug behind `__DEV__`. Never log CNIC or phone numbers.
 
-9. **Keep all three suites green:** `tests/regression.test.cjs` (123 checks, all passing),
-   `tests/entryAudit.test.cjs` (17), the i18n suite (8). Run them after every change.
+9. **Keep all three suites green:** `tests/regression.test.cjs` (162 checks, all passing),
+   `tests/entryAudit.test.cjs` (18), the i18n suite (8). Run them after every change.
+   These counts were stale for a long time (123 / 17); they are the TOTAL lines each suite
+   prints, so correct them rather than trusting a number in this file.
+
+   **ONE CHECK WHILE WRITING ONE:** `ONLY=162 node tests/regression.test.cjs` (or
+   `ONLY=159,160`) runs just those, in seconds rather than the five minutes a full suite
+   costs — every check boots its own database and runs every migration, which is what made
+   mutation-testing a single guard a twenty-minute job. It prints a banner, prints NO `TOTAL`
+   line, and exits **2** even when everything selected passes, so a filtered run cannot be
+   read as a green suite. Rule 9 still means all three suites in full, before any report.
    Requires Node 22 (`nvm use 22`) — `node:sqlite` throws on 18/20. Expo builds still use
    Node 18 via `.nvmrc`.
    **Run all three, not just the big one.** `entryAudit` builds its OWN minimal fixture
@@ -673,9 +691,26 @@ their own, enforced in the data layer not by hiding buttons).
 > another business, not one being BORN pointing at it. Nor can the path, which is the local
 > id and unconstrained by design.
 > The filter therefore belongs to the READER, checked against the local tree
-> (the puller's own `firebase_uid` plus their descendants', `is_deleted = 0`), and an
+> (the puller's own `firebase_uid` plus their descendants'), and an
 > unknown `ownerId` is dropped silently — no row written, no error on screen.
 > PULL IS NOT DONE UNTIL THAT FILTER EXISTS AND IS TESTED.
+> **BUILT 2026-10-12** as `services/database/pullAudience.ts`; check 159, mutation-tested.
+>
+> **REMOVED DESCENDANTS ARE IN THE KNOWN SET, DELIBERATELY (2026-10-12).** `knownAudience`
+> filters on `firebase_uid IS NOT NULL` and `userScope('id')` and nothing else — it does NOT
+> exclude `is_deleted = 1`, and that is the decision, not an oversight. A dismissed staff
+> member's entries must stay visible (non-negotiable rule 4); their documents were stamped
+> `visibleTo = [them, the admin]` while they were still live, so the rules admit them; and on
+> a device that has never pulled them, THIS FILTER IS THE ONLY THING standing between the
+> owner and losing that history. Excluding them would break rule 4 in a place nobody would
+> think to look, because it reads like ordinary hygiene. The audience set is "whose documents
+> may enter", never "who may log in" — `verifyUserLogin` is where removal is enforced.
+>
+> `userScope` gained `'id'` for this: the same SQL with a different column, so the `users`
+> table can be scoped against itself. It is an EXCEPTION TO RULE 1 made visibly — the reason
+> is in the helper's own doc comment, and check 159 asserts `pullAudience` calls the shared
+> helper rather than hand-rolling the predicate, and mentions neither `account_level` nor
+> `is_deleted`.
 >
 > **AND A CURSOR MUST NEVER ADVANCE PAST A DOCUMENT IT DROPPED (2026-10-12).** The obvious
 > way to bootstrap a fresh device is two passes: pull with the known set as just the viewer,
@@ -691,6 +726,172 @@ their own, enforced in the data layer not by hiding buttons).
 > cursor moves. The team bootstrap is therefore a single cursor-free query of the admin's own
 > `staff_records` — not a pull pass — and the order is: identity bootstrap, audience filter,
 > team bootstrap, pull.
+>
+> **THE TEAM BOOTSTRAP — BUILT 2026-10-12.** `services/firebase/firebaseTeam.ts`
+> (`bootstrapTeamFromCloud`) with its local half in `services/database/teamBootstrap.ts`,
+> split for the same reason adoption is: the harness cannot load the Firebase packages, so
+> anything beside them is assertable only as source text. Check 160. It runs in the login
+> side-effect right after the profile publish, and **the pull step must AWAIT it and gate on
+> `complete` rather than assume a login ran it.**
+>
+> - **IT IS NOT A SECOND-DEVICE-ONLY STEP.** `users` is in `LOCAL_ONLY_TABLES` and
+>   `firebase_uid` is written only for the account that signs in ON THIS DEVICE — so the
+>   ORIGINAL device, which has every staff row, holds NULL for all of them. Its known set is
+>   just as short and its pull would drop just as much.
+> - **MEMBERSHIP COMES FROM A DOCUMENT THE VIEWER WROTE:** one `getDocs` of
+>   `users/{myLocalId}/staff_records`, keeping only documents whose `ownerId` is the viewer's
+>   own uid, then `linked_user_id` off each. The collection-group query over `profile` that
+>   `findAccountProfile` uses would be one call instead of several and MUST NOT be used here:
+>   it returns every profile naming the viewer in `visibleTo`, so a stranger could add
+>   THEMSELVES to the team — the exact thing the audience filter exists to stop.
+> - **THE UID COMES FROM THE MEMBER'S OWN `profile/self`**, read by direct path. Nothing else
+>   could carry it, and only that account can have stamped its `ownerId`.
+> - **STRUCTURE IS LOCAL, IDENTITY IS REMOTE.** `parentId` is forced to the viewer, role and
+>   level to staff, the business name taken off the viewer's own row; only name, phone, photo,
+>   area and currency come from the document. A profile claiming `parentId: <someone else>` or
+>   `role: 'admin'` is filed as the viewer's own staff member anyway, because the claim is
+>   never read. The tree rule is `assertConsistentLevel`, shared with account creation, which
+>   is also what refuses a bootstrap under a viewer who is not an admin.
+> - **IT NEVER REWRITES AN IDENTITY.** It creates a row for a local id it has none for, or
+>   fills in a MISSING `firebase_uid` and nothing else. A row already carrying a different uid
+>   (`uid-mismatch`), a uid another row holds (`uid-claimed`), a phone another row holds
+>   (`phone-claimed`) and the viewer's own row (`self`) are all refused with a reason, with
+>   nothing written. A created row gets `NO_LOGIN_HASH` — the empty string, which
+>   `verifyStoredHash` can never produce a match for — because this device holds no password
+>   for that person and inventing a hash would be inventing a login.
+> - **A DISMISSED MEMBER IS STILL BOOTSTRAPPED**, mirrored as soft-deleted from the viewer's
+>   own record, for the rule-4 reason above.
+> - **KNOWN LIMIT, and it is the next step's gate.** A member who never published a profile
+>   has no uid — and no uid means `authorisationFor` returns null, so they have never uploaded
+>   anything and pull has nothing of theirs to drop. The case that is NOT safe is a profile
+>   that EXISTS and cannot be read: a uid exists that this device cannot learn. Both are
+>   reported in `unresolved`, and `complete` is false for either, which is why pull must gate
+>   on it rather than run and advance cursors.
+> - **Accepted divergence:** the bootstrap never changes `is_deleted` on a row that already
+>   exists, so if a member is dismissed AFTER a second device created their row, that device
+>   keeps them live until it is wiped. Mirroring removal onto an existing account would mean a
+>   cloud document could soft-delete a login — and nothing about pull depends on it, since the
+>   audience set includes removed descendants either way.
+>
+> **PULL, P1 — THE PREREQUISITES. BUILT 2026-10-12, DEPLOY REQUIRED.** Pull itself (P2) is
+> not built. P1 is everything that has to be LIVE before pull can be judged at all, and all
+> of it was approved by the owner on 2026-10-12.
+>
+> - **THE CURSOR IS A SERVER TIMESTAMP** — `SYNCED_AT_FIELD` (`syncedAt`) in
+>   `syncAuthorisation.ts`, stamped by `authorisedPayload`. Never a client clock: two phones
+>   disagree about "later" by however much their clocks do, and a cursor that moves on a
+>   wrong clock skips documents permanently. The sentinel is PASSED IN
+>   (`serverTimestamp()`), never imported there — that module is loaded and RUN by the
+>   harness, which cannot load the Firebase packages.
+> - **TWO CONSEQUENCES, and both have bitten projects before they were written down.**
+>   (1) A query ordering on a field returns ONLY documents that have it — Firestore excludes
+>   the rest rather than treating them as oldest. So every document uploaded before this
+>   existed was invisible to pull, which is why the initial upload was re-run from scratch
+>   (`resetBackfill`, and the second `__DEV__` button in Settings). (2) **A DELETION MUST
+>   CARRY THE STAMP TOO.** The delete path writes its own small payload and used to bypass
+>   `authorisedPayload` entirely — an unstamped delete never travels, so the other phone
+>   keeps showing a row its owner deleted. `deletionPayload` now exists so neither uploader
+>   can build that write by hand, and check 161 fails if either one does.
+> - **Migration v52: `sync_pull`**, per account and per table like `sync_backfill`, holding
+>   seconds + nanos + **document id**. The id half is load-bearing: the batch uploader
+>   commits up to 500 documents at once and a batch gives them all the SAME write time, so
+>   `startAfter(timestamp)` alone would skip the rest of that batch at a page boundary.
+>   Order on `(syncedAt, __name__)` and resume after that pair.
+> - **23 COLLECTION-GROUP READ BLOCKS AND 23 COMPOSITE INDEXES**, generated from
+>   `SYNC_PATHS` — 17 flat leaves plus 6 nested, `day_closings` excluded as `pending`. A
+>   flat collection lives under the AUTHOR's local id, so reading a whole team in one query
+>   means a collection-group query, and **a collection-group query supplies no ancestry, so
+>   the `/users/{pathId}/{document=**}` block cannot match it** — the `profile` lesson, now
+>   the rule rather than the exception. The collection name must be a literal (there is no
+>   variable-collection form), which is why it is 23 blocks; the CONDITION is one shared
+>   `pulled()`, because 23 copies of a security test is 23 chances for one to differ. They
+>   grant no write, and nothing outside `/users` grants one either, which is what bounds the
+>   widening. Check 161 asserts a block AND an index per live table, and none for a pending
+>   one, so a table can never be wired on one side only.
+> - **NOT DEPLOYED BY BUILDING IT.** From the repo ROOT: `npx firebase-tools deploy --only
+>   firestore:rules` then `--only firestore:indexes`. Read the publish timestamp in the
+>   version history afterwards — a green Playground proves the EDITOR, never what is live.
+>
+> **PULL, P2 — BUILT 2026-10-13, DEVICE-UNVERIFIED.** `firebase/firebasePull.ts`
+> (`pullRemoteChanges`, `planPull`) with its local half in `database/pullApply.ts` and the
+> cursor store in `database/pullCursor.ts`. Check 162, mutation-tested. `pullSyncService.ts`
+> is DELETED — it imported a non-existent export, queried the wrong paths, and interpolated
+> REMOTE KEYS into its SQL.
+>
+> - **ONE CHOKE POINT.** `pullApply.applyDocument` is the only way a document reaches SQLite,
+>   and it refuses in this order: the audience filter (`acceptable`), then
+>   `ownerMatchesAuthor`, then the id, then a `sync_queue` row, then the column whitelist
+>   from `PRAGMA table_info`. The local half holds every decision that could lose data and
+>   imports no Firebase, so the harness RUNS it.
+> - **THE GATE, EVERY RUN.** Pull bootstraps the team first and refuses outright unless it
+>   came back `complete`. The case it exists for is a member whose uid exists (so they can
+>   upload) but whose profile this device cannot read, which can become true between logins.
+>   Given the gate, the cursor advances over EVERY document a query returned — dropped ones
+>   included — because one permanently unknown owner must not block a collection for ever.
+> - **PUSH DRAINS FIRST**, and whatever is still queued afterwards is KEPT OUT and counted.
+>   Local unsent work wins whole, never field by field: a half-merged row is a number nobody
+>   wrote.
+> - **A DELETION APPLIES, AND THAT TOOK TWO FIXES** (owner-found on the device, 2026-10-12):
+>   1. **BOTH SPELLINGS TRAVEL AND THEY DISAGREE.** A real document carries
+>      `is_deleted: true, deleted_at: "…"` beside `isDeleted: 0, deletedAt: null`, because a
+>      soft delete writes only the snake_case pair and the camelCase half is whatever the
+>      create left behind. Copying fields onto columns would land `isDeleted = 0` — and the
+>      Khata reads `isDeleted` and nothing else, so the entry would arrive LOOKING ALIVE. So
+>      the flags are DERIVED (deleted if either spelling says so) and written to every delete
+>      column the table has, from `PRAGMA table_info` rather than a table-keyed map that
+>      would go stale. Check 162 asserts a pulled deletion is gone from
+>      `getCashEntriesByUserId` and `getTransactionsByUserId` — the app's OWN queries.
+>   2. **THE AUDIT GUARD REFUSED DELETIONS.** `assertAuditedRemoteUnchanged` compares the
+>      delete flags too, so a remote khata deletion read as a conflict and was kept out,
+>      leaving a deleted entry alive on the other phone for ever. The flags are now judged
+>      apart from the fields: a soft delete applies, a document that moves an audited FIELD is
+>      still refused and counted. Safe because no money moves, the deletion's own
+>      `entry_audit` rows sync separately, and only the entry's own account can write them.
+> - **UPDATE AN EXISTING ROW, INSERT A NEW ONE — NOT `ON CONFLICT DO UPDATE`.** SQLite builds
+>   the candidate row before it notices the conflict, so a NOT NULL column a document does
+>   not carry fails the whole statement even when the row exists and the update would never
+>   have touched it — which is exactly the shape of a soft delete. A document that cannot
+>   CREATE a row is refused as `incomplete` rather than filled in with guesses.
+> - **`entry_audit` IS INSERT-ONLY** against triggers that `RAISE(ABORT)` on update and on
+>   replace — `OR IGNORE` aborts too — so it looks first and then inserts. A rewritten
+>   history document changes nothing.
+> - **COUNTED, AND SHOWN.** `sync_pull` keeps `applied` / `dropped` / `kept_out` per account
+>   and table (v53), and the Sync Centre shows the kept-out number with its reason and says
+>   when a download was BLOCKED. A silently refused edit is what gets rediscovered weeks
+>   later as "sync is broken" (owner, 2026-10-12).
+> - **Still open, by design:** pulled attachment paths point at the OTHER device's
+>   documentDirectory, so a pulled photo is a dead path until an attachment-transfer step
+>   exists. Across runs a child row can arrive before its parent (separate cursors, foreign
+>   keys off) and waits as an orphan.
+>
+> **THE NEXT TWO STEPS AFTER PULL, IN THIS ORDER (owner, 2026-10-12).** Found while building
+> the team bootstrap; neither is a hardening idea and neither is optional. **Without (2) the
+> two-location requirement — the thing this app is for — does not work: a Dubai staff
+> member's books would never reach the Khuzdar owner.** Device 2 is the OWNER'S second phone,
+> so (1) does not block the pull step; it blocks every staff member's phone.
+>
+> 1. **PROVISION THE STAFF MEMBER'S FIREBASE IDENTITY AT ADD STAFF TIME.** Today
+>    `ensureFirebaseAccount` runs only at a login of that account, so a staff member created
+>    by an admin has NO Firebase identity until they log in somewhere — and on a fresh install
+>    they cannot: no local row, so `verifyUserLogin` fails, adoption tries to sign in to
+>    Firebase, no account exists, and the login is refused as `invalid`. A staff member can
+>    therefore never set up their own phone. `createStaffMember` is the one moment their
+>    plaintext password legitimately exists, which is why the identity belongs there (and the
+>    profile publish with it). Rollout workaround until then: the staff member logs in once on
+>    the admin's phone while online.
+> 2. **THE STAFF DEVICE MUST KNOW ITS PARENT'S uid, so its uploads name the admin.**
+>    `authorisationFor` walks `parentId` through local `users` rows. On a staff member's own
+>    device, adoption creates their row but no row for the admin, so the walk ends at once and
+>    `visibleTo` is `[staff]` alone — the admin's `array-contains` pull query would never
+>    return their books. **This is the two-location requirement, not a refinement.** The team
+>    bootstrap is downward by design and does not fix it, and today nothing the staff device
+>    may read carries the admin's uid (the admin's own profile and staff_records are stamped
+>    `visibleTo = [admin]`).
+>    **CEILING ON THE OBVIOUS FIX, recorded rather than designed around (owner, 2026-10-12):**
+>    the admin's profile publish naming its team in `visibleTo` — which it can do once the
+>    team bootstrap has run — collides with the rules' `sane()` cap of `size() <= 8`. It
+>    holds for an admin with at most 7 staff and silently breaks their own publish beyond
+>    that. Do not pick a design for this yet.
 >
 > **THE OTHER PLACE THE CLIENT HAS TO PROTECT US: the profile lookup's ownerId filter
 > (2026-10-12).** `findAccountProfile` runs a collection-group query over `profile` and keeps

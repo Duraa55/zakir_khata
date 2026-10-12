@@ -1,10 +1,10 @@
 import { getDatabase } from './database/db';
 import { getPendingSyncExpenses } from './database/expenseDb';
 import { useSyncStore } from '../store/useSyncStore';
-import { doc, setDoc, updateDoc, writeBatch } from 'firebase/firestore';
+import { doc, setDoc, updateDoc, writeBatch, serverTimestamp } from 'firebase/firestore';
 import { getFirestoreDB, IS_FIREBASE_CONFIGURED } from './firebase/firebaseConfig';
 import { SyncQueueItem } from '../types/sync.types';
-import { authorLocalIdFrom, authorisationFor, authorisedPayload } from './database/syncAuthorisation';
+import { authorLocalIdFrom, authorisationFor, authorisedPayload, deletionPayload } from './database/syncAuthorisation';
 import { currentFirebaseUid } from './firebase/firebaseAuth';
 
 /**
@@ -99,10 +99,13 @@ export async function processSyncQueue(): Promise<void> {
       if (__DEV__) console.log('[Sync] uploading ' + item.id + ' as ' + signedInUid + ', ownerId ' + authorisation.ownerId);
 
       // A delete only flips the flags; the document already carries its ownerId, and the
-      // update rule keeps that field immutable anyway.
+      // update rule keeps that field immutable anyway. IT STILL CARRIES THE SERVER STAMP,
+      // through the shared helper: pull orders on that field and Firestore excludes a
+      // document that lacks it, so an unstamped deletion would never travel and the other
+      // phone would go on showing a row its owner deleted.
       const outgoing = item.operation === 'delete'
-        ? { is_deleted: true, deleted_at: payload.deleted_at || new Date().toISOString() }
-        : authorisedPayload(payload, authorisation);
+        ? deletionPayload(payload.deleted_at || new Date().toISOString(), serverTimestamp())
+        : authorisedPayload(payload, authorisation, serverTimestamp());
 
       // THE DOCUMENT ITSELF, not a description of it, and the SAME object that is sent
       // below — a log built separately is free to disagree with the write.
@@ -219,9 +222,11 @@ export async function batchProcessSyncQueue(): Promise<void> {
     if (!authorisation || authorisation.ownerId !== signedInUid) continue;
     const docRef = doc(firestore, item.firestore_path);
     if (item.operation === 'delete') {
-      batch.update(docRef, { is_deleted: true, deleted_at: payload.deleted_at || new Date().toISOString() });
+      // The same two helpers as the single uploader, for the same reason: a stamp missing
+      // here and present there would mean deletions that travel from one code path only.
+      batch.update(docRef, deletionPayload(payload.deleted_at || new Date().toISOString(), serverTimestamp()));
     } else {
-      batch.set(docRef, authorisedPayload(payload, authorisation), { merge: true });
+      batch.set(docRef, authorisedPayload(payload, authorisation, serverTimestamp()), { merge: true });
     }
     batched.push(item);
   }

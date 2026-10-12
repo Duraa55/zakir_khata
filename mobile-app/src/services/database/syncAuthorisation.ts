@@ -19,6 +19,29 @@ import type { SQLiteDatabase } from 'expo-sqlite';
 export type SyncAuthorisation = { ownerId: string; visibleTo: string[] };
 
 /**
+ * THE FIELD PULL ORDERS ON, and the reason it is a SERVER timestamp.
+ *
+ * A cursor cannot be a client clock. Every `updated_at` in this database is written by the
+ * device that made the change, so two phones disagree about "later" by however much their
+ * clocks disagree — and a cursor that moves on a wrong clock skips documents permanently.
+ * Firestore's own write time is the one value both devices read identically.
+ *
+ * TWO CONSEQUENCES THAT ARE EASY TO MISS, and both are why this constant is here rather
+ * than inline in the uploader:
+ *
+ *   1. A QUERY ORDERING ON THIS FIELD RETURNS ONLY DOCUMENTS THAT HAVE IT. Firestore does
+ *      not treat a missing field as "oldest" — it excludes the document from the result
+ *      altogether. So every document uploaded before this existed is invisible to pull
+ *      until it is uploaded again, which is why the initial upload was re-run from scratch
+ *      (owner, 2026-10-12).
+ *   2. A DELETION MUST CARRY IT TOO. A soft delete uploads only its flags, and if that
+ *      write skipped the stamp the deletion would never be pulled — the other phone would
+ *      keep showing a row its owner deleted, which is worse than one arriving late.
+ *      `deletionPayload` below exists so no uploader can build that write by hand.
+ */
+export const SYNCED_AT_FIELD = 'syncedAt';
+
+/**
  * The local account that authored a queued row, taken from its document path.
  *
  * Every path is built as `users/{localUserId}/…` — by writeRowWithSyncIn's callers and by
@@ -83,9 +106,27 @@ export const authorisationFor = async (
  */
 export const authorisedPayload = (
   payload: Record<string, any>,
-  authorisation: SyncAuthorisation
+  authorisation: SyncAuthorisation,
+  syncedAt: unknown
 ): Record<string, any> => ({
   ...payload,
   ownerId: authorisation.ownerId,
   visibleTo: authorisation.visibleTo,
+  [SYNCED_AT_FIELD]: syncedAt,
+});
+
+/**
+ * A soft delete as it goes to Firestore: the flags, and the stamp pull orders on.
+ *
+ * The only fields a delete writes. The document already carries its `ownerId`, which the
+ * update rule keeps immutable, so re-sending the audience would be noise — but the STAMP is
+ * not optional, and this exists so that cannot be got wrong in two uploaders independently.
+ * `syncedAt` is a sentinel the caller passes in (`serverTimestamp()`), never built here:
+ * this module is loaded and RUN by the test harness, which cannot load the Firebase
+ * packages, and that is worth more than the convenience of importing it.
+ */
+export const deletionPayload = (deletedAt: string, syncedAt: unknown): Record<string, any> => ({
+  is_deleted: true,
+  deleted_at: deletedAt,
+  [SYNCED_AT_FIELD]: syncedAt,
 });

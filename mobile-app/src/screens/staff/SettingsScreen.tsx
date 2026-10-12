@@ -299,6 +299,115 @@ export const SettingsScreen = () => {
               <Text style={styles.devText}>{t('setDevBackfill')}</Text>
             </TouchableOpacity>
           )}
+
+          {/* DEV-ONLY — RE-UPLOAD EVERYTHING. Not destructive either: it clears this
+              account's backfill cursor and queues every row again. It exists because pull
+              orders on a SERVER timestamp and Firestore excludes a document that lacks the
+              field it orders by — so every document uploaded before that field existed is
+              invisible to pull until it is sent again, and the cursor is the only thing
+              saying the work is done. Idempotent at the far end: every upload is a merge. */}
+          {__DEV__ && user?.role === 'admin' && (
+            <TouchableOpacity
+              style={[styles.changePasswordBtn, styles.devBtn]}
+              onPress={async () => {
+                try {
+                  const { getDatabase } = await import('../../services/database/db');
+                  const { resetBackfill, planBackfill, runBackfill } = await import('../../services/database/syncBackfill');
+                  const db = await getDatabase();
+                  const me = user.id;
+                  Alert.alert(
+                    t('setReuploadTitle'),
+                    t('setReuploadBody'),
+                    [
+                      { text: t('commonCancel'), style: 'cancel' },
+                      {
+                        text: t('setReuploadConfirm'),
+                        onPress: async () => {
+                          try {
+                            // The cursor goes first: the plan is only honest once the run it
+                            // describes is the one that would actually happen.
+                            await resetBackfill(db, me);
+                            const plan = await planBackfill(db, me);
+                            if (!plan.totalEnqueue) {
+                              Alert.alert(t('setReuploadedTitle'), t('setReuploadNone'));
+                              return;
+                            }
+                            const result = await runBackfill(db, me);
+                            Alert.alert(t('setReuploadedTitle'), t('setReuploadedBody', { rows: result.enqueued }));
+                          } catch (e: any) {
+                            Alert.alert(t('commonError'), e?.message || t('setReuploadFailed'));
+                          }
+                        },
+                      },
+                    ]
+                  );
+                } catch (e: any) {
+                  Alert.alert(t('commonError'), e?.message || t('setReuploadFailed'));
+                }
+              }}
+            >
+              <Icon name="refresh-cw" size={iconSize.sm} tint={color.attention} />
+              <Text style={styles.devText}>{t('setDevReupload')}</Text>
+            </TouchableOpacity>
+          )}
+
+          {/* DEV-ONLY — DOWNLOAD NOW. The dry run FIRST, like the backfill's: the size of a
+              run is seen before it happens, and "nothing waiting" is told apart from
+              "nothing happened". A refusal is reported as a refusal — the gate closing
+              because the team is not fully known is the one outcome that must never read as
+              success, since it means a pull would have dropped documents and advanced its
+              cursors past them. */}
+          {__DEV__ && (
+            <TouchableOpacity
+              style={[styles.changePasswordBtn, styles.devBtn]}
+              onPress={async () => {
+                if (!user) return;
+                try {
+                  const { planPull, pullRemoteChanges } = await import('../../services/firebase/firebasePull');
+                  const plan = await planPull(user.id);
+                  if (plan.status === 'blocked') {
+                    Alert.alert(t('commonError'), t('syncDevPullBlocked', { who: plan.unresolved.join(', ') }));
+                    return;
+                  }
+                  if (plan.status !== 'plan') {
+                    Alert.alert(t('commonError'), t('syncDevPullFailed'));
+                    return;
+                  }
+                  if (!plan.total) {
+                    Alert.alert(t('syncDevPullTitle'), t('syncDevPullNone'));
+                    return;
+                  }
+                  Alert.alert(
+                    t('syncDevPullTitle'),
+                    t('syncDevPullBody', { rows: plan.total }),
+                    [
+                      { text: t('commonCancel'), style: 'cancel' },
+                      {
+                        text: t('syncNow'),
+                        onPress: async () => {
+                          const result = await pullRemoteChanges(user.id);
+                          if (result.status === 'done') {
+                            Alert.alert(t('syncDevPullTitle'), t('syncDevPullDone', {
+                              applied: result.applied, keptOut: result.keptOut, dropped: result.dropped,
+                            }));
+                          } else if (result.status === 'blocked') {
+                            Alert.alert(t('commonError'), t('syncDevPullBlocked', { who: result.unresolved.join(', ') }));
+                          } else {
+                            Alert.alert(t('commonError'), t('syncDevPullFailed'));
+                          }
+                        },
+                      },
+                    ]
+                  );
+                } catch (e: any) {
+                  Alert.alert(t('commonError'), e?.message || t('syncDevPullFailed'));
+                }
+              }}
+            >
+              <Icon name="download-cloud" size={iconSize.sm} tint={color.attention} />
+              <Text style={styles.devText}>{t('syncDevPull')}</Text>
+            </TouchableOpacity>
+          )}
         </View>
 
         {/* ── My documents ──
