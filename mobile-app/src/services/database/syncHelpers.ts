@@ -94,6 +94,28 @@ export const syncPayloadFor = (tableName: string, data: Record<string, any>): Re
   return out;
 };
 
+/**
+ * Columns that are written to SQLite but must never travel: this phone's own bookkeeping.
+ *
+ * `synced` is per-device by definition, and `firestore_path` is where the document already
+ * is — sending either back would be telling the server what it just told us. They are
+ * stripped from the live payload and from the backfill's alike, which is the whole reason
+ * this lives here rather than once in each: a live document and a backfilled one must be
+ * the SAME SHAPE, or pull is being tested against a document the app does not actually send.
+ */
+export const LOCAL_BOOKKEEPING = ['synced', 'firestore_path'] as const;
+
+/**
+ * The document for a row as it was written: local-only fields removed, JSON lists reshaped,
+ * this phone's bookkeeping dropped. The one way a payload is built, for live writes and for
+ * the backfill.
+ */
+export const outgoingPayload = (tableName: string, row: Record<string, any>): Record<string, any> => {
+  const payload = { ...syncPayloadFor(tableName, row) };
+  for (const column of LOCAL_BOOKKEEPING) delete payload[column];
+  return payload;
+};
+
 export async function writeWithSync(options: WriteOptions): Promise<void> {
   const { tableName, recordId, operation, data, firestorePath } = options;
   // Canonical identifiers prevent a differently-cased/quoted table bypassing the gate.
@@ -131,57 +153,68 @@ export async function writeRowWithSyncIn(db: SQLiteDatabase, options: WriteOptio
   if (isAuditedBook(tableName) && operation !== 'create') throw new Error('Audited edits must go through writeWithSync.');
   const now = new Date().toISOString();
   const syncId = `sync_${Date.now()}_${Math.random().toString(36).substring(2, 11)}`;
+  // THE ROW AS ACTUALLY WRITTEN, and the queue payload is built from THIS — never from the
+  // caller's `data`.
+  //
+  // It used to be built from `data`, while the timestamps below were appended to a local
+  // keys/values pair that `data` never saw. So they reached SQLite and never reached the
+  // document: a live-written cashbook or transactions row shipped with NO `createdAt` in
+  // either spelling, and both columns are NOT NULL, so the receiving phone could not
+  // INSERT it and dropped it as `incomplete`. `expenses` and `reminders` shipped without
+  // their NOT NULL `created_at` for the same reason and would have dropped the moment one
+  // was pulled onto a device that did not already hold the row. Found on the device,
+  // 2026-10-13 (owner: applied=10, dropped=2).
+  //
+  // A BACKFILLED document never had the bug — it is `SELECT *` of the real row — which is
+  // why the first upload looked fine and only entries written afterwards vanished. Keeping
+  // one object for both the write and the payload is what makes the two shapes the same by
+  // construction rather than by two lists agreeing.
+  const useCamelCase = ['users', 'transactions', 'cashbook'].includes(tableName);
+  const written: Record<string, any> = { ...data };
   // 1. Write to SQLite immediately
   if (operation === 'create') {
-    const keys = Object.keys(data);
-    const values = Object.values(data);
-    // Ensure synced and created_at and firestore_path are present
-    if (!keys.includes('synced')) { keys.push('synced'); values.push(0); }
-    if (!keys.includes('created_at')) { keys.push('created_at'); values.push(now); }
-    if (!keys.includes('updated_at')) { keys.push('updated_at'); values.push(now); }
-    if (!keys.includes('firestore_path')) { keys.push('firestore_path'); values.push(firestorePath); }
-
-    const useCamelCase = ['users', 'transactions', 'cashbook'].includes(tableName);
+    if (!('synced' in written)) written.synced = 0;
+    if (!('created_at' in written)) written.created_at = now;
+    if (!('updated_at' in written)) written.updated_at = now;
+    if (!('firestore_path' in written)) written.firestore_path = firestorePath;
     if (useCamelCase) {
-      if (!keys.includes('createdAt')) { keys.push('createdAt'); values.push(now); }
-      if (!keys.includes('updatedAt')) { keys.push('updatedAt'); values.push(now); }
-      if (!keys.includes('isDeleted')) { keys.push('isDeleted'); values.push(0); }
+      if (!('createdAt' in written)) written.createdAt = now;
+      if (!('updatedAt' in written)) written.updatedAt = now;
+      if (!('isDeleted' in written)) written.isDeleted = 0;
     }
 
+    const keys = Object.keys(written);
     const placeholders = keys.map(() => '?').join(', ');
     if (__DEV__) console.log(`[Sync] INSERT INTO ${tableName} (${keys.join(', ')})`);
     await db.runAsync(
       `INSERT INTO ${tableName} (${keys.join(', ')}) VALUES (${placeholders})`,
-      values
+      keys.map(k => written[k])
     );
   } else if (operation === 'update') {
-    const keys = Object.keys(data);
-    const values = Object.values(data);
-    
-    let setClause = keys.map(k => `${k} = ?`).join(', ');
-    
     // Force synced=0 and update timestamp
-    if (!keys.includes('synced')) { setClause += `, synced = 0`; }
-    if (!keys.includes('updated_at')) { setClause += `, updated_at = ?`; values.push(now); }
-    if (!keys.includes('firestore_path')) { setClause += `, firestore_path = ?`; values.push(firestorePath); }
-    
-    const useCamelCase = ['users', 'transactions', 'cashbook'].includes(tableName);
-    if (useCamelCase) {
-      if (!keys.includes('updatedAt')) { setClause += `, updatedAt = ?`; values.push(now); }
-    }
+    if (!('synced' in written)) written.synced = 0;
+    if (!('updated_at' in written)) written.updated_at = now;
+    if (!('firestore_path' in written)) written.firestore_path = firestorePath;
+    if (useCamelCase && !('updatedAt' in written)) written.updatedAt = now;
 
-    values.push(recordId);
+    const keys = Object.keys(written);
     if (__DEV__) console.log(`[Sync] UPDATE ${tableName} SET ... WHERE id = ${recordId}`);
     await db.runAsync(
-      `UPDATE ${tableName} SET ${setClause} WHERE id = ?`,
-      values
+      `UPDATE ${tableName} SET ${keys.map(k => `${k} = ?`).join(', ')} WHERE id = ?`,
+      [...keys.map(k => written[k]), recordId]
     );
   } else if (operation === 'delete') {
+    // The SQL is unchanged. What is new is that the payload now carries the same values,
+    // so `deletionPayload` reads a real `deleted_at` instead of falling back to its own clock.
     if (__DEV__) console.log(`[Sync] SOFT DELETE ${tableName} id = ${recordId}`);
     await db.runAsync(
       `UPDATE ${tableName} SET is_deleted=1, deleted_at=?, synced=0, updated_at=? WHERE id=?`,
       [now, now, recordId]
     );
+    written.is_deleted = 1;
+    written.deleted_at = now;
+    written.synced = 0;
+    written.updated_at = now;
   }
 
   // 2. Add to sync_queue
@@ -190,7 +223,7 @@ export async function writeRowWithSyncIn(db: SQLiteDatabase, options: WriteOptio
     await db.runAsync(
       `INSERT INTO sync_queue (id, table_name, record_id, operation, payload, firestore_path, status, created_at)
        VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)`,
-      [syncId, tableName, recordId, operation, JSON.stringify(syncPayloadFor(tableName, data)), firestorePath, now]
+      [syncId, tableName, recordId, operation, JSON.stringify(outgoingPayload(tableName, written)), firestorePath, now]
     );
   }
 }

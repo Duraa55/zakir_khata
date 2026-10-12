@@ -343,7 +343,7 @@ scoping.
 
 8. **No new `console.log`**; gate debug behind `__DEV__`. Never log CNIC or phone numbers.
 
-9. **Keep all three suites green:** `tests/regression.test.cjs` (162 checks, all passing),
+9. **Keep all three suites green:** `tests/regression.test.cjs` (163 checks, all passing),
    `tests/entryAudit.test.cjs` (18), the i18n suite (8). Run them after every change.
    These counts were stale for a long time (123 / 17); they are the TOTAL lines each suite
    prints, so correct them rather than trusting a number in this file.
@@ -863,6 +863,50 @@ their own, enforced in the data layer not by hiding buttons).
 >   documentDirectory, so a pulled photo is a dead path until an attachment-transfer step
 >   exists. Across runs a child row can arrive before its parent (separate cursors, foreign
 >   keys off) and waits as an orphan.
+>
+> **THE PAYLOAD WAS NOT THE ROW — FIXED 2026-10-13, FOUND ON THE DEVICE.** The first real
+> two-device pull returned `applied=10, dropped=2`, one cashbook and one transactions
+> document, failing on `transactions.createdAt`. It was NOT a camelCase/snake_case mismatch,
+> which is what it looks like: both tables carry BOTH spellings as real columns
+> (`createdAt`/`updatedAt` NOT NULL, `created_at` DEFAULT CURRENT_TIMESTAMP, `updated_at`
+> nullable), so pull's column whitelist would have accepted either. **The document carried
+> neither.**
+>
+> `writeRowWithSyncIn` appended the timestamps to the INSERT's own keys/values arrays and
+> never to `data` — and the queue payload was built from `data`. So they reached SQLite and
+> never reached Firestore. The payload is now built from `written`, the row AS WRITTEN, through
+> the shared `outgoingPayload` in `syncHelpers.ts`.
+>
+> - **IT WAS NEVER ABOUT THOSE TWO TABLES.** `expenses` and `reminders` shipped without their
+>   NOT NULL `created_at` for the same reason and would have dropped the moment one was
+>   pulled onto a device that did not already hold the row. `customers` was fine only because
+>   `addCustomer` happens to put `created_at` into `data` by hand. Fixing the two tables the
+>   device named would have left the other two to be rediscovered.
+> - **A BACKFILLED DOCUMENT NEVER HAD THE BUG** — it is `SELECT *` of the real row — which is
+>   exactly why the first upload looked fine and only entries written AFTERWARDS vanished.
+>   That is also why the backfill no longer keeps its own copy of the strip list: a live
+>   document and a backfilled one face the same pull, so any difference between them is a bug
+>   that only appears after a backfill. One builder, `outgoingPayload`, for both.
+> - **A DELETE's stored payload now carries its own `deleted_at`**, so `deletionPayload` reads
+>   a real stamp instead of falling back to its own clock. The delete SQL is unchanged.
+> - **WHY 162 DID NOT CATCH IT.** Every document check 162 feeds the choke point is written BY
+>   THE TEST. It proved pull handles the documents the test believes push sends. Check 163
+>   closes that: it writes through the real data layer on one harness, takes the payload out
+>   of `sync_queue`, stamps it with the real `authorisedPayload`, and applies it to a SECOND
+>   harness that has never seen the row. **Two databases is load-bearing** — in one, the row
+>   already exists and `applyDocument` takes the UPDATE path, which never needed the missing
+>   columns and so never failed. Its guard is driven by `PRAGMA table_info`, not a column
+>   list, and it was made to fail twice on purpose: once with the payload rebuilt from
+>   `data` (reproducing `createdAt, updatedAt` exactly), once with pull dropping `createdAt`
+>   (proving the device-2 round trip bites on its own).
+> - **NOT BUILT, AND DELIBERATELY: a cursor reset.** Pull advances over dropped documents by
+>   design, so the two stranded documents could not return on their own — but re-uploading
+>   from device 1 gives them a fresh `syncedAt`, after the cursor, so they arrive on the next
+>   pull with nothing to reset. If a reset is ever wanted as a DEBUGGING tool, it is
+>   `resetCursor(db, account, tables?)` NULLing `cursor_seconds`/`cursor_nanos`/`cursor_doc_id`
+>   in `sync_pull` — `readCursor` already returns null for that, so the collection restarts
+>   from its first document and the counters survive. `clearPullCounters` deliberately does
+>   NOT touch the cursor. Do not build it as part of a fix; a re-upload is the fix.
 >
 > **THE NEXT TWO STEPS AFTER PULL, IN THIS ORDER (owner, 2026-10-12).** Found while building
 > the team bootstrap; neither is a hardening idea and neither is optional. **Without (2) the

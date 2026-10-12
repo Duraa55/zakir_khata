@@ -6964,6 +6964,91 @@ check(162,'PULL (P2): a remote document enters through ONE choke point that refu
  assert.ok(/syncKeptOut/.test(centre)&&/syncPullBlocked/.test(centre),
   'the Sync Centre shows neither the kept-out count nor a blocked download, so both would be silent');
 }));
+check(163,'PUSH: THE QUEUED PAYLOAD IS THE ROW AS WRITTEN, so a live document carries every NOT NULL column its table has and a second phone can actually INSERT it — it used to be built from the CALLER’s object while the timestamps were appended to the INSERT alone, so cashbook and transactions shipped with no createdAt in either spelling and expenses and reminders with no created_at, and the receiving device dropped them as incomplete (found on the device, 2026-10-13)',at('src/services/database/syncHelpers.ts','outgoingPayload'),async()=>{
+ // TWO DEVICES, because that is the bug. Device 1 writes and queues; device 2 has never
+ // seen the row and must INSERT it. In one database this would exercise the UPDATE path,
+ // which never needed the missing columns and so never failed — which is why the whole
+ // suite stayed green while every live-written cash entry was being dropped on arrival.
+ const one=harness(),two=harness();
+ try{
+  await one.boot();await two.boot();
+  for(const h of [one,two]){
+   seedPeople(h);h.login('owner');
+   h.sqlite.prepare('UPDATE users SET firebase_uid=? WHERE id=?').run('fb_owner','owner');
+  }
+
+  // ── DEVICE 1: REAL WRITES THROUGH THE REAL DATA LAYER ──────────────────────────────
+  // Nothing here constructs a document. Every payload below is what writeWithSync actually
+  // put in sync_queue, which is the thing that was wrong and the thing nothing else reads.
+  await one.load('src/services/database/cashbookDb.ts').createCashEntry('owner','Dubai float',250000,'in',date);
+  await one.load('src/services/database/transactionDb.ts').createTransaction('owner','Bilal',500000,'lena','Note',date);
+  await one.load('src/services/database/expenseDb.ts').addExpenseRecord({user_id:'owner',amount:12345,description:'Fuel',category:'Fuel',expense_date:date});
+  await one.load('src/services/database/reminderDb.ts').addReminder({user_id:'owner',title:'Call Bilal',type:'payment',due_date:date});
+
+  const queued=one.all("SELECT table_name,record_id,payload FROM sync_queue WHERE operation='create' ORDER BY table_name");
+  assert.deepEqual(sorted(queued.map(q=>q.table_name)),['cashbook','expenses','reminders','transactions'],
+   'the four tables this bug covered are not all being queued, so the rest of this check proves less than it reads');
+
+  // ── THE GUARD: A CREATE PAYLOAD SATISFIES ITS OWN TABLE ────────────────────────────
+  // Driven by PRAGMA, never by a hand-written column list: a list goes stale the next time
+  // a migration adds a NOT NULL column, which is the shape of how this shipped.
+  for(const q of queued){
+   const payload=JSON.parse(q.payload);
+   const required=one.all('PRAGMA table_info('+q.table_name+')')
+    .filter(c=>c.notnull&&c.dflt_value===null&&!c.pk).map(c=>c.name);
+   const missing=required.filter(c=>!Object.prototype.hasOwnProperty.call(payload,c));
+   assert.deepEqual(missing,[],q.table_name+' queues a document missing NOT NULL column(s) its own table demands: '+missing.join(', ')+' — the receiving phone cannot INSERT it and drops it as incomplete');
+   // A LIVE DOCUMENT AND A BACKFILLED ONE MUST BE THE SAME SHAPE. This phone's bookkeeping
+   // is not the server's business, and sending firestore_path back would also mean a pulled
+   // row arriving pre-marked with the OTHER device's path.
+   for(const local of ['synced','firestore_path'])
+    assert.ok(!Object.prototype.hasOwnProperty.call(payload,local),q.table_name+' ships its own bookkeeping column '+local);
+  }
+
+  // ── DEVICE 2: THE SAME PAYLOADS THROUGH THE ONE CHOKE POINT ────────────────────────
+  const pull=two.load('src/services/database/pullApply.ts');
+  const pa=two.load('src/services/database/pullAudience.ts');
+  const auth=two.load('src/services/database/syncAuthorisation.ts');
+  const sqlite2=await two.load('src/services/database/db.ts').getDatabase();
+  const known=await pa.knownAudience(sqlite2,'owner');
+  for(const q of queued){
+   // Stamped by the REAL uploader's own function, with the sentinel it is handed.
+   const doc=auth.authorisedPayload(JSON.parse(q.payload),{ownerId:'fb_owner',visibleTo:['fb_owner']},{seconds:1,nanoseconds:2});
+   assert.deepEqual(plain(await pull.applyDocument(sqlite2,q.table_name,q.record_id,doc,known,{path:'users/owner/'+q.table_name+'/'+q.record_id})),
+    {status:'written',id:q.record_id},
+    'a document the app really sends was refused by the device that receives it: '+q.table_name);
+  }
+
+  // ── AND THE ROW IS REALLY THERE, THROUGH THE APP'S OWN QUERIES ─────────────────────
+  // Read out rather than counted: a row that INSERTs and then reads as deleted, or with
+  // the money in the wrong unit, would satisfy a bare existence check.
+  const cashRows=await two.load('src/services/database/cashbookDb.ts').getCashEntriesByUserId('owner');
+  assert.equal(cashRows.length,1,'the pulled cash entry is not visible to the Cash Book');
+  assert.equal(cashRows[0].amount_paisa,250000,'integer paisa did not survive the round trip');
+  const khataRows=await two.load('src/services/database/transactionDb.ts').getTransactionsByUserId('owner');
+  assert.equal(khataRows.length,1,'the pulled khata entry is not visible to the Khata');
+  assert.equal(khataRows[0].amount_paisa,500000);
+  const idOf=table=>queued.find(q=>q.table_name===table).record_id;
+  assert.equal(two.one('SELECT amount FROM expenses WHERE id=?',idOf('expenses')).amount,12345);
+  assert.ok(two.one('SELECT id FROM reminders WHERE id=?',idOf('reminders')),'the pulled reminder is not there');
+  // The timestamps landed in the columns that are NOT NULL, in the spelling each table uses.
+  for(const [table,column] of [['cashbook','createdAt'],['transactions','createdAt'],['expenses','created_at'],['reminders','created_at']])
+   assert.ok(two.one('SELECT '+column+' v FROM '+table+' WHERE id=?',idOf(table)).v,
+    table+'.'+column+' is empty on the receiving phone');
+  // Pulling queues nothing: the second phone must not send the first its own rows back.
+  assert.equal(two.one('SELECT COUNT(*) c FROM sync_queue').c,0,'applying a pulled document queued an upload');
+
+  // ── ONE BUILDER, NOT TWO ───────────────────────────────────────────────────────────
+  // The backfill kept its own copy of the strip list. A live document and a backfilled one
+  // face the same pull, so a difference between them only shows for rows written after a
+  // backfill — which is exactly where this hid.
+  const backfill=read('src/services/database/syncBackfill.ts');
+  assert.ok(/outgoingPayload\(/.test(backfill),'the backfill does not use the shared payload builder');
+  assert.ok(!/LOCAL_BOOKKEEPING\s*=/.test(backfill),'the backfill keeps its own copy of the strip list, free to drift from the live one');
+  assert.ok(/outgoingPayload\(tableName, written\)/.test(read('src/services/database/syncHelpers.ts')),
+   'the queue payload is not built from the row as written, which is the whole fix');
+ }finally{one.dispose();two.dispose();}
+});
 /**
  * ONE CHECK AT A TIME: `ONLY=162 node tests/regression.test.cjs`, or `ONLY=159,160`.
  *

@@ -1,6 +1,6 @@
 import type { SQLiteDatabase } from 'expo-sqlite';
 import { withWriteTransaction } from './writeTransaction';
-import { syncPayloadFor, afterSyncedWrite } from './syncHelpers';
+import { outgoingPayload, afterSyncedWrite } from './syncHelpers';
 import { SYNC_PATHS, pathForRow, authorLocalIdForRow, leafCollectionOf, tableForLeafCollection } from './syncPaths';
 
 /**
@@ -31,7 +31,7 @@ import { SYNC_PATHS, pathForRow, authorLocalIdForRow, leafCollectionOf, tableFor
  *   4. SOFT-DELETED ROWS INCLUDED. `entry_audit` references entry ids, so skipping deleted
  *      entries would leave the Activity Log on a second device showing history for rows that
  *      are not there. Correctness over volume (owner, 2026-10-11).
- *   5. PAYLOADS THROUGH `syncPayloadFor`, exactly as a live write does, or the first backfill
+ *   5. PAYLOADS THROUGH `outgoingPayload`, the SAME builder a live write uses, or the first backfill
  *      would ship every customer's CNIC.
  *   6. ROWS THE LIVE PATH HAS ALREADY QUEUED ARE SKIPPED, so running this does not double the
  *      queue for anything written since the last run.
@@ -41,9 +41,6 @@ import { SYNC_PATHS, pathForRow, authorLocalIdForRow, leafCollectionOf, tableFor
  * a rowid cursor silently skip or repeat rows. Lexicographic id order is not creation order,
  * but it is total and it does not move.
  */
-
-/** Columns that exist to track the local row and have no place in a document. */
-const LOCAL_BOOKKEEPING = ['synced', 'firestore_path'] as const;
 
 export type TablePlan = {
   table: string;
@@ -149,9 +146,9 @@ const verdictFor = async (
   const path = stored ?? await pathForRow(db, table, row);
   if (!path) return { kind: 'noPath' };
 
-  const payload = { ...syncPayloadFor(table, row) };
-  for (const column of LOCAL_BOOKKEEPING) delete payload[column];
-  return { kind: 'enqueue', path, payload };
+  // THE SAME BUILDER A LIVE WRITE USES. Two copies of this were free to drift, and the
+  // shape a backfilled document has is the shape pull is judged against.
+  return { kind: 'enqueue', path, payload: outgoingPayload(table, row) };
 };
 
 /** Tables that carry no `firestore_path` column, so the SQL below must not name it. */
