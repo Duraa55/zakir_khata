@@ -812,7 +812,11 @@ their own, enforced in the data layer not by hiding buttons).
 >   firestore:rules` then `--only firestore:indexes`. Read the publish timestamp in the
 >   version history afterwards — a green Playground proves the EDITOR, never what is live.
 >
-> **PULL, P2 — BUILT 2026-10-13, DEVICE-UNVERIFIED.** `firebase/firebasePull.ts`
+> **PULL, P2 — BUILT 2026-10-13, AND IT RAN ON TWO DEVICES THE SAME DAY (owner).** The
+> first real run was `applied=10, dropped=2`; after the payload fix below, device 2 holds
+> everything device 1 wrote. This is the first time a second phone has shown this business's
+> books. What is confirmed is the RE-UPLOAD path (the backfill, which never had the payload
+> bug) end to end: query, rules, indexes, team bootstrap, audience filter, cursor and apply. `firebase/firebasePull.ts`
 > (`pullRemoteChanges`, `planPull`) with its local half in `database/pullApply.ts` and the
 > cursor store in `database/pullCursor.ts`. Check 162, mutation-tested. `pullSyncService.ts`
 > is DELETED — it imported a non-existent export, queried the wrong paths, and interpolated
@@ -899,6 +903,10 @@ their own, enforced in the data layer not by hiding buttons).
 >   list, and it was made to fail twice on purpose: once with the payload rebuilt from
 >   `data` (reproducing `createdAt, updatedAt` exactly), once with pull dropping `createdAt`
 >   (proving the device-2 round trip bites on its own).
+> - **STILL UNCONFIRMED ON A DEVICE: THE LIVE-WRITE CASE ITSELF.** The owner's successful run
+>   was the RE-UPLOAD, and the backfill never had this bug. What proves the fix is an entry
+>   created on device 1 AFTER this build and then pulled — check 163 proves it in the harness,
+>   the device has not. Do not mark this device-verified until that is watched by hand.
 > - **NOT BUILT, AND DELIBERATELY: a cursor reset.** Pull advances over dropped documents by
 >   design, so the two stranded documents could not return on their own — but re-uploading
 >   from device 1 gives them a fresh `syncedAt`, after the cursor, so they arrive on the next
@@ -1005,10 +1013,14 @@ their own, enforced in the data layer not by hiding buttons).
   not a password. Someone who stays logged in for months therefore never starts syncing, and
   nothing tells them. Deferred by the owner on 2026-10-07; no sign-out, no account, writes
   simply queue meanwhile.
-- **Sync is the biggest piece and it's broken.** Push-only. `pullSyncService` imports a
-  non-existent export and is never called; other pull functions query top-level collections
-  while writes go to `users/{uid}/…`, so they always return `[]`. Two owners in two countries
-  would have two isolated ledgers.
+- **Sync is no longer push-only (2026-10-13).** Pull runs on two devices and the owner has
+  seen device 1's books on device 2. `pullSyncService` — the one that imported a non-existent
+  export and queried top-level collections — is DELETED. **It is still a `__DEV__` BUTTON and
+  nothing else:** no automatic trigger, no schedule, no pull on login or on focus. The owner
+  wants to watch it by hand before it runs on its own, and `useSyncStore.pullRemoteChanges`
+  deliberately has no screen caller. The two-location requirement is still NOT met — see the
+  staff-device uid step above, which is what makes a Dubai staff member's books reach the
+  Khuzdar owner.
 - **SECURITY — check before any real client build.** There is NO `firestore.rules` file and
   NO Firebase Auth. Every write is an unauthenticated `setDoc`. The API key ships in the APK.
   If the rules are open, anyone with that key can read/write every business's data.
