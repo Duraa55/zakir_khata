@@ -148,6 +148,27 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
                   + ' ' + team.outcomes.map(o => o.status).join(',')
                   + (team.unresolved.length ? ' unresolved=' + team.unresolved.map(u => u.localId + ':' + u.reason).join(',') : '')
                 : ''));
+
+            // ── AND THEN PULL, ONCE (owner, 2026-10-13, after watching it work by hand) ──
+            // Still a side-effect of a login that already succeeded: this whole chain is
+            // `void`, so nothing here can delay or fail a login. Offline it is never
+            // reached at all — ensureFirebaseAccount does not reach 'signed-in' — so there
+            // is no new cost on the slow offline path CLAUDE.md measures at ~3s.
+            //
+            // THROUGH THE STORE, NOT `pullRemoteChanges` DIRECTLY. The store action carries
+            // the `isSyncing` guard, so this cannot run on top of a push or a second pull,
+            // and it is what feeds the Sync Centre its kept-out count and blocked state. A
+            // pull whose result nobody can see is what those counters exist to prevent.
+            //
+            // ONCE PER LOGIN, AND STRUCTURALLY SO: this is the only automatic call site in
+            // the app. No timer, no interval, no pull on focus or on app resume. If one is
+            // ever wanted it is a decision to take deliberately — check 164 fails if a
+            // third caller appears.
+            //
+            // Imported here rather than at the top of the file: syncHelpers already reaches
+            // the store, and a static import from authStore closes that loop.
+            const { useSyncStore } = await import('./useSyncStore');
+            await useSyncStore.getState().pullRemoteChanges(account.id);
           }
           // Only divergence is surfaced: every other failure is transient and retried at
           // the next login, so nagging about it would be noise.

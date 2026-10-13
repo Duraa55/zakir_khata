@@ -7049,6 +7049,61 @@ check(163,'PUSH: THE QUEUED PAYLOAD IS THE ROW AS WRITTEN, so a live document ca
    'the queue payload is not built from the row as written, which is the whole fix');
  }finally{one.dispose();two.dispose();}
 });
+check(164,'PULL RUNS ITSELF AFTER A LOGIN, ONCE — as a side-effect of a login that already succeeded, never a precondition: it sits inside the SAME un-awaited chain as the Firebase account step, it goes through the store so the isSyncing guard and the Sync Centre counters apply, and it is the ONLY automatic trigger in the app (no timer, no focus, no app-resume), with the dev button still there beside it',at('src/store/authStore.ts','pullRemoteChanges'),async()=>{
+ // Source-text only: authStore reaches the Firebase packages, which the harness cannot load.
+ const auth=read('src/store/authStore.ts');
+
+ // ── IT CANNOT BLOCK OR SLOW A LOGIN ────────────────────────────────────────────────
+ // The whole side-effect chain is void-ed and the pull lives inside it. If the pull were
+ // awaited by login itself, a hanging network call would hold the user out of their own
+ // books — the one thing this chain exists to prevent.
+ assert.ok(/void ensureFirebaseAccount\(/.test(auth),
+  'the login side-effect chain is no longer fire-and-forget, so a slow network now delays getting into the app');
+ assert.ok(!/await ensureFirebaseAccount\(/.test(auth),'the Firebase account step is awaited by login');
+ const chain=auth.indexOf('void ensureFirebaseAccount(');
+ const pull=auth.indexOf('pullRemoteChanges(account.id)');
+ assert.ok(pull>chain,'the pull is not inside the un-awaited login side-effect chain');
+ assert.ok(!/\.catch\(/.test(auth.slice(chain,pull))||/\.catch\(/.test(auth.slice(pull)),
+  'the chain no longer catches after the pull, so a pull failure would surface as an unhandled rejection');
+ assert.ok(/\.catch\(/.test(auth.slice(pull)),'nothing catches a throw from the pull');
+
+ // ── ORDER: IDENTITY, PROFILE, TEAM, THEN PULL ──────────────────────────────────────
+ // The audience filter needs the team, and a cursor that advances past a dropped document
+ // is not recoverable. Pull gates on this itself, but running it out of order here would
+ // mean every login pays for a bootstrap that is then redone.
+ const team=auth.indexOf('bootstrapTeamFromCloud(account.id)');
+ assert.ok(team>=0&&team<pull,'pull runs before the team bootstrap in the login chain');
+ assert.ok(auth.indexOf('publishAccountProfile(account.id)')<team,'the profile is published after the team bootstrap');
+
+ // ── THROUGH THE STORE, WHICH IS WHERE THE GUARD AND THE COUNTERS LIVE ──────────────
+ assert.ok(/useSyncStore\.getState\(\)\.pullRemoteChanges\(account\.id\)/.test(auth),
+  'the login calls the raw pull instead of the store action, so it bypasses the isSyncing guard and the Sync Centre never sees the result');
+ assert.ok(!/from '\.\.\/services\/firebase\/firebasePull'/.test(auth),
+  'authStore imports firebasePull directly; the store action is the one call path');
+ const store=read('src/store/useSyncStore.ts');
+ assert.ok(/if \(get\(\)\.isSyncing\) return;/.test(store.slice(store.indexOf('pullRemoteChanges: async'))),
+  'the store action no longer refuses to run on top of another sync, so a login pull could race the dev button');
+
+ // ── ONCE PER LOGIN, AND NOTHING ELSE STARTS ONE ────────────────────────────────────
+ // The owner asked for exactly one automatic trigger. A timer or a focus hook would make
+ // pull run on a schedule nobody chose, each run moving cursors.
+ for(const banned of ['setInterval','setTimeout'])
+  assert.ok(!new RegExp(banned+'[^;]{0,200}pullRemoteChanges').test(auth),
+   'the login schedules a pull with '+banned+'; it must run once, not on a timer');
+ // Every caller of the store action, anywhere in the app. Two: this one, and the dev button.
+ const callers=sourceFiles()
+  .filter(f=>/[\\/]src[\\/]/.test(f)&&!/useSyncStore\.ts$|sync\.types\.ts$|firebasePull\.ts$/.test(f))
+  .filter(f=>/pullRemoteChanges/.test(fs.readFileSync(f,'utf8')))
+  .map(f=>f.split(/[\\/]/).slice(-2).join('/'));
+ assert.deepEqual(sorted(callers),['staff/SettingsScreen.tsx','store/authStore.ts'],
+  'pull has gained or lost a trigger. It is meant to run automatically in exactly ONE place — the login side-effect — with the __DEV__ button as the only manual one. A pull on focus or on app resume moves cursors on a schedule nobody chose: '+sorted(callers).join(', '));
+
+ // ── THE DEV BUTTON SURVIVES, WITH ITS DRY RUN ──────────────────────────────────────
+ const settings=read('src/screens/staff/SettingsScreen.tsx');
+ assert.ok(/syncDevPull/.test(settings),'the dev download button is gone');
+ assert.ok(/planPull\(/.test(settings),'the dev button lost its dry run, so the size of a download is no longer seen before it happens');
+ assert.ok(/__DEV__ &&/.test(settings.slice(0,settings.indexOf('syncDevPull'))),'the download button is no longer behind __DEV__');
+});
 /**
  * ONE CHECK AT A TIME: `ONLY=162 node tests/regression.test.cjs`, or `ONLY=159,160`.
  *

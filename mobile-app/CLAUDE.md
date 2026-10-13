@@ -343,7 +343,7 @@ scoping.
 
 8. **No new `console.log`**; gate debug behind `__DEV__`. Never log CNIC or phone numbers.
 
-9. **Keep all three suites green:** `tests/regression.test.cjs` (163 checks, all passing),
+9. **Keep all three suites green:** `tests/regression.test.cjs` (164 checks, all passing),
    `tests/entryAudit.test.cjs` (18), the i18n suite (8). Run them after every change.
    These counts were stale for a long time (123 / 17); they are the TOTAL lines each suite
    prints, so correct them rather than trusting a number in this file.
@@ -1015,10 +1015,16 @@ their own, enforced in the data layer not by hiding buttons).
   simply queue meanwhile.
 - **Sync is no longer push-only (2026-10-13).** Pull runs on two devices and the owner has
   seen device 1's books on device 2. `pullSyncService` — the one that imported a non-existent
-  export and queried top-level collections — is DELETED. **It is still a `__DEV__` BUTTON and
-  nothing else:** no automatic trigger, no schedule, no pull on login or on focus. The owner
-  wants to watch it by hand before it runs on its own, and `useSyncStore.pullRemoteChanges`
-  deliberately has no screen caller. The two-location requirement is still NOT met — see the
+  export and queried top-level collections — is DELETED. **IT RUNS ITSELF AFTER A LOGIN, ONCE
+  (owner, 2026-10-13, after watching it work by hand).** It sits at the end of the SAME
+  un-awaited side-effect chain as the Firebase account step in `authStore.login` — identity,
+  profile, team, then pull — so nothing it does can delay or fail a login, and offline it is
+  never reached at all, because `ensureFirebaseAccount` does not reach 'signed-in'. It goes
+  through `useSyncStore.pullRemoteChanges`, NOT the raw export, for the `isSyncing` guard
+  (so it cannot race a push or the dev button) and for the Sync Centre's kept-out and
+  blocked state. The `__DEV__` button stays, with its dry run. **NO TIMER, NO FOCUS HOOK, NO
+  APP-RESUME HOOK** — exactly two call sites in the app, and check 164 fails if a third
+  appears, if the chain is ever awaited, or if a pull is put on a timer. The two-location requirement is still NOT met — see the
   staff-device uid step above, which is what makes a Dubai staff member's books reach the
   Khuzdar owner.
 - **SECURITY — check before any real client build.** There is NO `firestore.rules` file and
