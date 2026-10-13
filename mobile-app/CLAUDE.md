@@ -206,7 +206,70 @@ scoping.
 > raw SQL that bypassed `createUser` — and so bypassed the password strength rule that
 > account would have failed — in every build, surviving every wipe because its id was
 > hardcoded. v45 soft-deletes the row on devices that already have it. **The seed creates
-> ONE admin**: `03000000000` / `Admin@12345`, stored as `+923000000000`.
+> ONE admin**, and that held until 2026-10-13.
+>
+> **TWO SEEDED ADMINS SINCE 2026-10-13 (owner), WHICH REVERSES THE RULE ABOVE.**
+>
+> | | phone | password | business |
+> |---|---|---|---|
+> | Zakir | `03368542509` → `+923368542509` | `Zakir@123` | Al Reef |
+> | Waseem | `03337334333` → `+923337334333` | `Wasi@123` | Al Reef |
+>
+> `SEEDED_ADMINS` in `seedData.ts` is the list; `ZAKIR_SEED_*` and `WASEEM_SEED_*` are the
+> per-account constants, and the regression suite reads them out of the source rather than
+> copying the literals, so the two cannot drift. `ADMIN_SEED_PHONE`/`NAME`/`PASSWORD` are
+> kept as aliases for the FIRST admin so callers meaning "the bootstrap account" still read.
+>
+> **WHAT IS ACCEPTED BY REVERSING IT.** The 2026-10-07 rule existed because `seedTestUsers`
+> shipped a second admin with a known password in every build. That hazard is unchanged:
+> **both passwords ship in the APK**, so both are defaults to be changed on first login
+> (Settings -> Change password, which needs to be online). What is different is that these
+> go through `createUser` — so the strength rule and `assertConsistentLevel` apply, and no
+> id is hardcoded, so a wipe does not resurrect them.
+>
+> **TWO ADMINS ARE TWO ISOLATED USERS, NOT CO-OWNERS.** `parentId` is null on both, so by
+> rule 1 they share nothing: not books, not stock, not customers, not staff, not reports.
+> Neither appears in the other's Staff Book, `entryOwner` refuses the sideways read, and
+> pull carries nothing between them because the audience filter is built from the viewer's
+> own tree. **Sharing one business between two accounts is FUTURE WORK** and needs its own
+> design — do not approximate it by giving one a `parentId`, which `assertConsistentLevel`
+> refuses outright ("An admin account cannot have a parent"). Check 168 pins all of it,
+> including the invisibility of one admin's rows to the other through the books' OWN queries.
+>
+> **EXISTING INSTALLS KEEP THEIR CURRENT ACCOUNT.** The guard is per phone, so a device that
+> already has `Admin` / `03000000000` keeps it, with its data and its old password —
+> nothing is migrated, by decision. But the seed WILL also create Zakir and Waseem there,
+> because neither phone is present: an upgraded device ends up with THREE admin accounts,
+> two of them empty. That is the accepted consequence of seeding by phone; the old account
+> is the one holding the books.
+>
+> **THE SEED IDENTITY LIVES IN ONE PLACE: `ADMIN_SEED_NAME`, `ADMIN_SEED_PHONE` and
+> `ADMIN_SEED_PASSWORD` in `seedData.ts`**, beside
+> `ADMIN_SEED_PHONE`. It was a literal there and in NINE assertions across the regression
+> suite; the suite now reads the constant out of the source, and fails at load if it stops
+> being a literal. Do not copy the value anywhere else — the line above and the one in
+> TESTING.md are the only places it is written down.
+>
+> **CHANGING IT ONLY AFFECTS A FRESH INSTALL, and that is the part worth knowing.**
+> `seedDatabase` creates the admin only when no row holds the phone, so a device that
+> already has one keeps the password it was created with for ever — and so does that
+> account's Firebase credential, which is the copy both phones share. An existing install
+> is moved with **Settings -> Change password**, which requires being ONLINE
+> (`changeOwnPassword` refuses offline and moves Firebase first, so a refusal leaves
+> nothing changed anywhere). Editing the constant and shipping a build does NOT rotate a
+> password already out there.
+>
+> **THE NAME IS IN THE SAME BOAT.** `ADMIN_SEED_NAME` is the display name on the seeded
+> account — Settings, and the `user_name` stamped on every entry it authors. An install
+> that already has the admin keeps the name it was created with ('Admin' on anything seeded
+> before 2026-10-13); renaming the constant does not rename an existing row. There is no
+> screen to rename an account today, so a device wanting the new name has to be wiped.
+>
+> **The home screen prefers the BUSINESS name.** `AdminDashboard` renders
+> `user?.businessName || user?.name`. The old seed passed no businessName at all — the
+> `'admin'` in that call sits in the ACCOUNT LEVEL position, not the business one — so the
+> hero fell through to the account name. Both seeded admins now carry `businessName:
+> 'Al Reef'`, which is what the hero and every bill PDF show.
 >
 > **Guard a migration on the COLUMN, not the table.** `PRAGMA table_info` returns `[]` for a
 > missing table, so one check covers both. v45's first version read `users.phone`
@@ -343,7 +406,7 @@ scoping.
 
 8. **No new `console.log`**; gate debug behind `__DEV__`. Never log CNIC or phone numbers.
 
-9. **Keep all three suites green:** `tests/regression.test.cjs` (167 checks, all passing),
+9. **Keep all three suites green:** `tests/regression.test.cjs` (168 checks, all passing),
    `tests/entryAudit.test.cjs` (18), the i18n suite (8). Run them after every change.
    These counts were stale for a long time (123 / 17); they are the TOTAL lines each suite
    prints, so correct them rather than trusting a number in this file.

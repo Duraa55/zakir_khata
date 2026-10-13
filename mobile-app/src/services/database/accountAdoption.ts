@@ -1,7 +1,7 @@
 import type { SQLiteDatabase } from 'expo-sqlite';
 import { SYNC_PATHS } from './syncPaths';
 import { hashPassword, normalisePhone } from './userDb';
-import { ADMIN_SEED_PHONE } from './seedData';
+import { isSeededAdminPhone } from './seedData';
 
 /**
  * MAKING THIS DEVICE THE ACCOUNT A CLOUD PROFILE DESCRIBES — the local half.
@@ -84,7 +84,10 @@ export const mayBeAdoptable = async (
   localUserId: string,
   e164Phone: string
 ): Promise<boolean> => {
-  if (e164Phone !== normalisePhone(ADMIN_SEED_PHONE)) return false;
+  // EVERY seeded phone, not just the first. This compared against one constant, so a
+  // second seeded admin would never have been adoptable and their second device would have
+  // landed in a brand-new empty account — the exact failure adoption exists to prevent.
+  if (!isSeededAdminPhone(e164Phone)) return false;
   const row = await db.getFirstAsync<{ role: string; adopted_at: string | null }>(
     'SELECT role, adopted_at FROM users WHERE id = ? AND is_deleted = 0', [localUserId]
   );

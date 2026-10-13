@@ -37,6 +37,22 @@ const only=(totals,label='total')=>{
 const sorted=x=>[...x].sort();
 const ids=rows=>sorted(rows.map(r=>r.id));
 const date='2026-09-08';
+// The seeded accounts, taken from the application constants rather than copied into the
+// assertions. They used to be literals in every one, so changing one meant a sweep across
+// the suite — the kind that gets half done. Reading the source means the suite cannot
+// drift from what actually ships, and fails at LOAD if a constant stops being a literal.
+const seedSource=read('src/services/database/seedData.ts');
+const seedConst=name=>{
+ const hit=new RegExp(name+"\\s*=\\s*'([^']+)'").exec(seedSource);
+ assert.ok(hit,'seedData.ts no longer exports '+name+' as a literal, so the suite cannot know it');
+ return hit[1];
+};
+const ZAKIR={name:seedConst('ZAKIR_SEED_NAME'),phone:seedConst('ZAKIR_SEED_PHONE'),password:seedConst('ZAKIR_SEED_PASSWORD')};
+const WASEEM={name:seedConst('WASEEM_SEED_NAME'),phone:seedConst('WASEEM_SEED_PHONE'),password:seedConst('WASEEM_SEED_PASSWORD')};
+// What the old single-admin assertions meant by "the seeded admin": the first one.
+const ADMIN_SEED_PASSWORD=ZAKIR.password;
+assert.notEqual(ZAKIR.phone,WASEEM.phone,'the two seeded admins share a phone, which is the login username and UNIQUE on users.phone');
+assert.notEqual(ZAKIR.password,WASEEM.password,'the two seeded admins share a password');
 function seedPeople(h){
  // account_level mirrors what the v32 backfill derives from parentId depth; every
  // real row has one after v32, so fixtures must too.
@@ -4178,12 +4194,20 @@ check(125,'nothing a person can see still says DigiKhata or Zakir: the dictionar
  // allowance — they were renamed to com.alreef.app on 2026-10-03, before the client
  // installed anything, and are pinned below so the old name cannot return there.
  const ALLOWED=/^\s*(slug|projectId)\b|"(slug|projectId)"\s*:/;
- const BRAND=/digi\s*[-_]?\s*khata|zakir/i;
+ // THE OLD PRODUCT NAME was 'Zakir Khata'. The ban is on the BRAND, and the owner's own
+ // first name is not the brand — the seeded admin is called Zakir, and refusing that would
+ // be the guard mistaking a person for a product (owner, 2026-10-13). So the bare word is
+ // allowed in seedData.ts ONLY, and 'Zakir Khata' / 'ZakirKhata' stay banned everywhere,
+ // that file included: the PAIR is what names the retired product.
+ const BRAND=/digi\s*[-_]?\s*khata|zakir\s*[-_]?\s*khata/i;
+ const BARE_ZAKIR=/zakir/i;
  const offenders=[];
  for(const rel of SURFACES){
   const text=read(rel);
+  const bareAllowed=rel==='src/services/database/seedData.ts';
   text.split('\n').forEach((line,i)=>{
-   if(!BRAND.test(line))return;
+   const hit=BRAND.test(line)||(!bareAllowed&&BARE_ZAKIR.test(line));
+   if(!hit)return;
    if(ALLOWED.test(line))return;
    offenders.push(rel+':'+(i+1)+'  '+line.trim().slice(0,90));
   });
@@ -5235,8 +5259,19 @@ check(141,'v45 upgrades an EXISTING database to E.164 instead of crashing it: st
  const seed=h.load('src/services/database/seedData.ts');
  assert.equal(seed.seedTestUsers,undefined,'seedTestUsers is back — it ships a weak admin and survives every wipe');
  const before=h.one('SELECT COUNT(*) AS n FROM users').n;
+ const held=p=>h.one('SELECT COUNT(*) AS n FROM users WHERE phone=?',udb.normalisePhone(p)).n;
+ // The seed owns two NEW phones since 2026-10-13, so it legitimately adds the ones this
+ // fixture does not already hold. What must never happen is a SECOND row on a number that
+ // is already taken — that is the UNIQUE constraint crash this check exists for.
+ const missing=seed.SEEDED_ADMINS.filter(a=>held(a.phone)===0).length;
  await seed.seedDatabase();
- assert.equal(h.one('SELECT COUNT(*) AS n FROM users').n,before,'seedDatabase re-seeded over an existing admin — this is the UNIQUE constraint crash');
+ assert.equal(h.one('SELECT COUNT(*) AS n FROM users').n,before+missing,'seedDatabase did not add exactly the seeded admins this device was missing');
+ assert.equal(held('03000000000'),1,'seedDatabase re-seeded over an existing admin — this is the UNIQUE constraint crash');
+ for(const a of seed.SEEDED_ADMINS)
+  assert.equal(held(a.phone),1,'a seeded admin has two rows on one UNIQUE phone: '+a.name);
+ // And running it again is a no-op, which is the normal case: it runs at every launch.
+ await seed.seedDatabase();
+ assert.equal(h.one('SELECT COUNT(*) AS n FROM users').n,before+missing,'a second seeding pass created more rows');
 },44));
 
 check(142,'v45 refuses to merge two accounts that normalise to the same number, and does not abort the chain doing it',at(dbPath,'is already taken'),()=>isolated(async h=>{
@@ -5292,7 +5327,7 @@ check(143,'v46 adds users.firebase_uid as the local-id-to-Firebase-uid MAPPING: 
 check(144,'startup seeding can never leave the app unreachable: a SOFT-DELETED row holding the bootstrap number is revived rather than silently skipped, a live admin is left exactly as it is, and the password is never reset',at('src/services/database/seedData.ts','was soft-deleted'),()=>isolated(async h=>{
  const udb=users(h);
  const seed=h.load('src/services/database/seedData.ts');
- const hash=await udb.hashPassword('Admin@12345');
+ const hash=await udb.hashPassword(ADMIN_SEED_PASSWORD);
  const phone=udb.normalisePhone(seed.ADMIN_SEED_PHONE);
 
  // ── The lockout: the bootstrap number is held by a REMOVED row ───────────────
@@ -5300,18 +5335,21 @@ check(144,'startup seeding can never leave the app unreachable: a SOFT-DELETED r
  // It cannot be repaired by creating a second row either: users.phone is UNIQUE.
  h.sqlite.prepare('INSERT INTO users (id,name,phone,passwordHash,role,account_level,is_deleted,createdAt,updatedAt) VALUES (?,?,?,?,?,?,1,?,?)')
   .run('u_removed','Admin',phone,hash,'admin','admin',date,date);
- assert.equal(await udb.verifyUserLogin(seed.ADMIN_SEED_PHONE,'Admin@12345'),null,'fixture: locked out to begin with');
+ assert.equal(await udb.verifyUserLogin(seed.ADMIN_SEED_PHONE,ADMIN_SEED_PASSWORD),null,'fixture: locked out to begin with');
 
  await seed.seedDatabase();
- assert.equal(h.one('SELECT COUNT(*) AS n FROM users').n,1,'a second row was created on a UNIQUE phone');
+ // Scoped to THIS phone: the seed now creates two admins, so a table-wide count would
+ // say nothing about whether the revived row was duplicated.
+ assert.equal(h.one('SELECT COUNT(*) AS n FROM users WHERE phone=?',phone).n,1,'a second row was created on a UNIQUE phone');
+ assert.equal(h.one('SELECT COUNT(*) AS n FROM users').n,2,'the seed no longer creates exactly the two admins it declares');
  const revived=h.one('SELECT is_deleted, deleted_at, role, passwordHash FROM users WHERE id=?','u_removed');
  assert.equal(revived.is_deleted,0,'the only account holding the bootstrap number is still removed — the app is unreachable');
  assert.equal(revived.deleted_at,null,'a revived account must not keep a removal date');
  assert.equal(revived.role,'admin','the bootstrap account must come back as an admin');
  assert.equal(revived.passwordHash,hash,'seeding must never reset an existing password');
- assert.ok(await udb.verifyUserLogin(seed.ADMIN_SEED_PHONE,'Admin@12345'),'still cannot log in after seeding');
+ assert.ok(await udb.verifyUserLogin(seed.ADMIN_SEED_PHONE,ADMIN_SEED_PASSWORD),'still cannot log in after seeding');
  // Typing it either way works, since both normalise to the stored spelling.
- assert.ok(await udb.verifyUserLogin(phone,'Admin@12345'),'the E.164 spelling must resolve too');
+ assert.ok(await udb.verifyUserLogin(phone,ADMIN_SEED_PASSWORD),'the E.164 spelling must resolve too');
 
  // ── A LIVE admin is left completely alone ────────────────────────────────────
  const before=plain(h.all('SELECT * FROM users ORDER BY id'));
@@ -5353,7 +5391,7 @@ check(145,'EVERY accepted spelling of one number resolves to the SAME account: t
 
 check(146,'v47 repairs a phone that v45 normalised with the broken rule, and is narrow enough that it cannot touch a real number',at(dbPath,'MIS_NORMALISED'),()=>isolated(async h=>{
  const udb=users(h);
- const hash=await udb.hashPassword('Admin@12345');
+ const hash=await udb.hashPassword(ADMIN_SEED_PASSWORD);
  // '+' plus exactly 10 digits is not valid E.164 for any currency this app supports
  // (PK 12 digits, AE 12, US 11, CN 13), so it can only be the old bug's output.
  h.sqlite.prepare('INSERT INTO users (id,name,phone,passwordHash,role,account_level,createdAt,updatedAt) VALUES (?,?,?,?,?,?,?,?)')
@@ -5372,7 +5410,7 @@ check(146,'v47 repairs a phone that v45 normalised with the broken rule, and is 
  for(const [id,phone] of Object.entries(untouched))
   assert.equal(h.one('SELECT phone FROM users WHERE id=?',id).phone,phone,'v47 rewrote a REAL number: '+id);
  // And the account is reachable the way a Pakistani writes it.
- assert.ok(await h.load('src/services/database/userDb.ts').verifyUserLogin('03000000000','Admin@12345'),'still locked out after the repair');
+ assert.ok(await h.load('src/services/database/userDb.ts').verifyUserLogin('03000000000',ADMIN_SEED_PASSWORD),'still locked out after the repair');
 },46));
 
 check(147,'Firebase Auth is a SIDE-EFFECT of a login that already succeeded: it is never awaited, never throws, is tried only after the local password was accepted, signs in BEFORE creating so email-enumeration protection cannot stop it creating anyone, and records the uid by direct SQL so no user row can ever sync',at('src/services/firebase/firebaseAuth.ts','ensureFirebaseAccount'),()=>isolated(async h=>{
@@ -6183,7 +6221,7 @@ check(158,'HOW A SECOND DEVICE BECOMES THE SAME PERSON: one identity document pe
   account_level:'admin',businessName:'AL-REEF',businessType:null,area:'Khuzdar',pictureUrl:null,
   parentId:null,default_currency:'PKR',createdAt:'2026-01-01T00:00:00.000Z',...over});
  const userRow=id=>h.one('SELECT id,name,role,phone,passwordHash FROM users WHERE id=?',id);
- const apply=()=>ad.applyCloudProfile(sqlite,profile(),'03000000000','Secret@123');
+ const apply=()=>ad.applyCloudProfile(sqlite,profile(),ZAKIR.phone,'Secret@123');
 
  // ── NO LOCAL ROW: built from the profile, with the SHARED id ──────────────────────────
  const made=await apply();
@@ -6194,8 +6232,8 @@ check(158,'HOW A SECOND DEVICE BECOMES THE SAME PERSON: one identity document pe
  assert.equal(built.phone,seedPhone,'the phone was not stored in the one canonical spelling login looks it up in');
  // The hash is DERIVED HERE from the password just proved against Firebase; it never travels.
  assert.ok(built.passwordHash,'a row with no hash can never log in again');
- assert.ok(await udb.verifyUserLogin('03000000000','Secret@123'),'the materialised account cannot log in with the password it was built from');
- assert.equal(await udb.verifyUserLogin('03000000000','WrongOne@1'),null,'any password opens the materialised account');
+ assert.ok(await udb.verifyUserLogin(ZAKIR.phone,'Secret@123'),'the materialised account cannot log in with the password it was built from');
+ assert.equal(await udb.verifyUserLogin(ZAKIR.phone,'WrongOne@1'),null,'any password opens the materialised account');
 
  // Idempotent: logging in again on the same device changes nothing.
  assert.deepEqual(plain(await apply()),{status:'already',localId:'shared_id'});
@@ -6204,7 +6242,7 @@ check(158,'HOW A SECOND DEVICE BECOMES THE SAME PERSON: one identity document pe
  // ── THE SEEDED ADMIN, adopted only while untouched ───────────────────────────────────
  const seeded=async()=>{
   h.sqlite.prepare('DELETE FROM users WHERE phone=?').run(seedPhone);
-  await udb.createUser('Admin','03000000000','Admin@12345','admin','admin');
+  await udb.createUser(ZAKIR.name,ZAKIR.phone,ADMIN_SEED_PASSWORD,'admin','admin');
   return h.one('SELECT id FROM users WHERE phone=?',seedPhone).id;
  };
  let seedId=await seeded();
@@ -6215,8 +6253,8 @@ check(158,'HOW A SECOND DEVICE BECOMES THE SAME PERSON: one identity document pe
  assert.equal(userRow(seedId),undefined,'the old seed id survived, so two rows now hold one number');
  assert.equal(userRow('shared_id').name,'Owner','the adopted row kept the seed identity instead of the cloud one');
  // The password that now opens it is the CLOUD one, not the seed default.
- assert.ok(await udb.verifyUserLogin('03000000000','Secret@123'));
- assert.equal(await udb.verifyUserLogin('03000000000','Admin@12345'),null,'the seed password still opens the adopted account');
+ assert.ok(await udb.verifyUserLogin(ZAKIR.phone,'Secret@123'));
+ assert.equal(await udb.verifyUserLogin(ZAKIR.phone,ADMIN_SEED_PASSWORD),null,'the seed password still opens the adopted account');
 
  // ── ONE AUTHORED ROW AND IT IS A REAL ACCOUNT ────────────────────────────────────────
  // Checked against the author columns SYNC_PATHS enumerates, never a list written out here:
@@ -6506,7 +6544,7 @@ check(160,'THE TEAM BOOTSTRAP, which must finish before pull moves a single curs
  assert.equal(made.name,'Dubai Manager');
  // NO CREDENTIAL TRAVELS, and none is invented. This device holds no password for that
  // person, so the row must be unable to answer a login however it is typed at.
- for(const typed of ['Admin@12345','Secret@123','','not-a-real-password',made.passwordHash])
+ for(const typed of [ADMIN_SEED_PASSWORD,'Secret@123','','not-a-real-password',made.passwordHash])
   assert.equal(await udb.verifyUserLogin(phone(0),typed),null,'a materialised team member logged in with '+JSON.stringify(typed));
 
  // Idempotent: every login runs this, and the second run must write nothing.
@@ -7244,6 +7282,85 @@ check(167,'MIGRATION v54: a row that reached the server stops saying "pending" i
  assert.deepEqual(plain(h.all('SELECT id,synced,syncStatus FROM cashbook ORDER BY id')),before);
  assert.equal(h.one('PRAGMA user_version').user_version,latest,'the chain did not finish');
 },53));
+check(168,'TWO SEEDED ADMINS, AND THEY ARE TWO SEPARATE BUSINESSES: both are created through createUser so both answer the strength rule, neither collides on the UNIQUE phone, each logs in to its OWN account with its OWN password, BOTH are adoptable on a second device — and a row written by one is invisible to the other in every book (owner, 2026-10-13, reversing the single-seed rule of 2026-10-07)',at('src/services/database/seedData.ts','SEEDED_ADMINS'),()=>isolated(async h=>{
+ const udb=users(h);
+ const seed=h.load('src/services/database/seedData.ts');
+ const ad=h.load('src/services/database/accountAdoption.ts');
+ const sqlite=await h.load('src/services/database/db.ts').getDatabase();
+
+ // boot() already ran the seed. Running it again must change nothing — it runs at EVERY
+ // launch, and the guard is per account, so a second pass is the normal case, not an edge.
+ await seed.seedDatabase();
+ await seed.seedDatabase();
+
+ assert.equal(seed.SEEDED_ADMINS.length,2,'the seed no longer declares exactly two admins');
+ assert.equal(h.one('SELECT COUNT(*) n FROM users').n,2,'the seed created something other than its two admins, or duplicated one');
+
+ // ── EACH ACCOUNT IS ITS OWN, AND THE PASSWORDS ARE NOT INTERCHANGEABLE ─────────────
+ const zakir=await udb.verifyUserLogin(ZAKIR.phone,ZAKIR.password);
+ const waseem=await udb.verifyUserLogin(WASEEM.phone,WASEEM.password);
+ assert.ok(zakir,'the first seeded admin cannot log in with the password that shipped');
+ assert.ok(waseem,'the second seeded admin cannot log in with the password that shipped');
+ assert.notEqual(zakir.id,waseem.id,'both seeded phones resolved to ONE row, so one account was silently lost');
+ assert.equal(await udb.verifyUserLogin(ZAKIR.phone,WASEEM.password),null,'one admin password opens the other account');
+ assert.equal(await udb.verifyUserLogin(WASEEM.phone,ZAKIR.password),null,'one admin password opens the other account');
+
+ // ── NEITHER IS UNDER THE OTHER. parentId null on both, or visibility would flow. ───
+ for(const row of [zakir,waseem]){
+  assert.equal(h.one('SELECT parentId FROM users WHERE id=?',row.id).parentId,null,
+   'a seeded admin has a parent, so one business would see into the other through the staff tree');
+  assert.equal(h.one('SELECT role FROM users WHERE id=?',row.id).role,'admin');
+ }
+ // The business name reaches the home hero and every bill PDF, which read businessName first.
+ assert.equal(h.one('SELECT businessName b FROM users WHERE id=?',zakir.id).b,'Al Reef');
+
+ // ── THE PASSWORDS WENT THROUGH THE STRENGTH RULE ───────────────────────────────────
+ // createUser applies it, so a weak default fails at startup instead of shipping. Asserted
+ // against the rule itself rather than restating it, so the two cannot drift.
+ for(const a of seed.SEEDED_ADMINS)
+  assert.equal(udb.accountPasswordProblem(a.password),null,'a seeded password would be refused by the app own rule: '+udb.accountPasswordProblem(a.password));
+ // And no hash is the password. (A seed that wrote raw SQL would not have hashed at all.)
+ for(const row of [zakir,waseem])
+  assert.notEqual(h.one('SELECT passwordHash p FROM users WHERE id=?',row.id).p,ZAKIR.password);
+
+ // ── BOTH ARE ADOPTABLE, which is what makes a SECOND DEVICE possible for each ──────
+ // mayBeAdoptable compared against ONE seed phone. With a second seeded admin that made
+ // their second device land in a brand-new empty account that looks entirely legitimate —
+ // the precise failure adoption exists to prevent.
+ for(const [who,row] of [['first',zakir],['second',waseem]])
+  assert.equal(await ad.mayBeAdoptable(sqlite,row.id,row.phone),true,
+   'the '+who+' seeded admin is not adoptable, so their second device would silently start an empty account');
+ assert.equal(await ad.mayBeAdoptable(sqlite,zakir.id,udb.normalisePhone('03000000000')),false,
+  'a number the seed does not own is adoptable');
+
+ // ── AND THE WHOLE POINT: ONE ADMIN CANNOT SEE THE OTHER ───────────────────────────
+ // Through the app OWN queries, per book, not through SQL written here.
+ h.login(zakir.id);
+ await h.load('src/services/database/cashbookDb.ts').createCashEntry(zakir.id,'Zakir float',250000,'in',date);
+ await h.load('src/services/database/transactionDb.ts').createTransaction(zakir.id,'Bilal',500000,'lena','n',date);
+ await h.load('src/services/database/expenseDb.ts').addExpenseRecord({user_id:zakir.id,amount:12345,description:'Fuel',category:'Fuel',expense_date:date});
+ await h.load('src/services/database/customerDb.ts').addCustomer({user_id:zakir.id,name:'Zakir customer',phone:'03001112222'});
+
+ const cash=h.load('src/services/database/cashbookDb.ts'), khata=h.load('src/services/database/transactionDb.ts');
+ const expense=h.load('src/services/database/expenseDb.ts'), customer=h.load('src/services/database/customerDb.ts');
+ assert.equal((await cash.getCashEntriesByUserId(zakir.id)).length,1,'the author cannot see their own entry');
+ assert.deepEqual(plain(await cash.getCashEntriesByUserId(waseem.id)),[],'the other admin can see a cash entry they did not write');
+ assert.deepEqual(plain(await khata.getTransactionsByUserId(waseem.id)),[],'the other admin can see a khata entry they did not write');
+ assert.deepEqual(plain(await expense.getExpensesByUserId(waseem.id)),[],'the other admin can see an expense they did not write');
+ assert.deepEqual(plain(await customer.getCustomers(waseem.id)),[],'the other admin can see a customer they did not add');
+ // Totals are SQL aggregates over the filtered set, so they must be empty too — a total
+ // that counted the other business would be the same leak in a number instead of a list.
+ const totals=await cash.getCashBalanceSummary(waseem.id);
+ assert.equal(totals.cashIn,0);assert.equal(totals.cashOut,0);
+
+ // Staff too: the Staff Book is the one cross-account read, and it is DOWNWARD only.
+ const staff=h.load('src/services/database/staffDb.ts');
+ assert.deepEqual(plain(await staff.getStaffRecords(waseem.id)),[],'the other admin can see staff they did not add');
+ // And neither can drill into the other: entryOwner refuses sideways.
+ const scope=h.load('src/services/database/entryScope.ts');
+ await assert.rejects(()=>scope.entryOwner(waseem.id,zakir.id),
+  'one seeded admin can drill into the other through the Staff Book, which is a sideways read');
+}));
 /**
  * ONE CHECK AT A TIME: `ONLY=162 node tests/regression.test.cjs`, or `ONLY=159,160`.
  *
