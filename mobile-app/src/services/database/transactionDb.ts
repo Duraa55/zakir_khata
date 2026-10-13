@@ -228,12 +228,6 @@ export const deleteTransaction = async (id: string, userId: string): Promise<voi
   });
 };
 
-export const getPendingSyncTransactions = async (): Promise<Transaction[]> => {
-  const db = await getDatabase();
-  return db.getAllAsync<Transaction>(
-    "SELECT * FROM transactions WHERE syncStatus = 'pending' AND isDeleted = 0 ORDER BY createdAt ASC"
-  );
-};
 
 /** One row of the customer list: a real customer, or a legacy name with no record. */
 export type PartyBalance = {

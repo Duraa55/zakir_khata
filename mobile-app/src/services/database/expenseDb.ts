@@ -283,10 +283,4 @@ export const deleteExpenseRecord = async (id: string, userId: string): Promise<v
   });
 };
 
-export async function getPendingSyncExpenses(userId: string) {
-  const db = await getDatabase();
-  return await db.getAllAsync(
-    'SELECT * FROM expenses WHERE user_id = ? AND synced = 0',
-    [userId]
-  );
-}
+

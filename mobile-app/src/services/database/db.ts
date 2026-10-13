@@ -2104,6 +2104,40 @@ async function migrateFrom(database: SQLite.SQLiteDatabase): Promise<void> {
     await database.execAsync('PRAGMA user_version = 53');
     version = 53;
   }
+
+  if (version < 54) {
+    if (__DEV__) console.log('[DB] Migrating to v54: syncStatus agrees with synced');
+    // A ROW THAT REACHED THE SERVER SAID "pending" IN THE OTHER COLUMN.
+    //
+    // `cashbook` and `transactions` carry both bookkeeping spellings: `synced`, which the
+    // queue uploader sets, and `syncStatus`, which it never touched. So every uploaded row
+    // sat at syncStatus = 'pending' for ever, and the pre-rewrite uploader that has now
+    // been deleted read exactly that column to decide what to send — re-uploading each row
+    // as a raw whole document, overwriting ownerId, visibleTo and the server timestamp, and
+    // on one occasion undoing a deletion. The code no longer does this, but the stale
+    // column is still a false statement on every device already out there, and the next
+    // reader of it would be wrong in the same way.
+    //
+    // NARROW ON PURPOSE: only where `synced = 1`, i.e. only rows the uploader itself
+    // confirmed. A pending row stays pending — this repairs a contradiction, it does not
+    // declare anything synced that was not. Idempotent: running it twice changes nothing,
+    // because the second run matches no rows.
+    //
+    // Guarded on the COLUMNS, not the table (the v43 lesson): PRAGMA table_info returns []
+    // for a missing table, so one check covers both, and the entryAudit suite's minimal
+    // fixture schema has neither column.
+    for (const table of ['cashbook', 'transactions']) {
+      const columns = await database.getAllAsync<{ name: string }>(`PRAGMA table_info(${table})`);
+      const names = columns.map(c => c.name);
+      if (!names.includes('synced') || !names.includes('syncStatus')) continue;
+      await database.runAsync(
+        `UPDATE ${table} SET syncStatus = 'synced' WHERE synced = 1 AND syncStatus != 'synced'`
+      );
+    }
+
+    await database.execAsync('PRAGMA user_version = 54');
+    version = 54;
+  }
 }
 
 export const closeDatabase = async (): Promise<void> => {

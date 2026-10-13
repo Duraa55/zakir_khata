@@ -158,7 +158,15 @@ export const rowFromDocument = (
   for (const column of DELETED_AT_COLUMNS) if (columns.has(column)) row[column] = deleted ? stamp : null;
 
   // A pulled row IS synced: it came from the server. Queueing it would send it back.
+  //
+  // BOTH bookkeeping columns, and `syncStatus` is not cosmetic. A document carries no
+  // syncStatus, so the column would take its schema DEFAULT of 'pending' — and a pulled
+  // row would read as outstanding local work on the receiving phone. That is how device 2
+  // came to re-upload, as a raw whole row, every entry it had just pulled from device 1,
+  // undoing a deletion in the process (CLAUDE.md, 2026-10-13). A document that arrives
+  // from the server is synced by definition, in whichever column a table spells it.
   if (columns.has('synced')) row.synced = 1;
+  if (columns.has('syncStatus')) row.syncStatus = 'synced';
   return row;
 };
 

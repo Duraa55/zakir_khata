@@ -4,7 +4,7 @@
 const fs=require('node:fs');
 const path=require('node:path');
 const crypto=require('node:crypto');
-const {root,read,sourceFiles,location,latest,harness,ts,assert}=require('./regression-harness.cjs');
+const {root,read,sourceFiles,location,latest,harness,ts,assert,SERVER_TIMESTAMP}=require('./regression-harness.cjs');
 const dbPath='src/services/database/db.ts';
 // Independent contract from Round 1: do NOT derive expectations from migration's array.
 const MONEY={
@@ -6675,9 +6675,16 @@ check(161,'PULL’S PREREQUISITES (P1): every document carries a SERVER timestam
   const src=read(f);
   assert.ok(!/is_deleted:\s*true/.test(src),
    f+' builds a deletion payload by hand, which is how one of the two workers loses the stamp: use deletionPayload()');
-  for(const line of src.split(String.fromCharCode(10))){
+  // STATEMENT-BASED, NOT LINE-BASED — the check-158 lesson, relearned on 2026-10-13 when a
+  // call was wrapped across lines for readability and this guard failed on the formatting
+  // alone. A guard a line break can break is one that gets satisfied by moving code around
+  // instead of by fixing it. Comments out first, then one entry per statement.
+  const statements=src
+   .replace(/\/\*[\s\S]*?\*\//g,'')
+   .split(String.fromCharCode(10)).map(l=>l.replace(/^\s*\/\/.*/,'')).join(' ')
+   .split(';');
+  for(const line of statements){
    if(!/authorisedPayload\(|deletionPayload\(/.test(line)) continue;
-   if(/^\s*(\*|\/\/)/.test(line)) continue;
    assert.ok(/serverTimestamp\(\)/.test(line),f+' builds a document without a server timestamp: '+line.trim());
   }
  }
@@ -6810,6 +6817,11 @@ check(162,'PULL (P2): a remote document enters through ONE choke point that refu
   assert.equal(row.deleted_at,'2026-10-12T19:29:22.685Z',table+'.deleted_at');
   assert.equal(row.deletedAt,'2026-10-12T19:29:22.685Z',table+'.deletedAt disagrees with deleted_at');
   assert.equal(row.synced,1,'a pulled row is synced by definition — it came from the server');
+  // AND IN THE OTHER SPELLING. A document carries no syncStatus, so the column would take
+  // its schema DEFAULT of 'pending' — and this phone would treat a row it just downloaded
+  // as outstanding local work. That is how device 2 came to re-upload, as a raw whole row,
+  // everything it had pulled from device 1, undoing a deletion on the way (2026-10-13).
+  assert.equal(row.syncStatus,'synced',table+'.syncStatus is still pending on a row that came FROM the server, so this phone will try to upload it back');
  }
  // AND IT NEVER QUEUES WHAT IT RECEIVED, which would send the server its own copy back.
  assert.equal(h.one('SELECT COUNT(*) c FROM sync_queue').c,0,'pulling queued an upload');
@@ -7104,6 +7116,134 @@ check(164,'PULL RUNS ITSELF AFTER A LOGIN, ONCE — as a side-effect of a login 
  assert.ok(/planPull\(/.test(settings),'the dev button lost its dry run, so the size of a download is no longer seen before it happens');
  assert.ok(/__DEV__ &&/.test(settings.slice(0,settings.indexOf('syncDevPull'))),'the download button is no longer behind __DEV__');
 });
+check(165,'THE UPLOADER IS RUN, NOT READ: a delete reaches the cloud as a DELETE, stamped with the server sentinel and carrying none of this phone bookkeeping — and there is exactly ONE uploader, because a second one that spread the raw row over the same document with a string timestamp is what silently undid a deletion on the owner device (2026-10-13)',at('src/services/syncProcessor.ts','markRowSynced'),async()=>{
+ const h=harness({firestore:true,uid:'fb_owner',online:true});
+ try{
+  await h.boot();
+  seedPeople(h);h.login('owner');
+  h.sqlite.prepare('UPDATE users SET firebase_uid=? WHERE id=?').run('fb_owner','owner');
+  const cash=h.load('src/services/database/cashbookDb.ts');
+  const processor=h.load('src/services/syncProcessor.ts');
+  const path='users/owner/cashbook/';
+
+  // ── CREATE, UPLOADED FOR REAL ──────────────────────────────────────────────────────
+  const entry=await cash.createCashEntry('owner','Lasan',250000,'in',date);
+  await processor.processSyncQueue();
+  const created=h.cloud.get(path+entry.id);
+  assert.ok(created,'the create never reached the cloud at all');
+  assert.equal(created.ownerId,'fb_owner','the document carries no ownerId, so the rules can never admit an update to it');
+  assert.deepEqual(plain(created.visibleTo),['fb_owner']);
+  assert.equal(created.syncedAt,SERVER_TIMESTAMP,
+   'syncedAt is not the server sentinel. A client clock here is a cursor riding a clock two phones disagree about — and a STRING is the signature of the uploader that was deleted');
+
+  // THE BOOKKEEPING STAYS ON THE PHONE. These three in a document are how the second
+  // uploader was identified: it spread the raw SQLite row and stripped nothing.
+  for(const local of ['synced','syncStatus','firestore_path'])
+   assert.ok(!(local in created),'the document carries this phone bookkeeping column: '+local);
+
+  // AND THE ROW IS MARKED SYNCED IN BOTH SPELLINGS. Leaving syncStatus at pending is what
+  // kept an already-uploaded row looking like outstanding work for ever.
+  const row=h.one('SELECT synced,syncStatus FROM cashbook WHERE id=?',entry.id);
+  assert.equal(row.synced,1);
+  assert.equal(row.syncStatus,'synced',
+   'an uploaded row still says syncStatus=pending, which is the false statement the second uploader acted on');
+  assert.equal(h.one('SELECT COUNT(*) c FROM sync_queue').c,0,'the queue was not drained');
+
+  // ── DELETE, AND THE STORED DOCUMENT MUST SAY SO ────────────────────────────────────
+  await cash.deleteCashEntry(entry.id,'owner');
+  assert.equal(h.one("SELECT COUNT(*) c FROM sync_queue WHERE operation='delete'").c,1,'the delete was never queued');
+  await processor.processSyncQueue();
+
+  const deleted=h.cloud.get(path+entry.id);
+  assert.equal(deleted.is_deleted,true,'THE DELETE DID NOT REACH THE CLOUD AS A DELETE — the other phone goes on showing a row its owner deleted');
+  assert.ok(deleted.deleted_at,'the deletion carries no timestamp');
+  assert.equal(deleted.syncedAt,SERVER_TIMESTAMP,
+   'an unstamped deletion never travels: a query ordering on syncedAt excludes a document that lacks it');
+  assert.equal(deleted.ownerId,'fb_owner','the delete dropped the ownerId the update rule tests');
+  // THE DELETE WRITE ITSELF CARRIED THE STAMP — not merely the document afterwards.
+  // A merged update keeps a field it omits, so the create's stamp would still be sitting
+  // there and the final document cannot tell the two apart. This is the assertion that
+  // actually bites when a deletion stops going through deletionPayload.
+  const deleteWrites=h.cloud.writesTo(path+entry.id).slice(1);
+  assert.equal(deleteWrites.length,1,'the delete did not produce exactly one write');
+  assert.equal(deleteWrites[0].data.syncedAt,SERVER_TIMESTAMP,'the delete WRITE carried no server stamp, so a deletion built by hand would travel unstamped and never be pulled');
+  assert.equal(deleteWrites[0].data.is_deleted,true);
+  assert.equal(deleted.amount_paisa,250000,'the delete was not a merge: it replaced the document instead of flipping its flags');
+  assert.equal(h.one('SELECT COUNT(*) c FROM sync_queue').c,0,'the delete is still queued, so it failed');
+
+  // A SECOND DRAIN CHANGES NOTHING. A delete that re-sent itself would keep rewriting the
+  // stamp, and the other phone would re-pull the same deletion for ever.
+  await processor.processSyncQueue();
+  assert.equal(h.cloud.get(path+entry.id).is_deleted,true);
+ }finally{h.dispose();}
+});
+check(166,'ONE UPLOADER: nothing outside syncProcessor may write a book document, and the 30-second whole-row uploader that overwrote correct documents is GONE — it bypassed the payload builder, the authorisation stamp and the server timestamp, and re-uploaded rows that pull had just written',at('src/services/syncProcessor.ts','processSyncQueue'),()=>{
+ // The pre-rewrite uploader and its timer. Deleted, not disabled: a disabled one gets
+ // switched back on by someone who does not know what it did.
+ for(const gone of ['src/services/firebase/syncService.ts','src/services/firebase/offlineSync.ts'])
+  assert.ok(!fs.existsSync(path.join(root,gone)),gone+' is back. It spread the raw SQLite row over the document with setDoc(merge), a STRING syncedAt and no ownerId, on a 30-second timer');
+ const navigator=read('src/navigation/AppNavigator.tsx');
+ assert.ok(!/initializeOfflineSync|offlineSync/.test(navigator),'the navigator still starts the offline sync timer');
+
+ // THE GUARD. One writer, found by walking the source rather than by remembering.
+ // A second writer is not a style problem: two uploaders with different payload builders
+ // is exactly the bug, and the one that loses is whichever wrote last.
+ const writers=sourceFiles()
+  .filter(f=>/[\\/]src[\\/]/.test(f))
+  .map(f=>[f,fs.readFileSync(f,'utf8')])
+  // The IMPORT, not a mention: these names appear in prose in the backfill's own notes,
+  // and a guard a comment can trip is a guard nobody keeps.
+  .filter(([,text])=>/import\s*\{[^}]*\b(setDoc|updateDoc|writeBatch)\b[^}]*\}\s*from\s*'firebase\/firestore'/.test(text))
+  .map(([f])=>f.split(/[\\/]/).slice(-2).join('/'));
+ assert.deepEqual(sorted(writers),['firebase/firebaseProfile.ts','services/syncProcessor.ts'],
+  'a file outside syncProcessor writes documents. Every book write goes through the queue uploader, which is the only place the payload builder, the authorisation stamp and the server timestamp are applied: '+sorted(writers).join(', '));
+
+ // AND THE QUERY THAT FED IT. A pulled row lands synced; a helper that lists rows by
+ // syncStatus would make it an upload candidate again, which is how device 2 came to
+ // re-upload everything it had just downloaded.
+ const pending=sourceFiles()
+  .filter(f=>/[\\/]src[\\/]/.test(f)&&/getPendingSync/.test(fs.readFileSync(f,'utf8')))
+  .map(f=>f.split(/[\\/]/).slice(-2).join('/'));
+ assert.deepEqual(pending,[],'a pending-sync query helper is back, and it is what a second uploader reads: '+pending.join(', '));
+
+ // THE BATCH UPLOADER'S TWO FAULTS. It is not reachable from any screen today, but it is
+ // exported, store-wired and covered by the entryAudit suite, so it is fixed, not deleted.
+ const proc=read('src/services/syncProcessor.ts');
+ const batch=proc.slice(proc.indexOf('export async function batchProcessSyncQueue'))
+  // Comments out. The guard above tripped on its own explanation of what not to do, which
+  // is the second time a source assertion has been fooled by prose (CLAUDE.md, check 158).
+  .split('\n').map(l=>l.replace(/^\s*\/\/.*/,'')).join('\n');
+ assert.ok(/ORDER BY created_at ASC/.test(batch),
+  'the batch reads the queue unordered, and a batch applies its writes IN ORDER — a create landing after its own delete merges the row back to life');
+ assert.ok(!/batch\.update\(/.test(batch),
+  'the batch still uses update(), which fails the WHOLE commit when the document does not exist — 500 rows refused for one, retrying for ever');
+ assert.ok(/batch\.set\(/.test(batch)&&/deletionPayload\(/.test(batch),
+  'the batch delete no longer goes through deletionPayload, so a deletion could travel unstamped from this path only');
+});
+check(167,'MIGRATION v54: a row that reached the server stops saying "pending" in the other bookkeeping column — the contradiction the deleted uploader read to decide what to re-send. Narrow on purpose (only where synced=1, so nothing is declared sent that was not) and idempotent',at('src/services/database/db.ts','Migrating to v54'),()=>isolated(async h=>{
+ seedPeople(h);
+ // The three states a device already in the field can be in.
+ h.insert('cashbook',{id:'c_uploaded',userId:'owner',description:'Uploaded',amount_paisa:100,direction:'in',date,synced:1,syncStatus:'pending'});
+ h.insert('cashbook',{id:'c_waiting', userId:'owner',description:'Waiting', amount_paisa:100,direction:'in',date,synced:0,syncStatus:'pending'});
+ h.insert('transactions',{id:'t_uploaded',userId:'owner',partyName:'B',amount_paisa:100,type:'lena',date,synced:1,syncStatus:'pending'});
+ await h.boot();
+
+ assert.equal(h.one("SELECT syncStatus s FROM cashbook WHERE id='c_uploaded'").s,'synced',
+  'an uploaded row still says pending, which is the false statement the deleted uploader acted on');
+ assert.equal(h.one("SELECT syncStatus s FROM transactions WHERE id='t_uploaded'").s,'synced');
+ // AND IT CLAIMS NOTHING IT SHOULD NOT. A row that never uploaded is still outstanding work;
+ // calling it synced would STRAND it, because nothing would ever send it.
+ assert.equal(h.one("SELECT syncStatus s FROM cashbook WHERE id='c_waiting'").s,'pending',
+  'the migration declared an UNSENT row synced, which strands it for ever');
+ assert.equal(h.one("SELECT synced c FROM cashbook WHERE id='c_waiting'").c,0,'the migration wrote synced, which is not its column to touch');
+ assert.equal(h.one('SELECT COUNT(*) c FROM cashbook').c,2,'a row was lost');
+
+ // IDEMPOTENT: a second pass matches nothing and changes nothing.
+ const before=plain(h.all('SELECT id,synced,syncStatus FROM cashbook ORDER BY id'));
+ await h.boot();
+ assert.deepEqual(plain(h.all('SELECT id,synced,syncStatus FROM cashbook ORDER BY id')),before);
+ assert.equal(h.one('PRAGMA user_version').user_version,latest,'the chain did not finish');
+},53));
 /**
  * ONE CHECK AT A TIME: `ONLY=162 node tests/regression.test.cjs`, or `ONLY=159,160`.
  *

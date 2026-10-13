@@ -8,7 +8,6 @@ import { AuthNavigator } from './AuthNavigator';
 import { AdminNavigator } from './AdminNavigator';
 import { getDatabase } from '../services/database/db';
 import { seedDatabase } from '../services/database/seedData';
-import { initializeOfflineSync, stopOfflineSync } from '../services/firebase/offlineSync';
 import { IS_FIREBASE_CONFIGURED } from '../services/firebase/firebaseConfig';
 import { currentFirebaseUid } from '../services/firebase/firebaseAuth';
 import { logBackfillPlan } from '../services/database/syncBackfill';
@@ -80,13 +79,6 @@ export const AppNavigator = () => {
     };
     boot();
   }, []);
-
-  useEffect(() => {
-    if (isAuthenticated && user?.id) {
-      initializeOfflineSync(user.id);
-    }
-    return () => { stopOfflineSync(); };
-  }, [isAuthenticated, user?.id]);
 
   if (!isLoaded) return <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: color.surface }}><ActivityIndicator color={color.accent} /></View>;
 

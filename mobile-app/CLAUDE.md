@@ -10,7 +10,7 @@ in the other location are doing.
 
 React Native + Expo 51, TypeScript, expo-sqlite (local-first), Firebase Firestore
 (push-only), Zustand, NativeWind + StyleSheet. ~27k LOC, ~170 source files, 35 tables,
-schema at **v48**. English + Urdu.
+schema at **v54**. English + Urdu.
 
 Eight books: Cash, Khata (receivables), Bill, Stock, Expense, Purchase, Staff, Customer.
 Plus Reports, Reminders, Activity Log, Global Search, Sync Center.
@@ -343,7 +343,7 @@ scoping.
 
 8. **No new `console.log`**; gate debug behind `__DEV__`. Never log CNIC or phone numbers.
 
-9. **Keep all three suites green:** `tests/regression.test.cjs` (164 checks, all passing),
+9. **Keep all three suites green:** `tests/regression.test.cjs` (167 checks, all passing),
    `tests/entryAudit.test.cjs` (18), the i18n suite (8). Run them after every change.
    These counts were stale for a long time (123 / 17); they are the TOTAL lines each suite
    prints, so correct them rather than trusting a number in this file.
@@ -553,7 +553,12 @@ did not exist. `supplierDb.addSupplierPayment` is now validated (whole paisa abo
 more than the invoice balance) and writes the payment and the invoice's paid/balance/status
 in ONE transaction. `createPurchaseInvoice` is still NOT atomic — next candidate.
 
-**TypeScript: 7 errors remain, all deliberate leftovers** (this said 9 for a while; it was
+**TypeScript: 1 error remains** (this said 7, then 9; the five `firebase/syncService.ts`
+errors went when that file was deleted on 2026-10-13, and `pullSyncService.ts` before it).
+What is left is the navigator typing for `CashEntryDetail`. Verify with `npx tsc --noEmit`
+rather than trusting this number. The old note follows for its history:
+
+**Formerly 7 errors, all deliberate leftovers** (this said 9 for a while; it was
 already 7 before the currency work, which adds none): navigator typing for `CashEntryDetail`
 (route registration — not touched, 1) and the broken sync services (`firebase/syncService.ts`
 5, `pullSyncService.ts` 1 — part of the sync rework below). Verify with
@@ -916,6 +921,51 @@ their own, enforced in the data layer not by hiding buttons).
 >   from its first document and the counters survive. `clearPullCounters` deliberately does
 >   NOT touch the cursor. Do not build it as part of a fix; a re-upload is the fix.
 >
+>
+> **THERE WERE TWO UPLOADERS, AND THE OTHER ONE WAS WINNING — DELETED 2026-10-13.**
+> Owner-found: a cash entry deleted on device 1 stayed alive in Firestore, its document
+> reading `is_deleted: 0` with `syncedAt` as a STRING and `firestore_path`, `synced` and
+> `syncStatus` sitting in it as fields.
+>
+> `firebase/syncService.ts` did `setDoc(doc(...), { ...entry, syncedAt: new Date().toISOString() },
+> { merge: true })` — the raw SQLite row, no payload builder, no `ownerId`, no `visibleTo`,
+> a client clock where the cursor field belongs. `firebase/offlineSync.ts` ran it on a
+> **30-second `setInterval`** started for every authenticated user from `AppNavigator`. No
+> button, no queue, no authorisation. All three are now deleted/unwired, and check 166
+> fails if either file returns or if any file outside `syncProcessor` imports `setDoc`,
+> `updateDoc` or `writeBatch` from `firebase/firestore`.
+>
+> - **WHAT FED IT WAS A COLUMN NOBODY MAINTAINED.** `cashbook` and `transactions` carry
+>   both bookkeeping spellings. The queue uploader set `synced = 1` and never touched
+>   `syncStatus`, so every uploaded row sat at `'pending'` for ever — and `syncStatus` is
+>   exactly what the second uploader selected on. Both are written together now
+>   (`markRowSynced` in syncProcessor), and **migration v54** repairs rows already out
+>   there: `syncStatus = 'synced' WHERE synced = 1`, narrow on purpose, because declaring
+>   an unsent row synced would strand it where nothing would ever send it. Check 167.
+> - **PULL WAS FEEDING IT TOO, AND THAT IS THE WORSE HALF.** A document carries no
+>   `syncStatus`, so a pulled row took the column's DEFAULT of `'pending'` — and device 2
+>   then re-uploaded, as a raw whole row, everything it had just downloaded from device 1,
+>   overwriting good documents and undoing a deletion. `pullApply` now writes
+>   `syncStatus = 'synced'` beside `synced = 1`: a document that came FROM the server is
+>   synced in whichever column a table spells it. Check 162.
+> - **THE UPLOADER IS NOW RUN BY A TEST, NOT READ.** The harness has a FAKE FIRESTORE
+>   (`harness({ firestore: true, uid, online: true })`), so check 165 drives the real
+>   `processSyncQueue` through create → delete and asserts the stored document says
+>   deleted, with the server SENTINEL and none of the phone bookkeeping. It records every
+>   write, because a merged update keeps a field it omits — reading the final document
+>   cannot tell "this write sent a stamp" from "an earlier one did", and the first version
+>   of that assertion passed against a hand-built deletion for exactly that reason.
+> - **THE BATCH UPLOADER IS FIXED, NOT DELETED** — no screen reaches it, but it is
+>   exported, store-wired and covered by the entryAudit suite. It read the queue with no
+>   `ORDER BY` (a batch applies writes IN ORDER, so a create landing after its own delete
+>   merges the row back to life) and used `batch.update()`, which fails the WHOLE commit
+>   when the document is missing — 500 rows refused for one, retrying for ever. It now
+>   orders by `created_at` and sends an authorised merged `set`, which satisfies the
+>   create rule as well as the update rule so neither case can wedge it.
+> - **TWO SOURCE GUARDS TRIPPED ON THEIR OWN COMMENTS while being written** — once on the
+>   word `setDoc(` in the backfill's prose, once on a comment explaining why not to use
+>   `batch.update(`. Both now key on the IMPORT, or strip comments first. That is the
+>   third time (see check 158): a source-text assertion must be told what is code.
 > **THE NEXT TWO STEPS AFTER PULL, IN THIS ORDER (owner, 2026-10-12).** Found while building
 > the team bootstrap; neither is a hardening idea and neither is optional. **Without (2) the
 > two-location requirement — the thing this app is for — does not work: a Dubai staff
@@ -1024,7 +1074,9 @@ their own, enforced in the data layer not by hiding buttons).
   (so it cannot race a push or the dev button) and for the Sync Centre's kept-out and
   blocked state. The `__DEV__` button stays, with its dry run. **NO TIMER, NO FOCUS HOOK, NO
   APP-RESUME HOOK** — exactly two call sites in the app, and check 164 fails if a third
-  appears, if the chain is ever awaited, or if a pull is put on a timer. The two-location requirement is still NOT met — see the
+  appears, if the chain is ever awaited, or if a pull is put on a timer. The 30-second
+  `offlineSync` timer that used to run a SECOND uploader is deleted; see the two-uploaders
+  note above before adding any periodic sync. The two-location requirement is still NOT met — see the
   staff-device uid step above, which is what makes a Dubai staff member's books reach the
   Khuzdar owner.
 - **SECURITY — check before any real client build.** There is NO `firestore.rules` file and

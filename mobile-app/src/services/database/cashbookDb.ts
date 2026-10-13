@@ -253,12 +253,6 @@ export const deleteCashEntry = async (id: string, userId: string): Promise<void>
   });
 };
 
-export const getPendingSyncCashEntries = async (): Promise<CashEntry[]> => {
-  const db = await getDatabase();
-  return db.getAllAsync<CashEntry>(
-    `SELECT * FROM cashbook WHERE syncStatus = 'pending' AND ${CASH_LIVE} ORDER BY createdAt ASC`
-  );
-};
 
 export type DayTotals = { cashIn: number; cashOut: number; net: number; entryCount: number };
 

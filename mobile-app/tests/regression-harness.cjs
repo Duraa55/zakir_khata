@@ -38,8 +38,87 @@ function capMigrations(source, ceiling) {
   for (const [start,end] of cuts.sort((a,b)=>b[0]-a[0])) source = source.slice(0,start) + source.slice(start,end).replace(/[^\r\n]/g,' ') + source.slice(end);
   return source;
 }
-function harness() {
+/**
+ * A FAKE FIRESTORE, so the real uploader can be RUN rather than read as source text.
+ *
+ * syncProcessor is the one place a document is actually built and sent, and until this
+ * existed nothing could assert what it sends — which is how a second uploader overwriting
+ * correct documents survived (CLAUDE.md, 2026-10-13). It models only what the uploader
+ * uses: document paths, setDoc with merge, updateDoc, and a write batch applied IN ORDER
+ * on commit. `serverTimestamp()` returns a sentinel object, so a test can tell a real
+ * server stamp apart from a client clock — the exact difference that gave the bug away.
+ *
+ * updateDoc on a missing document REJECTS, as Firestore does, and a batch that contains
+ * one fails whole. A fake that quietly succeeded there would hide the fault it exists to
+ * catch.
+ */
+const SERVER_TIMESTAMP = { __sentinel: "serverTimestamp" };
+function fakeFirestore() {
+  const docs = new Map();
+  const writes = [];
+  const merge = (path, data, isMerge, op) => {
+    writes.push({ path, op: op || (isMerge ? "merge" : "set"), data });
+    const next = isMerge ? { ...(docs.get(path) || {}), ...data } : { ...data };
+    docs.set(path, next);
+  };
+  const api = {
+    docs,
+    get: path => docs.get(path),
+    writes,
+    writesTo: target => writes.filter(w => w.path === target),
+    module: {
+      doc: (_db, ...segments) => ({ path: segments.join("/") }),
+      setDoc: async (ref, data, options) => { merge(ref.path, data, !!(options && options.merge), "set"); },
+      updateDoc: async (ref, data) => {
+        if (!docs.has(ref.path)) {
+          const err = new Error("No document to update: " + ref.path);
+          err.code = "not-found";
+          throw err;
+        }
+        merge(ref.path, data, true, "update");
+      },
+      deleteDoc: async ref => { docs.delete(ref.path); },
+      getDoc: async ref => ({ exists: () => docs.has(ref.path), data: () => docs.get(ref.path) }),
+      serverTimestamp: () => SERVER_TIMESTAMP,
+      writeBatch: () => {
+        const queued = [];
+        return {
+          set: (ref, data, options) => { queued.push(["set", ref, data, options]); },
+          update: (ref, data) => { queued.push(["update", ref, data]); },
+          delete: ref => { queued.push(["delete", ref]); },
+          commit: async () => {
+            // All-or-nothing, and ordered. Validate first so a failing write leaves
+            // NOTHING applied, which is what makes a batch a batch.
+            const pending = new Set();
+            for (const [op, ref] of queued) {
+              if (op === "set") pending.add(ref.path);
+              else if (op === "update" && !docs.has(ref.path) && !pending.has(ref.path)) {
+                const err = new Error("No document to update: " + ref.path);
+                err.code = "not-found";
+                throw err;
+              }
+            }
+            for (const [op, ref, data, options] of queued) {
+              if (op === "delete") docs.delete(ref.path);
+              else merge(ref.path, data, op === "update" || !!(options && options.merge), op);
+            }
+          },
+        };
+      },
+      collection: () => ({}), query: () => ({}), where: () => ({}), orderBy: () => ({}),
+      limit: () => ({}), startAfter: () => ({}), documentId: () => ({}),
+      collectionGroup: () => ({}), getDocs: async () => ({ docs: [] }),
+      Timestamp: class { constructor(seconds, nanos) { this.seconds = seconds; this.nanoseconds = nanos; } },
+    },
+  };
+  return api;
+}
+
+function harness(options = {}) {
   const folder = fs.mkdtempSync(path.join(os.tmpdir(), 'digikhata-regression-'));
+  // Opt-in: only a check that asks for it gets a Firestore, so every other check still
+  // fails loudly if application code reaches for one.
+  const cloud = options.firestore ? fakeFirestore() : null;
   const sqlite = new DatabaseSync(path.join(folder, 'isolated.db'), { enableDoubleQuotedStringLiterals: true });
   // Expo SQLite's default; the application does not enable foreign keys.
   sqlite.exec('PRAGMA foreign_keys = OFF');
@@ -68,7 +147,7 @@ function harness() {
     },
   };
   adapter.withExclusiveTransactionAsync=adapter.withTransactionAsync;
-  const sync={isOnline:false,incrementPendingCount(){},processSyncQueue:async()=>{assert.equal(depth,0);}};
+  const sync={isOnline:options.online===true,pendingCount:0,incrementPendingCount(){},setPendingCount(n){sync.pendingCount=n;},processSyncQueue:async()=>{assert.equal(depth,0);}};
   function load(file) {
     file=path.resolve(root,file);
     if(cache.has(file))return cache.get(file).exports;
@@ -77,6 +156,15 @@ function harness() {
     if(file===path.join(root,'src/services/database/db.ts') && cap!==Infinity)source=capMigrations(source,cap);
     const output=ts.transpileModule(source,{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2020,jsx:ts.JsxEmit.React}}).outputText;
     function req(id) {
+      if(id==='firebase/firestore'){
+        if(!cloud)throw Error('This check loaded Firestore without asking for one: pass {firestore:true} to harness().');
+        return cloud.module;
+      }
+      if(id.endsWith('/firebaseConfig')){
+        if(!cloud)throw Error('This check loaded firebaseConfig without asking for a Firestore.');
+        return {getFirestoreDB:()=>({}),IS_FIREBASE_CONFIGURED:true};
+      }
+      if(id.endsWith('/firebaseAuth'))return {currentFirebaseUid:async()=>options.uid??null,ensureFirebaseAccount:async()=>({status:'signed-in'}),signOutFirebase:async()=>{}};
       if(id==='expo-sqlite')return {openDatabaseAsync:async()=>adapter};
       if(id==='expo-crypto')return {getRandomBytes:n=>crypto.randomBytes(n),CryptoDigestAlgorithm:{SHA256:'sha256'},digestStringAsync:async(algorithm,value)=>crypto.createHash(algorithm).update(value).digest('hex')};
       if(id==='expo-print')return {printToFileAsync:async({html:body})=>{html.push(body);return {uri:'test://report.pdf'};}};
@@ -117,10 +205,10 @@ function harness() {
     sqlite.prepare('INSERT INTO '+table+' ('+keys.join(',')+') VALUES ('+keys.map(()=>'?').join(',')+')').run(...Object.values(data));
     return data.id;
   };
-  return {sqlite,adapter,queries,html,csv,versions,files,present,logs,load,all,one,insert,
+  return {sqlite,adapter,queries,html,csv,versions,files,present,logs,load,all,one,insert,cloud,
     login:id=>{session={isAuthenticated:true,user:{id}};},
     boot:async(ceiling=Infinity)=>{cap=ceiling;cache.clear();await load('src/services/database/db.ts').getDatabase();},
     dispose:()=>{sqlite.close();fs.rmSync(folder,{recursive:true,force:true});},
   };
 }
-module.exports={root,read,sourceFiles,location,latest,harness,ts,assert};
+module.exports={root,read,sourceFiles,location,latest,harness,ts,assert,SERVER_TIMESTAMP};

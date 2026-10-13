@@ -1,5 +1,5 @@
+import type { SQLiteDatabase } from 'expo-sqlite';
 import { getDatabase } from './database/db';
-import { getPendingSyncExpenses } from './database/expenseDb';
 import { useSyncStore } from '../store/useSyncStore';
 import { doc, setDoc, updateDoc, writeBatch, serverTimestamp } from 'firebase/firestore';
 import { getFirestoreDB, IS_FIREBASE_CONFIGURED } from './firebase/firebaseConfig';
@@ -17,6 +17,31 @@ const refreshPendingCount = async (db: Awaited<ReturnType<typeof getDatabase>>):
   );
   useSyncStore.getState().setPendingCount(remaining?.count || 0);
 };
+
+/**
+ * A row that has reached the server, in BOTH bookkeeping columns.
+ *
+ * `synced` is the one the queue-based uploader reads; `syncStatus` is the older
+ * camelCase-table column, and leaving it at 'pending' is what let a second uploader keep
+ * treating an already-uploaded row as outstanding and overwrite its document with a raw
+ * whole-row `setDoc` (CLAUDE.md, 2026-10-13). That uploader is gone, but a column saying
+ * 'pending' about a row that is synced is a false statement, and the next thing to read it
+ * would be wrong in the same way. `syncStatus` does not exist on every table, so it is set
+ * only where it does.
+ */
+const syncStatusTables = new Map<string, boolean>();
+async function markRowSynced(db: SQLiteDatabase, table: string, id: string): Promise<void> {
+  let has = syncStatusTables.get(table);
+  if (has === undefined) {
+    const cols = await db.getAllAsync<{ name: string }>(`PRAGMA table_info(${table})`);
+    has = cols.some(c => c.name === 'syncStatus');
+    syncStatusTables.set(table, has);
+  }
+  await db.runAsync(
+    `UPDATE ${table} SET synced=1${has ? ", syncStatus='synced'" : ''} WHERE id=?`,
+    [id]
+  );
+}
 
 export async function processSyncQueue(): Promise<void> {
   const isOnline = useSyncStore.getState().isOnline;
@@ -133,7 +158,7 @@ export async function processSyncQueue(): Promise<void> {
 
       // Success: mark local record as synced
       if (item.table_name !== 'entry_audit') {
-        await db.runAsync(`UPDATE ${item.table_name} SET synced=1 WHERE id=?`, [item.record_id]);
+        await markRowSynced(db, item.table_name, item.record_id);
       }
       
       // Remove from queue
@@ -204,7 +229,10 @@ export async function batchProcessSyncQueue(): Promise<void> {
   if (!signedInUid) return;
 
   const pendingItems = await db.getAllAsync<SyncQueueItem>(
-    `SELECT * FROM sync_queue WHERE status='pending' LIMIT 500`
+    // ORDERED. Without this the batch took whatever order SQLite happened to return, and
+    // a batch applies its writes IN ORDER: a create landing after its own delete would
+    // merge the row back to life. The single uploader has always ordered; this did not.
+    `SELECT * FROM sync_queue WHERE status='pending' ORDER BY created_at ASC LIMIT 500`
   );
   if (pendingItems.length === 0) return;
 
@@ -224,7 +252,23 @@ export async function batchProcessSyncQueue(): Promise<void> {
     if (item.operation === 'delete') {
       // The same two helpers as the single uploader, for the same reason: a stamp missing
       // here and present there would mean deletions that travel from one code path only.
-      batch.update(docRef, deletionPayload(payload.deleted_at || new Date().toISOString(), serverTimestamp()));
+      //
+      // A MERGED SET, NOT AN UPDATE. `batch.update()` on a document that does not exist
+      // fails the WHOLE commit — all 500 rows, none of them at fault — and the rows stay
+      // pending to fail again on the next run. A document can legitimately be missing: its
+      // create may never have been queued. Carrying the authorisation makes the write
+      // satisfy the CREATE rule as well as the update rule, so neither case can wedge the
+      // batch. A tombstone for a row that was never uploaded is harmless: the other phone
+      // cannot build a row from delete flags alone and drops it as incomplete, counted.
+      batch.set(
+        docRef,
+        authorisedPayload(
+          deletionPayload(payload.deleted_at || new Date().toISOString(), serverTimestamp()),
+          authorisation,
+          serverTimestamp()
+        ),
+        { merge: true }
+      );
     } else {
       batch.set(docRef, authorisedPayload(payload, authorisation, serverTimestamp()), { merge: true });
     }
@@ -237,7 +281,7 @@ export async function batchProcessSyncQueue(): Promise<void> {
     // Mark as synced ONLY what was actually sent.
     for (const item of batched) {
       if (item.table_name !== 'entry_audit') {
-        await db.runAsync(`UPDATE ${item.table_name} SET synced=1 WHERE id=?`, [item.record_id]);
+        await markRowSynced(db, item.table_name, item.record_id);
       }
       await db.runAsync(`DELETE FROM sync_queue WHERE id=?`, [item.id]);
     }
