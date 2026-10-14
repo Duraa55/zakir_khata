@@ -190,7 +190,7 @@ export const ur: Record<TKey, string> = {
   "commonRequired": "ضروری",
   "commonSearchItems": "اشیاء تلاش کریں",
   "commonOptional": "اختیاری",
-  "cashInHandAllTime": "رقم ہاتھ میں (شروع سے اب تک)",
+  "cashInHandAllTime": "رقم ہاتھ میں",
   "cashTodayBalance": "آج کا بیلنس",
   "cashDayBalance": "دن کا بیلنس",
   "cashViewAsFailed": "یہ اندراجات نہیں کھل سکے۔",

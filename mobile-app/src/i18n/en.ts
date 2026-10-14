@@ -188,7 +188,7 @@ export const en = {
   "commonRequired": "Required",
   "commonSearchItems": "Search items",
   "commonOptional": "optional",
-  "cashInHandAllTime": "Cash in hand (all time)",
+  "cashInHandAllTime": "Cash in hand",
   "cashTodayBalance": "Today balance",
   "cashDayBalance": "Day balance",
   "cashViewAsFailed": "These entries could not be loaded.",

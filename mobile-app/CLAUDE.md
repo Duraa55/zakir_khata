@@ -406,7 +406,7 @@ scoping.
 
 8. **No new `console.log`**; gate debug behind `__DEV__`. Never log CNIC or phone numbers.
 
-9. **Keep all three suites green:** `tests/regression.test.cjs` (168 checks, all passing),
+9. **Keep all three suites green:** `tests/regression.test.cjs` (169 checks, all passing),
    `tests/entryAudit.test.cjs` (18), the i18n suite (8). Run them after every change.
    These counts were stale for a long time (123 / 17); they are the TOTAL lines each suite
    prints, so correct them rather than trusting a number in this file.
@@ -1090,6 +1090,48 @@ their own, enforced in the data layer not by hiding buttons).
 > from the queue id. Deploying from git (`firebase deploy --only firestore:rules`) removes
 > the whole ambiguity, which is one more reason to fix the CLI login.
 
+- **AN OTA PUBLISH RE-SHIPS `extra`, WHICH IS WHERE THE FIREBASE CONFIG LIVES — so a
+  publish from the wrong shell turns sync off on every phone that takes it (2026-10-14).**
+
+      npx eas-cli update --channel preview --environment preview --message "what changed"
+
+  **`--environment preview` is not optional.** `app.config.js` builds `extra.firebase*` from
+  `process.env.FIREBASE_*` AT PUBLISH TIME, and that block travels with the update. Publish
+  without those variables loaded and every device on the channel receives
+  `firebaseApiKey: ''` — `IS_FIREBASE_CONFIGURED` goes false, and then there is no upload, no
+  pull, no Firebase auth, **and nothing on any screen says so**. The books keep working
+  offline, so it looks like sync "just stopped". The flag loads the EAS `preview`
+  environment, which holds all six.
+
+  **EVERY `FIREBASE_*` VARIABLE MUST BE _SENSITIVE_, NEVER _SECRET_.** The two visibilities
+  read identically in the dashboard and behave completely differently here:
+
+  - **Sensitive** — masked in listings and logs, but the CLI can still resolve the value.
+    `eas update` gets the real string, and `extra` ships correctly.
+  - **Secret** — readable ONLY on the EAS build worker. `eas update` cannot read it back,
+    so it resolves to **empty** and publishes a config with Firebase switched off. It is
+    indistinguishable from never having set the variable at all.
+
+  A Secret variable therefore still produces a working BUILD and a broken UPDATE, which is
+  the worst shape: the thing you tested is fine and the thing you shipped is not.
+  `FIREBASE_API_KEY` and `FIREBASE_AUTH_DOMAIN` were Secret until 2026-10-14; all six are
+  Sensitive now. Verify before publishing, and never "tighten" one back to Secret:
+
+      npx eas-cli env:list --environment preview
+
+  None of this is a leak being accepted. The Firebase web API key is not a credential — it
+  ships inside the APK either way, which is precisely why the Firestore rules and the
+  client-side `ownerId` filters are what actually protect the data. Marking it Secret buys
+  nothing and breaks OTA.
+
+  **Check 169 fails if any of this rots:** it evaluates `app.config.js` twice — once with a
+  populated environment, asserting all six variables reach `extra`, and once empty,
+  asserting that an empty environment really does produce the silent-off config — then
+  resolves the LIVE environment (`.env.local` ahead of `.env`, as Expo does) and fails if
+  `apiKey` or `projectId` comes out empty. It reads the gate out of `firebaseConfig.ts`
+  rather than restating it, so the guard cannot drift from the two fields the app checks,
+  and it never prints a value (rule 8). Run the suite before a publish, not only before a
+  build — this is the check that stands between a bad shell and a dead sync on every phone.
 - **DEPLOY RULES AND INDEXES FROM GIT, and the login flag that makes it possible
   (2026-10-11).** From the repo ROOT, never `mobile-app/`:
 

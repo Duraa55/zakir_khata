@@ -7361,6 +7361,82 @@ check(168,'TWO SEEDED ADMINS, AND THEY ARE TWO SEPARATE BUSINESSES: both are cre
  await assert.rejects(()=>scope.entryOwner(waseem.id,zakir.id),
   'one seeded admin can drill into the other through the Staff Book, which is a sideways read');
 }));
+check(169,'A PUBLISH CANNOT SILENTLY TURN SYNC OFF: app.config.js maps every FIREBASE_* variable into extra, the app gates on apiKey AND projectId, and an environment that cannot supply those two resolves to a config that disables Firebase with no error on screen — so this fails HERE instead of on every phone that takes the update',at('app.config.js','firebaseApiKey'),()=>{
+ // app.config.js reads process.env at require time, so each evaluation needs a cold
+ // require and its own environment.
+ const configPath=path.join(root,'app.config.js');
+ const evaluate=env=>{
+  const saved={...process.env};
+  for(const k of Object.keys(process.env)) if(/^FIREBASE_/.test(k)) delete process.env[k];
+  Object.assign(process.env,env);
+  try{
+   delete require.cache[require.resolve(configPath)];
+   return require(configPath).expo;
+  }finally{
+   for(const k of Object.keys(process.env)) if(/^FIREBASE_/.test(k)) delete process.env[k];
+   Object.assign(process.env,saved);
+   delete require.cache[require.resolve(configPath)];
+  }
+ };
+
+ const VARS=['FIREBASE_API_KEY','FIREBASE_AUTH_DOMAIN','FIREBASE_PROJECT_ID',
+             'FIREBASE_STORAGE_BUCKET','FIREBASE_MESSAGING_SENDER_ID','FIREBASE_APP_ID'];
+ const FIELDS={FIREBASE_API_KEY:'firebaseApiKey',FIREBASE_AUTH_DOMAIN:'firebaseAuthDomain',
+  FIREBASE_PROJECT_ID:'firebaseProjectId',FIREBASE_STORAGE_BUCKET:'firebaseStorageBucket',
+  FIREBASE_MESSAGING_SENDER_ID:'firebaseMessagingSenderId',FIREBASE_APP_ID:'firebaseAppId'};
+
+ // ── THE MAPPING IS REAL, for every variable, not just the two that gate ────────────
+ // A variable that stopped being mapped would reach no phone and nothing else would say so.
+ const populated=evaluate(Object.fromEntries(VARS.map(v=>[v,'value-of-'+v])));
+ for(const v of VARS)
+  assert.equal(populated.extra[FIELDS[v]],'value-of-'+v,
+   v+' is not mapped into extra.'+FIELDS[v]+', so its value never reaches the app');
+
+ // ── AND AN EMPTY ENVIRONMENT PRODUCES THE SILENT FAILURE ───────────────────────────
+ // This is the shape of the bug, demonstrated rather than described: no throw, no warning,
+ // just a config whose apiKey is '' — and IS_FIREBASE_CONFIGURED false means no upload, no
+ // pull, no auth, and nothing on screen to say so.
+ const empty=evaluate({});
+ assert.equal(empty.extra.firebaseApiKey,'','a missing variable no longer falls back to empty, so this check is testing the wrong thing');
+ assert.equal(empty.extra.firebaseProjectId,'');
+
+ // ── THE GATE THIS DEPENDS ON ───────────────────────────────────────────────────────
+ // Asserted against the source, so the two cannot drift: if the app ever gates on a
+ // different field, the two values checked below are the wrong ones.
+ const cfg=read('src/services/firebase/firebaseConfig.ts');
+ assert.match(cfg,/IS_FIREBASE_CONFIGURED[\s\S]{0,120}firebaseConfig\.apiKey[\s\S]{0,60}firebaseConfig\.projectId/,
+  'the app no longer gates Firebase on apiKey AND projectId, so this check guards the wrong two values');
+
+ // ── THE LIVE ENVIRONMENT MUST BE ABLE TO PRODUCE A WORKING CONFIG ──────────────────
+ // Expo loads .env.local ahead of .env; this mirrors that, because eas update publishes
+ // whatever app.config.js resolves AT PUBLISH TIME. A publish from a shell without these
+ // ships extra.firebaseApiKey: '' to every device on the channel.
+ //
+ // NO VALUE IS EVER PRINTED — only whether one is present (rule 8).
+ const dotenv=file=>{
+  const full=path.join(root,file);
+  if(!fs.existsSync(full))return {};
+  const out={};
+  for(const line of read(file).split('\n')){
+   const m=/^\s*([A-Z_][A-Z0-9_]*)\s*=\s*(.*)$/.exec(line.replace(/\r$/,''));
+   if(m)out[m[1]]=m[2].trim().replace(/^['"]|['"]$/g,'');
+  }
+  return out;
+ };
+ const live={...dotenv('.env'),...dotenv('.env.local'),
+  ...Object.fromEntries(VARS.filter(v=>process.env[v]).map(v=>[v,process.env[v]]))};
+ const resolved=evaluate(live);
+ const blank=['firebaseApiKey','firebaseProjectId'].filter(f=>!resolved.extra[f]);
+ assert.deepEqual(blank,[],
+  'this environment resolves an EMPTY '+blank.join(' and ')+', so a build or an eas update '
+  +'from here would ship a config with Firebase switched off — no upload, no pull, no auth, '
+  +'and no error on any screen. Run npx eas-cli env:pull --environment preview (or publish '
+  +'with --environment preview). Every FIREBASE_* variable must be Sensitive, not Secret: '
+  +'the CLI cannot read a Secret back, so it resolves to empty exactly like a missing one.');
+ // The other four are not gating, but a publish missing them is still broken.
+ const partial=VARS.map(v=>FIELDS[v]).filter(f=>!resolved.extra[f]);
+ assert.deepEqual(partial,[],'this environment resolves an empty '+partial.join(', '));
+});
 /**
  * ONE CHECK AT A TIME: `ONLY=162 node tests/regression.test.cjs`, or `ONLY=159,160`.
  *
